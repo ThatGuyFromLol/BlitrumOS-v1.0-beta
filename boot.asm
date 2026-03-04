@@ -23,6 +23,13 @@ done:
 cli
 hlt ;stop
 
+gdt_start:
+ db 0x00000000
+ db 0x00000000
+ ; code segment deskryptor
+ dw 0xFFFF
+ dw 0x0000
+ dw
 msg: 
 db 'hello world boot',0
 
