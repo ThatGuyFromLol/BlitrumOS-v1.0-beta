@@ -54,4 +54,4 @@ dd gdt_start
 
 times 510 - ($-$$) db 0
 
-dw 
+dw 0xAA55
