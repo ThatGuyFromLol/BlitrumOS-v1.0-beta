@@ -49,7 +49,6 @@ gdt_start:
 gdt_end:
 
 gdt_descryptor:
-
 dw gdt_end - gdt_start - 1 ;wielkość gdy -1
 dd gdt_start
 
