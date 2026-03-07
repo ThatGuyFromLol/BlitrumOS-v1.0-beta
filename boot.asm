@@ -30,26 +30,25 @@ gdt_start:
 ;Global descyptor table
  db 0x00000000
  db 0x00000000
- ; code segment deskryptor
+ 
+; code segment deskryptor
+gdt_code:
  dw 0xFFFF    ;limit
  dw 0x0000    ;baza
- db 0x00      ;baza
- db 10011010b ;Acces byte
- db 11001111b ;flagi 
- db 0x00      ;baza
+ dw 0x9A00    ;Acces byte
+ dw 0x00CF    ;flagi  
 
  ; data segment deskryptor
+gdt_data:
  dw 0xFFFF    ;limit
  dw 0x0000    ;baza
- db 0x00      ;baza
- db 10010010b ;Acces byte
- db 11001111b ;flagi 
- db 0x00      ;baza
+ dw 0x9200    ;Acces byte
+ dw 0x00CF    ;flagi  
 
 gdt_end:
 
 gdt_descryptor:
-dw gdt_end - gdt_start - 1 ;wielkość gdy -1
+dw gdt_end - gdt_start - 1 ;wielkość gdt -1
 dd gdt_start
 
 times 510 - ($-$$) db 0
