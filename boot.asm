@@ -34,14 +34,16 @@ gdt_start:
 ; code segment deskryptor
 gdt_code:
  dw 0xFFFF    ;limit
- dw 0x0000    ;baza
+ db 0x00      ;baza
+ db 0x00      ;baza
  dw 0x9A00    ;Acces byte
  dw 0x00CF    ;flagi  
 
  ; data segment deskryptor
 gdt_data:
  dw 0xFFFF    ;limit
- dw 0x0000    ;baza
+ db 0x00      ;baza
+ db 0x00      ;baza
  dw 0x9200    ;Acces byte
  dw 0x00CF    ;flagi  
 
