@@ -1,13 +1,13 @@
 [bits 16]
-[org 0x7C00] ; pierwszy adress zapisu kodu czytany przez BIOS
+[org 0x7C00] ; adres, pod którym będzie ładowany nasz bootloader przez BIOS
 
 
-start:
+start: 
 cli ;wyczyść interupty oraz wyłącz je
 mov ax, 0x00 
 mov ds, ax
 mov ss, ax
-mov sp, 0x7C00
+mov sp, 0x7C00 
 sti ;włącza interupty
 lgdt [gdt_descryptor] ;ładuje gdt do rejestru gdtr
 mov si, msg
@@ -50,10 +50,12 @@ gdt_data:
 
 gdt_end:
 
-gdt_descryptor:
+gdt_descryptor: 
 dw gdt_end - gdt_start - 1 ;wielkość gdt -1
-dd gdt_start
+dd gdt_start    ;adres gdt
 
 
-times 510 - ($-$$) db 0
-dw 0xAA55
+times 510 - ($-$$) db 0 ;wypełniamy resztę zerami, aby mieć 512 bajtów
+dw 0xAA55 ; bootloader musi mieć 512 bajtów, więc wypełniamy resztę zerami, a na końcu dodajemy magiczną liczbę 0xAA55
+
+; ułatwienie z nasm oraz quemu użyj wbudowanego ai do wygenerowania boot.bin z boot.asm.
