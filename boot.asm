@@ -25,7 +25,6 @@ mov es, ax
 mov ss, ax
 mov esp, 0x90000
 
-call clear_screen
 mov dword [0xB8000], 0x2F412F41 ;wypisuje "AA" na ekranie
 hlt
 
