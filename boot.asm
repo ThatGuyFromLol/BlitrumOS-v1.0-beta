@@ -26,7 +26,7 @@ mov ss, ax
 mov esp, 0x90000
 
 mov dword [0xB8000], 0x2F412F41 ;wypisuje "AA" na ekranie
-hlt
+jmp $ ;zatrzymuje program
 
 gdt_start:       
 ;Global descyptor table
