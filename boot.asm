@@ -1,13 +1,16 @@
 [bits 16]
 [org 0x7C00] ; adres, pod którym będzie ładowany nasz bootloader przez BIOS
 
-
 start: 
 cli ;wyczyść interupty oraz wyłącz je
 mov ax, 0x00 
 mov ds, ax
 mov ss, ax
 mov sp, 0x7C00 
+in al, 0x92 ;włącza A20, aby móc korzystać z pamięci powyżej 1MB
+or al, 0x02
+out 0x92, al
+
 sti ;włącza interupty
 lgdt [cs:gdt_descryptor] ;ładuje gdt do rejestru gdtr
 
