@@ -58,7 +58,7 @@ gdt_descryptor:
 dw gdt_end - gdt_start - 1 ;wielkość gdt -1
 dd gdt_start    ;adres gdt
 
-[bita 32]
+[bits 32]
 protected_mode:
 mov ax, 0x10
 mov ds, ax
