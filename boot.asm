@@ -9,14 +9,25 @@ mov ds, ax
 mov ss, ax
 mov sp, 0x7C00 
 sti ;włącza interupty
-lgdt [gdt_descryptor] ;ładuje gdt do rejestru gdtr
+lgdt [cs:gdt_descryptor] ;ładuje gdt do rejestru gdtr
 
 mov eax,cr0
 or eax, 1
 mov cr0, eax
 
-jmp 0x08:protected_mode
+jmp 0x08:protected_mode ;przeskok do kodu w trybie chronionym 
 
+[bits 32]
+protected_mode:
+mov ax, 0x10
+mov ds, ax
+mov es, ax
+mov ss, ax
+mov esp, 0x90000
+
+call clear_screen
+mov dword [0xB8000], 0x2F412F41 ;wypisuje "AA" na ekranie
+hlt
 
 gdt_start:       
 ;Global descyptor table
@@ -45,17 +56,7 @@ gdt_descryptor:
 dw gdt_end - gdt_start - 1 ;wielkość gdt -1
 dd gdt_start    ;adres gdt
 
-[bits 32]
-protected_mode:
-mov ax, 0x10
-mov ds, ax
-mov es, ax
-mov ss, ax
 
-mov esp, 0x90000
-jmp $
-
-mov dword [0xB8000], 0x2F412F41 ;wypisuje "AA" na ekranie
 
 times 510 - ($-$$) db 0 ;wypełniamy resztę zerami, aby mieć 512 bajtów
 dw 0xAA55 ; bootloader musi mieć 512 bajtów, więc wypełniamy resztę zerami, a na końcu dodajemy magiczną liczbę 0xAA55
