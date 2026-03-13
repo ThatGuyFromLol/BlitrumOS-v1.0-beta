@@ -35,7 +35,7 @@ mov cr4, eax
 ;włączamy long mode
 mov ecx, 0xC0000080
 rdmsr ;odczytujemy MSR IA32_EFER do rejestru edx:eax
-or eax, 0x10000000 ;ustawiamy bit LME w rejestrze EFER
+or eax, 0x100 ;ustawiamy bit LME w rejestrze EFER
 wrmsr ;zapisujemy z powrotem do MSR IA32_EFER 
 mov eax, cr0 
 or eax, 0x80000000 ;ustawiamy bit PG w rejestrze CR0, aby włączyć stronicowanie
