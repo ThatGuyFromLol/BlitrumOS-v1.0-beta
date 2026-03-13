@@ -33,7 +33,8 @@ mov eax, cr4
 or eax, 0x20 ;ustawiamy bit PAE 
 mov cr4, eax
 ;włączamy long mode
-mov ecx, 0xC0000080
+mov ecx, 0xC0000080 ;adres MSR IA32_EFER
+mov edx, 0 ;wyzeruj górną część rejestru edx
 rdmsr ;odczytujemy MSR IA32_EFER do rejestru edx:eax
 add eax, 0x100 ;ustawiamy bit LME w rejestrze EFER
 wrmsr ;zapisujemy z powrotem do MSR IA32_EFER 
