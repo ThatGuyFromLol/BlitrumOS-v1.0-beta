@@ -97,14 +97,14 @@ dd gdt_start  ;adres gdt
 
 align 4096 ;wyrównanie do 4096 bajtów, aby kod był w odpowiednim miejscu w pamięci
 pml4_table:
-dq pdpt_table | 0x03 ;ustawiamy bit P (Present) i bit RW (Read/Write)
+dq pdpt_table + 0x03 ;ustawiamy bit P (Present) i bit RW (Read/Write)
 times 511 dq 0
 
 align 4096
 pdpt_table:
-dq pd_table | 0x03 ;ustawiamy bit P (Present) i bit RW (Read/Write)
+dq pd_table + 0x03 ;ustawiamy bit P (Present) i bit RW (Read/Write)
 times 511 dq 0 
 align 4096
 pd_table:
- dq 0x00000000 | 0x83   
+ dq 0x00000000 + 0x83   
  times 511 dq 0
