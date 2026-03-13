@@ -110,5 +110,4 @@ pd_table:
  times 511 dq 0
  
  
- times 510-($-$$) db 0
-dw 0xAA55 ;sygnatura bootloadera, musi być na końcu sektora i wynosić 0xAA55
+
