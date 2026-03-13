@@ -33,17 +33,16 @@ mov eax, cr4
 or eax, 0x20 ;ustawiamy bit PAE 
 mov cr4, eax
 ;włączamy long mode
-mov ecx, 0xC0000080 ;adres MSR IA32_EFER
-mov edx, 0 ;wyzeruj górną część rejestru edx
-rdmsr ;odczytujemy MSR IA32_EFER do rejestru edx:eax
-add eax, 0x100 ;ustawiamy bit LME w rejestrze EFER
-wrmsr ;zapisujemy z powrotem do MSR IA32_EFER 
-mov eax, cr0 
-or eax, 0x80000000 ;ustawiamy bit PG w rejestrze CR0, aby włączyć stronicowanie
-mov cr0, eax ;włączamy stronicowanie
-mov eax, pml4_table ;ładujemy adres tabeli PML4 do rejestru eax
-mov cr3, eax ;ładujemy adres tabeli PML4 do rejestru CR3, aby włączyć stronicowanie
-jmp 0x18:long_mode ;przeskok do kodu w trybie długim
+mov eax, plm4_table ;adres tabeli PML4
+mov cr3, eax ;ładowanie adresu tabeli PML4 do rejestru cr3
+mov eax, 0xC0000080 ;adres rejestru EFER
+rdmsr ;odczyt wartości rejestru EFER do rejestru edx:eax
+or eax, 0x100 ;ustawiamy bit LME (Long Mode Enable)
+wrmsr ;zapisujemy z powrotem do rejestru EFER
+mov eax, cr0
+or eax, 0x80000000 ;ustawiamy bit PG (Paging)
+mov cr0, eax
+jmp long_mode ;przeskok do kodu w trybie długim (long mode)
 
 [bits 64]
 cli
