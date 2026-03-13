@@ -108,3 +108,7 @@ align 4096
 pd_table:
  dq 0x00000083   
  times 511 dq 0
+ 
+ 
+ times 512 db 0 ;wypełniamy resztę sektora zerami
+ dw 0xAA55 ;sygnatura bootloadera, musi być na końcu sektora
