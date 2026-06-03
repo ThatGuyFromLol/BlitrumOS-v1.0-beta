@@ -11,7 +11,7 @@ in al, 0x92 ;włącza A20, aby móc korzystać z pamięci powyżej 1MB
 or al, 0x02
 out 0x92, al
 
-cli ;włącza interupty
+cli ;włącza przerwania
 lgdt [cs:gdt_descryptor] ;ładuje gdt do rejestru gdtr
 
 mov eax,cr0
@@ -75,7 +75,8 @@ gdt_code:
  db 0x9A      ;Acces byte
  db 0xCF      ;flagi  
  db 0x00      ; baza hi
- ; data segment deskryptor
+ 
+; data segment deskryptor
 gdt_data:
  dw 0xFFFF    ;limit
  dw 0x00      ;baza
@@ -83,7 +84,7 @@ gdt_data:
  db 0x92      ;Acces byte
  db 0xCF      ;flagi
  db 0x00      ; baza hi
-
+ 
 gdt_code64:
     dw 0x0000    ;limit
     dw 0x0000    ;baza lo
@@ -99,12 +100,12 @@ dd gdt_start  ;adres gdt
 
 align 4096 ;wyrównanie do 4096 bajtów, aby kod był w odpowiednim miejscu w pamięci
 pml4_table:
-dq pdpt_table ;ustawiamy bit P (Present) i bit RW (Read/Write)
+dq pdpt_table | 0x03 ;ustawiamy bit P (Present) i bit RW (Read/Write)
 times 511 dq 0
 
 align 4096
 pdpt_table:
-dq pd_table ;ustawiamy bit P (Present) i bit RW (Read/Write)
+dq pd_table | 0x03 ;ustawiamy bit P (Present) i bit RW (Read/Write)
 times 511 dq 0 
 align 4096
 pd_table:
