@@ -57,6 +57,9 @@ mov rsp, 0x90000 ;ustaw stos na 0x90000
 mov rax, 0xb8000 ;adres pamięci wideo
 mov rbx , 0x2F412F412F412F41 ;tekst "Hello World!" w formacie ASCII
 mov [rax], rbx ;zapisz tekst do pamięci wideo
+
+
+
 HALT:
 hlt ;zatrzymaj procesor
 jmp HALT ;niekończąca się pętla, aby procesor nie wykonywał nieznanego kodu po zakończeniu naszego programu
