@@ -1,3 +1,5 @@
+jeśli pomysł z własnym systemem plików nie wypali
+
 plan ogólny:
 
 -id do guid zrobić poprzez random na bazie pc clock (128b) 
