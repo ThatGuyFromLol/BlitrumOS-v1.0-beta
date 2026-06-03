@@ -113,7 +113,4 @@ sterowniki, usługi systemowe)
 
 Architektura: - x86_64 - UEFI only - 64-bit only - Modularne sterowniki
 
-=============================================================== To jest
-fundament pełnego projektu systemu operacyjnego. Rozwijaj etapami i nie
-próbuj implementować wszystkiego naraz.
 ===============================================================
