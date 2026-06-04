@@ -16,6 +16,8 @@ call qword [rbx + 8]
 mov rax ,0x00100000
 jmp rax
 
+cli 
+
 hang:
 hlt
 jmp hang
