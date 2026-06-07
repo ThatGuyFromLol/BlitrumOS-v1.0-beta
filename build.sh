@@ -45,6 +45,7 @@ nasm -f elf64 Tools/usb_controller.asm    -o usb_controller.o
 nasm -f elf64 Tools/custom_sceduler.asm -o custom_sceduler.o
 nasm -f elf64 Tools/ahs-tus.asm         -o ahs-tus.o
 nasm -f elf64 Tools/update_loader.asm   -o update_loader.o
+nasm -f elf64 Tools/malicious_check.asm -o malicious_check.o
 nasm -f elf64 Tools/tgfs_vfs.asm        -o tgfs_vfs.o
 
 echo "-> Wszystkie moduly skompilowane pomyslnie."
