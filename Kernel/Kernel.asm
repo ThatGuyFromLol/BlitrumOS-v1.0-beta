@@ -35,6 +35,9 @@ extern scheduler_trigger_event  ; z custom_sceduler.asm
 ; Wektory systemu aktualizacji AHS-TUS
 extern update_system_init       ; z ahs-tus.asm
 extern update_register_vector   ; z ahs-tus.asm
+extern update_check
+extern update_apply
+extern update_is_pending
 
 ; Definicje stałych indeksów wektorów dla dynamicznej tabeli aktualizacji AHS-TUS
 VECTOR_AUDIO    equ 0
@@ -149,6 +152,15 @@ _start:
     lea rdx, [rel tgfs_load_and_map_file]
     call update_register_vector ; Rejestracja systemu plików i loadera pod Wektor 2
 .skip_storage:
+
+    ; --- SPRAWDZENIE AKTUALIZACJI ---
+    cmp byte [tgfs_active], 1
+    jne .skip_update_check
+    call update_check
+    cmp rax, 1
+    jne .skip_update_check
+    call update_apply
+.skip_update_check:
 
     ; --- 9. INICJALIZACJA SCHEDULERA ZDARZENIOWEGO (BME-QD) ---
     call scheduler_init         ; Przygotowanie 64-bitowej maski procesów
