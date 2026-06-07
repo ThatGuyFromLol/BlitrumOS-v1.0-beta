@@ -90,7 +90,7 @@ bsod_rip_lbl:   db "RIP:       0x", 0
 bsod_rsp_lbl:   db "RSP:       0x", 0
 bsod_cr2_lbl:   db "CR2:       0x", 0
 bsod_footer:    db "System zatrzymany. Uruchom ponownie (Reset).", 0
-bsod_footer2:   db "Nowatorski Wektorowy OS — Kernel Panic Handler v1.0", 0
+bsod_footer2:   db "BlitrumOS — Kernel Panic Handler v1.0", 0
 
 ; Bufor na hex string (16 cyfr + null)
 hex_buf:        times 17 db 0
