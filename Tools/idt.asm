@@ -1,6 +1,7 @@
 bits 64
 section .text
 
+extern isr_pit_handler
 global idt_init
 global bsod_handler
 extern bsod_handler
@@ -32,6 +33,11 @@ idt_init:
     inc rcx
     cmp rcx, 32
     jl .fill_exceptions
+
+    ; Rejestracja PIT Timer (IRQ0 → wektor 0x20)
+    mov rcx, 0x20
+    lea rdx, [rel isr_pit_handler]
+    call idt_set_gate
 
     ; Rejestracja przerwania sprzętowego USB 3.0 (xHCI)
     mov rcx, USB_INTERRUPT_VECTOR
