@@ -19,6 +19,9 @@ global syscall_compatibility_layer
 ; Importy niskopoziomowe ze sterowników sprzętowych projektu
 extern ahci_read_sectors        ; z ahci.asm (DMA odczyt sektorów SATA)
 extern pmm_alloc_page           ; z ppm.asm
+extern shell_print
+extern hid_get_last_key
+extern pmm_free_page
 
 ; Typy systemów plików obsługiwane przez VFS
 FS_TYPE_UNKNOWN equ 0
@@ -287,22 +290,99 @@ tgfs_load_and_map_file:
 ; BUGFIX: wcześniej brakowało `ret` po bloku domyślnym — wykonanie wpadało
 ; w .emulate_sys_write przypadkowo. Teraz każda ścieżka kończy się ret.
 ; ==============================================================================
-syscall_compatibility_layer:
+      syscall_compatibility_layer:
+    cmp rax, 0
+    je .emulate_sys_read        ; sys_read
     cmp rax, 1
-    je .emulate_sys_write
+    je .emulate_sys_write       ; sys_write
     cmp rax, 9
-    je .emulate_sys_mmap
+    je .emulate_sys_mmap        ; sys_mmap
+    cmp rax, 11
+    je .emulate_sys_munmap      ; sys_munmap
+    cmp rax, 12
+    je .emulate_sys_brk         ; sys_brk
+    cmp rax, 60
+    je .emulate_sys_exit        ; sys_exit
+    cmp rax, 231
+    je .emulate_sys_exit        ; sys_exit_group
 
-    ; Nieobsługiwana funkcja — zwracamy 0 (sukces) aby nie crashować aplikacji
+    ; Nieobsługiwana funkcja — zwracamy 0
     xor rax, rax
-    ret                         ; BUGFIX: brakujący ret (powodował fallthrough do .emulate_sys_write)
+    ret
 
 .emulate_sys_write:
-    ; sys_write(rdi=fd, rsi=buf, rdx=count) — zwracamy liczbę bajtów jak prawdziwe jądro
-    mov rax, rdx
+    ; sys_write(rdi=fd, rsi=buf, rdx=count)
+    ; fd=1 (stdout) lub fd=2 (stderr) → wypisz przez shell
+    cmp rdi, 1
+    je .write_stdout
+    cmp rdi, 2
+    je .write_stdout
+    ; Inne fd — zwróć -1 (błąd)
+    mov rax, -1
+    ret
+.write_stdout:
+    ; Wypisz bufor przez shell
+    push rsi
+    push rdx
+    mov rsi, rsi                ; RSI = bufor
+    call shell_print
+    pop rdx
+    pop rsi
+    mov rax, rdx                ; Zwróć liczbę bajtów
+    ret
+
+.emulate_sys_read:
+    ; sys_read(rdi=fd, rsi=buf, rdx=count)
+    ; Czekaj na klawisz z HID parsera
+    push rdi
+    push rsi
+    push rdx
+    call hid_get_last_key
+    pop rdx
+    pop rsi
+    pop rdi
+    test al, al
+    jz .read_nodata
+    mov [rsi], al               ; Zapisz znak do bufora
+    mov rax, 1                  ; Zwróć 1 bajt
+    ret
+.read_nodata:
+    xor rax, rax                ; Zwróć 0 (brak danych)
     ret
 
 .emulate_sys_mmap:
-    ; sys_mmap — prosimy PMM o stronę 4KB i zwracamy jej adres
+    ; sys_mmap — alokuj strony przez PMM
+    push rdi
+    push rsi
+    push rdx
+    ; rdx = rozmiar żądanej pamięci
+    mov rcx, rdx
+    shr rcx, 12                 ; Liczba stron = rozmiar / 4096
+    jz .mmap_one_page
+    ; Alokuj pierwszą stronę i zwróć jej adres
+.mmap_one_page:
     call pmm_alloc_page
+    pop rdx
+    pop rsi
+    pop rdi
+    ret
+
+.emulate_sys_munmap:
+    ; sys_munmap — zwolnij stronę do PMM
+    push rcx
+    mov rcx, rdi                ; RCX = adres strony
+    call pmm_free_page
+    pop rcx
+    xor rax, rax                ; Zwróć 0 (sukces)
+    ret
+
+.emulate_sys_exit:
+    ; sys_exit — zakończ proces (wróć do schedulera)
+    xor rax, rax
+    ret
+
+.emulate_sys_brk:
+    ; sys_brk — rozszerzenie segmentu danych
+    ; Zwracamy ten sam adres (brak implementacji sterty)
+    mov rax, rdi
     ret
