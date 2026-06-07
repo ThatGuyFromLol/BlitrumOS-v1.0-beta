@@ -180,7 +180,8 @@ _start:
 
     ; --- 9. INICJALIZACJA SCHEDULERA ZDARZENIOWEGO (BME-QD) ---
     call scheduler_init         ; Przygotowanie 64-bitowej maski procesów
-    call hid_init               ; Inicjalizacja parsera klawiatury i myszy
+    call hid_init  
+    call shell_init             ; Inicjalizacja parsera klawiatury i myszy
     ; --- KROK 10: URUCHOMIENIE INTERFEJSU GRAFICZNEGO ---
     cmp byte [tgfs_active], 1
     jne .fallback_render
