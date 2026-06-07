@@ -92,14 +92,6 @@ _start:
     mov qword [fb_height], 0
     mov qword [fb_pps], 0
 
-    ; --- ODCZYT MAPY PAMIĘCI UEFI PRZEKAZANEJ PRZEZ BOOTLOADER ---
-    mov rax, [rsp + 56]         ; Wskaźnik na mapę pamięci (EFI_MEMORY_DESCRIPTOR[])
-    mov [mmap_ptr], rax
-    mov rax, [rsp + 64]         ; Łączny rozmiar mapy w bajtach
-    mov [mmap_size], rax
-    mov rax, [rsp + 72]         ; Rozmiar pojedynczego deskryptora
-    mov [mmap_descsz], rax
-
     ; Przenosimy parametry z bootloadera do rejestrów nieulotnych zgodnie z ABI
     mov r12, rcx                ; R12 = Adres UEFI sys_table
     mov r13, r8                 ; R13 = Aktualny rejestr CR3
