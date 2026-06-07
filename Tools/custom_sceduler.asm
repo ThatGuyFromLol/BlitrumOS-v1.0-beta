@@ -176,5 +176,89 @@ scheduler_dispatch:
     ; EOI (End of Interrupt) dla Local APIC
     mov r11, 0xFEE00000
     mov dword [r11 + 0xB0], 0
+; ==============================================================================
+; FUNKCJA: scheduler_event_loop
+; Główna pętla zdarzeń — czyta zdarzenia USB i przekazuje do HID parsera.
+; Wywoływana przez idle thread kernela zamiast samego hlt.
+; ==============================================================================
+global scheduler_event_loop
 
+extern usb_pop_event
+extern hid_parse_keyboard
+extern hid_parse_mouse
+extern gui_process_mouse_click
+extern gui_refresh_screen
+
+section .data
+align 8
+hid_report_buf: times 8 db 0    ; Bufor na raport HID (max 8 bajtów)
+
+section .text
+
+scheduler_event_loop:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+.loop:
+    ; Pobierz zdarzenie z ring bufora USB
+    call usb_pop_event
+    test rax, rax
+    jz .idle                    ; Brak zdarzeń — idź spać
+
+    ; RAX = 64-bitowy pakiet zdarzenia:
+    ; Bajt 0: Typ (1=Klawiatura, 2=Mysz)
+    ; Bajt 1: Dane (scancode lub przyciski)
+    ; Bajty 2-3: Delta X
+    ; Bajty 4-5: Delta Y
+
+    movzx rbx, al               ; RBX = typ zdarzenia
+    cmp rbx, 1
+    je .handle_keyboard
+    cmp rbx, 2
+    je .handle_mouse
+    jmp .loop                   ; Nieznany typ — ignoruj
+
+.handle_keyboard:
+    ; Wypakuj dane do bufora i przekaż do parsera
+    mov [hid_report_buf], rax
+    lea rcx, [rel hid_report_buf]
+    call hid_parse_keyboard
+    jmp .loop
+
+.handle_mouse:
+    ; Wypakuj dane myszy do bufora
+    mov [hid_report_buf], rax
+    lea rcx, [rel hid_report_buf]
+    call hid_parse_mouse
+
+    ; Sprawdź kliknięcie lewego przycisku (bit 0)
+    movzx rbx, byte [hid_report_buf]
+    test rbx, 1
+    jz .no_click
+
+    ; Przekaż pozycję kliknięcia do GUI
+    mov rcx, [mouse_x]
+    mov rdx, [mouse_y]
+    call gui_process_mouse_click
+
+.no_click:
+    ; Odśwież ekran po ruchu myszy
+    call gui_refresh_screen
+    jmp .loop
+
+.idle:
+    hlt                         ; Energooszczędne czekanie na przerwanie
+    jmp .loop
+
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; Importujemy pozycję myszy z hid_parser
+extern mouse_x
+extern mouse_y
     iretq                       ; Powrót sprzętowy do nowego zadania
