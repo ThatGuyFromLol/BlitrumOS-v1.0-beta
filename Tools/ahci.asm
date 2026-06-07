@@ -5,7 +5,11 @@ section .text
 global find_ahci_controller
 global init_ahci_controller
 global check_ahci_ports
-global pci_read_config_dword
+global ahci_read_sectors
+; BUGFIX: `pci_read_config_dword` jest zdefiniowane w pci_(dyski).asm.
+; Wcześniej ahci.asm definiowało własną kopię -> "multiple definition".
+; Używamy wspólnej implementacji jako extern.
+extern pci_read_config_dword
 
 ; ==============================================================================
 ; FUNKCJA: find_ahci_controller
@@ -102,6 +106,11 @@ init_ahci_controller:
     push rax
     push rbx
 
+    ; Zapamiętujemy adres bazowy MMIO, by ahci_read_sectors mógł go użyć.
+    ; BUGFIX: wcześniej adres MMIO nie był nigdzie zapisywany, więc odczyt
+    ; sektorów nie miał jak zlokalizować rejestrów kontrolera.
+    mov [ahci_mmio_base], rax
+
     ; Rejestr GHC (Global Host Control) znajduje się pod offsetem 0x04
     ; Ustawiamy bit 31 (AE - AHCI Enable)
     mov ebx, [rax + 0x04]
@@ -165,44 +174,162 @@ check_ahci_ports:
 
 
 ; ==============================================================================
-; FUNKCJA POMOCNICZA: pci_read_config_dword
-; Odczytuje 32-bitowy rejestr konfiguracyjny PCI przez porty we/wy.
-; Wejście: BH = Bus, BL = Device, CH = Function, CL = Offset
-; Zwraca:  EAX = Odczytana wartość
+; FUNKCJA: ahci_read_sectors  — odczyt DMA sektorów z dysku SATA (READ DMA EXT)
+; Wymagana przez tgfs_vfs.asm.
+;
+; Konwencja wejścia (zgodna z wywołaniami w tgfs_vfs.asm):
+;   RCX = Numer portu SATA (0..31)
+;   RDX = Początkowy LBA (48-bit)
+;   R8  = Liczba sektorów do odczytu
+;   R9  = Adres bufora docelowego w RAM
+; Zwraca: CF=0 sukces, CF=1 błąd.
+;
+; Implementacja buduje minimalną strukturę AHCI w stałym obszarze RAM:
+;   Command List (1 KB) + Received FIS (256 B) + Command Table (z PRDT).
+; Następnie wysyła H2D Register FIS z komendą 0x25 i czeka na PxCI=0.
+;
+; Wymaga, by adres bazowy MMIO kontrolera AHCI był zapamiętany w [ahci_mmio_base]
+; (ustawiany przez init_ahci_controller — patrz niżej).
 ; ==============================================================================
-pci_read_config_dword:
+AHCI_CLB   equ 0x00400000        ; Command List Base (1 KB na port)
+AHCI_FB    equ 0x00400400        ; Received FIS Base (256 B)
+AHCI_CTBA  equ 0x00400800        ; Command Table Base (Command FIS + PRDT)
+
+ahci_read_sectors:
     push rbx
-    push rcx
-    push rdx
+    push rsi
+    push rdi
+    push r10
+    push r11
+    push r12
+    push r13
 
-    xor eax, eax            
-    mov eax, 0x80000000     ; Bit 31 = 1 (Enable)
+    mov r12, rcx                ; R12 = numer portu
+    mov r13, rdx                ; R13 = LBA
 
-    movzx edx, bh
-    shl edx, 16
-    or eax, edx             
+    ; Adres bazowy rejestrów portu: MMIO + 0x100 + port*0x80
+    mov rsi, [ahci_mmio_base]
+    test rsi, rsi
+    jz .err                     ; kontroler nieskonfigurowany
+    mov rax, r12
+    shl rax, 7                  ; port * 0x80
+    add rax, 0x100
+    add rsi, rax                ; RSI = baza rejestrów portu
 
-    movzx edx, bl
-    and dl, 0x1F            
-    shl edx, 11
-    or eax, edx             
+    ; 1. Ustawiamy wskaźniki Command List i FIS dla portu (PxCLB/PxFB)
+    mov dword [rsi + 0x00], AHCI_CLB    ; PxCLB (low 32)
+    mov dword [rsi + 0x04], 0           ; PxCLBU (high 32)
+    mov dword [rsi + 0x08], AHCI_FB     ; PxFB (low 32)
+    mov dword [rsi + 0x0C], 0           ; PxFBU (high 32)
 
-    movzx edx, ch
-    and dl, 0x07            
-    shl edx, 8
-    or eax, edx             
+    ; 2. Budujemy Command Header (slot 0) w Command List
+    mov rdi, AHCI_CLB
+    ; DW0: CFL=5 (długość Command FIS w dwordach), W=0 (odczyt), PRDTL=1
+    mov dword [rdi + 0x00], (1 << 16) | 5
+    mov dword [rdi + 0x04], 0           ; PRDBC = 0 (licznik przesłanych bajtów)
+    mov dword [rdi + 0x08], AHCI_CTBA   ; CTBA (adres Command Table)
+    mov dword [rdi + 0x0C], 0           ; CTBAU
 
-    movzx edx, cl
-    and dl, 0xFC            ; Wyrównanie offsetu do dworda (4 bajty)
-    or eax, edx             
+    ; 3. Zerujemy Command Table (Command FIS 64B + PRDT)
+    mov rdi, AHCI_CTBA
+    xor rax, rax
+    mov rcx, 16                 ; 128 bajtów / 8
+    rep stosq
 
-    mov dx, 0xCF8
-    out dx, eax             
+    ; 4. Budujemy H2D Register FIS w Command Table (offset 0)
+    mov rdi, AHCI_CTBA
+    mov byte [rdi + 0x00], 0x27 ; FIS Type = Register Host-to-Device
+    mov byte [rdi + 0x01], 0x80 ; C=1 (to jest komenda)
+    mov byte [rdi + 0x02], 0x25 ; Command = READ DMA EXT
+    mov byte [rdi + 0x03], 0    ; FeatureL
 
-    mov dx, 0xCFC
-    in eax, dx              
+    ; LBA 0..23 -> bajty 4,5,6 ; Device = 0x40 (LBA mode) -> bajt 7
+    mov rax, r13
+    mov byte [rdi + 0x04], al   ; LBA[7:0]
+    mov byte [rdi + 0x05], ah   ; LBA[15:8]
+    shr rax, 16
+    mov byte [rdi + 0x06], al   ; LBA[23:16]
+    mov byte [rdi + 0x07], 0x40 ; Device (bit 6 = tryb LBA)
 
-    pop rdx
-    pop rcx
+    ; LBA 24..47 -> bajty 8,9,10
+    mov rax, r13
+    shr rax, 24
+    mov byte [rdi + 0x08], al   ; LBA[31:24]
+    mov byte [rdi + 0x09], ah   ; LBA[39:32]
+    shr rax, 16
+    mov byte [rdi + 0x0A], al   ; LBA[47:40]
+    mov byte [rdi + 0x0B], 0    ; FeatureH
+
+    ; Liczba sektorów (Count) -> bajty 12,13
+    mov rax, r8
+    mov byte [rdi + 0x0C], al   ; Count[7:0]
+    mov byte [rdi + 0x0D], ah   ; Count[15:8]
+
+    ; 5. Budujemy PRDT (jedyny wpis) na offsecie 0x80 w Command Table
+    mov rdi, AHCI_CTBA + 0x80
+    mov rax, r9
+    mov [rdi + 0x00], eax       ; DBA (adres bufora, low 32)
+    shr rax, 32
+    mov [rdi + 0x04], eax       ; DBAU (high 32)
+    mov dword [rdi + 0x08], 0   ; zarezerwowane
+    ; DBC = (bajty - 1). Bajty = sektory * 512. Bit 31 = Interrupt on Completion.
+    mov rax, r8
+    shl rax, 9                  ; * 512
+    dec rax
+    or  eax, 0x80000000         ; I (interrupt) = 1
+    mov [rdi + 0x0C], eax       ; DBC
+
+    ; 6. Czekamy aż port przestanie być zajęty (TFD.BSY|DRQ = 0)
+    mov r10, 0x100000
+.wait_idle:
+    mov eax, [rsi + 0x20]       ; PxTFD
+    test eax, 0x88              ; BSY (0x80) | DRQ (0x08)
+    jz .issue
+    dec r10
+    jnz .wait_idle
+    jmp .err                    ; dysk zawieszony
+
+.issue:
+    ; 7. Wystawiamy komendę: ustaw bit 0 w PxCI (Command Issue, slot 0)
+    mov dword [rsi + 0x38], 1   ; PxCI bit0 = 1
+
+    ; 8. Czekamy aż kontroler wyczyści PxCI (komenda zakończona)
+    mov r10, 0x1000000
+.wait_done:
+    mov eax, [rsi + 0x38]       ; PxCI
+    test eax, 1
+    jz .check_err
+    ; Sprawdzamy też bit błędu zadania (PxIS.TFES = bit 30)
+    mov ebx, [rsi + 0x10]       ; PxIS
+    test ebx, 0x40000000
+    jnz .err
+    dec r10
+    jnz .wait_done
+    jmp .err                    ; timeout
+
+.check_err:
+    ; Komenda zakończona — sprawdź flagę błędu w PxTFD (bit 0 = ERR)
+    mov eax, [rsi + 0x20]
+    test eax, 0x01
+    jnz .err
+
+    clc                         ; sukces
+    jmp .out
+.err:
+    stc                         ; błąd
+.out:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop rdi
+    pop rsi
     pop rbx
     ret
+
+section .data
+align 8
+ahci_mmio_base: dq 0            ; Adres bazowy MMIO kontrolera AHCI (z init_ahci_controller)
+
+section .text
+; Funkcja pci_read_config_dword znajduje się w pci_(dyski).asm (wspólna implementacja).
