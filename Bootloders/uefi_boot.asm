@@ -52,15 +52,74 @@ _start:
     mov [fb_pps], eax
 
     ; ==============================================================================
-    ; PRZYGOTOWANIE SYGNAŁÓW DLA KERNELA (Zgodnie z Microsoft x64 ABI)
+    ; KROK 4: POBRANIE MAPY PAMIĘCI I WYJŚCIE Z BOOT SERVICES (KRYTYCZNE!)
     ; ==============================================================================
-    ; Przygotowanie dodatkowych parametrów na stosie (od [rsp + 32] w górę)
+    ; Bez ExitBootServices firmware nadal kontroluje sprzęt i timery — skok do
+    ; jądra w tym stanie jest niezdefiniowany. Najpierw pobieramy mapę pamięci
+    ; (potrzebną przez PMM), potem opuszczamy Boot Services jej kluczem (MapKey).
+    mov r11, [boot_services]
+
+    mov qword [mmap_size], MMAP_BUF_SIZE   ; deklarujemy rozmiar naszego bufora
+    sub rsp, 48                 ; shadow space (32) + 5. argument (8), 16-aligned
+    lea rcx, [rel mmap_size]    ; IN OUT &MemoryMapSize
+    lea rdx, [rel mmap_buf]     ; IN OUT bufor na mapę
+    lea r8,  [rel mmap_key]     ; OUT &MapKey
+    lea r9,  [rel mmap_descsz]  ; OUT &DescriptorSize
+    lea rax, [rel mmap_descver] ; OUT &DescriptorVersion (na stosie)
+    mov [rsp + 32], rax
+    call qword [r11 + 56]       ; BootServices->GetMemoryMap (offset 56)
+    add rsp, 48
+    test rax, rax
+    jnz hang                    ; nie udało się pobrać mapy pamięci
+
+    ; ExitBootServices(ImageHandle, MapKey)
+    sub rsp, 32
+    mov rcx, [image_handle]
+    mov rdx, [mmap_key]
+    call qword [r11 + 232]      ; BootServices->ExitBootServices (offset 232)
+    add rsp, 32
+    test rax, rax
+    jz .boot_services_exited
+
+    ; Mapa zmieniła się między GetMemoryMap a ExitBootServices — pobierz ją
+    ; ponownie ze świeżym MapKey i spróbuj wyjść jeszcze raz (wymóg specyfikacji).
+    mov qword [mmap_size], MMAP_BUF_SIZE
+    sub rsp, 48
+    lea rcx, [rel mmap_size]
+    lea rdx, [rel mmap_buf]
+    lea r8,  [rel mmap_key]
+    lea r9,  [rel mmap_descsz]
+    lea rax, [rel mmap_descver]
+    mov [rsp + 32], rax
+    call qword [r11 + 56]
+    add rsp, 48
+    sub rsp, 32
+    mov rcx, [image_handle]
+    mov rdx, [mmap_key]
+    call qword [r11 + 232]
+    add rsp, 32
+    test rax, rax
+    jnz hang                    ; druga próba też zawiodła — zatrzymujemy się
+
+.boot_services_exited:
+    ; ==============================================================================
+    ; PRZYGOTOWANIE SYGNAŁÓW DLA KERNELA
+    ; UWAGA: od tego miejsca NIE wolno już używać ConOut ani Boot Services.
+    ; Parametry przekazujemy w rejestrach + na stosie (od [rsp + 32] w górę).
+    ; ==============================================================================
+    sub rsp, 96                 ; rezerwa na 8 parametrów stosowych (16-aligned)
     mov ecx, [fb_width]
-    mov [rsp + 32], rcx         ; 5. parametr: Szerokość ekranu (Width)
+    mov [rsp + 32], rcx         ; Szerokość ekranu (Width)
     mov edx, [fb_height]
-    mov [rsp + 40], rdx         ; 6. parametr: Wysokość ekranu (Height)
+    mov [rsp + 40], rdx         ; Wysokość ekranu (Height)
     mov eax, [fb_pps]
-    mov [rsp + 48], rax         ; 7. parametr: Pixels Per Scan Line
+    mov [rsp + 48], rax         ; Pixels Per Scan Line
+    lea rax, [rel mmap_buf]
+    mov [rsp + 56], rax         ; Wskaźnik na mapę pamięci UEFI
+    mov rax, [mmap_size]
+    mov [rsp + 64], rax         ; Łączny rozmiar mapy pamięci (w bajtach)
+    mov rax, [mmap_descsz]
+    mov [rsp + 72], rax         ; Rozmiar pojedynczego deskryptora
 
     ; Główne cztery argumenty w rejestrach:
     mov rcx, [sys_table]        ; RCX = Adres tabeli systemowej UEFI
@@ -72,14 +131,14 @@ _start:
     mov rax, 0x00100000
     jmp rax
 
-cli 
-
 hang:
     hlt
     jmp hang
 
 section .data
-hello_str     db L"Bootloader UEFI: Inicjalizacja GOP (HDMI/DisplayPort)...", 13, 10, 0
+; UEFI ConOut->OutputString oczekuje łańcucha UTF-16 (CHAR16), dlatego używamy
+; `dw __utf16le__(...)` zamiast `db L"..."` (NASM nie obsługuje składni L"...").
+hello_str     dw __utf16le__(`Bootloader UEFI: Inicjalizacja GOP (HDMI/DisplayPort)...`), 13, 10, 0
 
 image_handle  dq 0
 sys_table     dq 0
@@ -92,3 +151,14 @@ fb_base       dq 0
 fb_width      dd 0
 fb_height     dd 0
 fb_pps        dd 0
+
+; --- Bufor i metadane mapy pamięci UEFI (dla GetMemoryMap / ExitBootServices) ---
+MMAP_BUF_SIZE equ 16384         ; 16 KB — wystarcza na typową mapę QEMU/firmware
+mmap_size     dq 0             ; IN: rozmiar bufora / OUT: faktyczny rozmiar mapy
+mmap_key      dq 0             ; OUT: MapKey wymagany przez ExitBootServices
+mmap_descsz   dq 0             ; OUT: rozmiar pojedynczego deskryptora pamięci
+mmap_descver  dd 0             ; OUT: wersja deskryptora
+
+section .bss
+align 16
+mmap_buf      resb MMAP_BUF_SIZE   ; bufor na tablicę EFI_MEMORY_DESCRIPTOR
