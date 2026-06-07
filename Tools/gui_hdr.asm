@@ -52,7 +52,9 @@ gui_init:
     shl rax, 3                  ; SZYBKA MATEMATYKA: Przesunięcie o 3 bity = Mnożenie przez 8 bajtów
     mov [backbuffer_size_b], rax
 
-    ; Alokujemy Backbuffer pod stałym, bezpiecznym adresem w wysokiej pamięci UEFI
+    ; Backbuffer leży pod stałym adresem 16MB. Ten obszar jest jawnie chroniony
+    ; przez PMM (pierwsze 32MB rezerwowane), więc nie zostanie przydzielony gdzie
+    ; indziej. Bufor 1920x1080x8B ≈ 16MB mieści się w zakresie 16–32MB.
     mov qword [gui_backbuffer], 0x01000000
 
     ; Czyszczenie Backbuffera 64-bitowego (Wypełniamy czernią: 0x0000000000000000)
@@ -140,8 +142,11 @@ gui_refresh_screen:
     mov al, bh                  
     
     ; 2. Kanał Zielony (G): bity 16-31 w RBX -> bity 8-15 w EAX
+    ; BUGFIX: wcześniej `mov ah, bl` brało DOLNY bajt kanału G, podczas gdy dla
+    ; kanału B użyto `bh` (górny bajt). Dla kolorów innych niż szarości dawało to
+    ; przekłamane barwy. Teraz konsekwentnie bierzemy górny bajt każdego kanału.
     shr rbx, 16
-    mov ah, bl
+    mov ah, bh
     
     ; 3. Kanał Czerwony (R): bity 32-47 w RBX -> bity 16-23 w EAX
     shr rbx, 16
