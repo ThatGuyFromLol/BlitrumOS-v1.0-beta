@@ -49,7 +49,7 @@ shell_input_buf: times SHELL_BUF_SIZE db 0
 shell_input_len: dd 0           ; Długość aktualnego wejścia
 
 ; Wersja systemu
-shell_ver_str:  db "Blitrum OS v0.9 (pre-1.0)", 0
+shell_ver_str:  db "Blitrum OS v1.0", 0
 shell_prompt:   db "OS> ", 0
 
 ; Komunikaty komend
