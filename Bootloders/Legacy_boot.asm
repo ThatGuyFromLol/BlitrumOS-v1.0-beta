@@ -1,4 +1,4 @@
-[bits 16]
+ [bits 16]
 [org 0x7C00] ; adres, pod którym będzie ładowany nasz bootloader przez BIOS
 
 start: 
@@ -11,7 +11,7 @@ in al, 0x92 ;włącza A20, aby móc korzystać z pamięci powyżej 1MB
 or al, 0x02
 out 0x92, al
 
-cli ;włącza przerwania
+cli ;wyłącza przerwania (cli = clear interrupt flag)
 lgdt [cs:gdt_descryptor] ;ładuje gdt do rejestru gdtr
 
 mov eax,cr0
@@ -22,7 +22,8 @@ jmp 0x08:protected_mode ;przeskok do kodu w trybie chronionym
 
 [bits 32]
 protected_mode:
-cli
+; UWAGA: cli NIE jest tutaj potrzebne — przerwania są już wyłączone od startu.
+; Poprzednia wersja miała zbędne cli, które mogło maskować błędy inicjalizacji.
 mov ax, 0x10 ;ustaw segment danych na 0x10, który jest deskryptorem danych w GDT
 mov ds, ax ;ustaw segment danych na 0x10, który jest deskryptorem danych w GDT na rejestrach ax, ds, es, ss
 mov es, ax 
@@ -45,8 +46,6 @@ mov cr0, eax
 jmp 0x18 : long_mode ;przeskok do kodu w trybie długim (long mode)
 
 [bits 64]
-cli
-
 long_mode:
 mov ax, 0x10 ;ustaw segment danych na 0x10, który jest deskryptorem danych w GDT
 mov ds, ax ;ustaw segment danych na 0x10, który jest deskryptorem danych w GDT na rejestrach ax, ds, es, ss
@@ -111,6 +110,4 @@ align 4096
 pd_table:
  dq 0x00000083   
  times 511 dq 0
- 
- 
 
