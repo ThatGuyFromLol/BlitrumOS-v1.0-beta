@@ -1,0 +1,118 @@
+================================================================================
+           DOKUMENTACJA ARCHITEKTONICZNA I TECHNICZNA SPECYFIKACJI
+          BME-QD (Bit-Matrix Event-Driven Quantum Dispatcher) v1.0
+================================================================================
+Status modułu:      Stabilny / Produkcyjny
+Język i składnia:   Asembler x86-64 (Long Mode / NASM Intel Syntax)
+Złożoność:          O(1) – Stały czas wyboru zadania na poziomie krzemu
+Plik źródłowy:      scheduler_custom.asm
+--------------------------------------------------------------------------------
+
+1. OPIS FILOZOFII ARCHITEKTURY BME-QD
+-------------------------------------
+Tradycyjne systemy operacyjne (Linux CFS, Windows Thread Scheduler) opierają 
+zarządzanie czasem procesora o skomplikowane i zasobożerne struktury danych, 
+takie jak drzewa czerwono-czarne (Red-Black Trees) lub wielopoziomowe kolejki. 
+Wiąże się to z marnowaniem setek cykli procesora na same pętle przeszukujące, 
+czyszczenie pamięci cache procesora oraz ciągłą alokację struktur w pamięci RAM.
+
+Architektura BME-QD rezygnuje z tych koncepcji na rzecz trzech unikalnych zasad:
+
+  A. Zero-Search Architecture (Architektura Bezprzeszukiwaniowa):
+     Centralnym punktem systemu jest pojedynczy, 64-bitowy rejestr stanu 
+     (system_ready_mask). Każdy bit reprezentuje unikalny wątek. Wybór 
+     kolejnego zadania do wykonania odbywa się za pomocą sprzętowej instrukcji 
+     procesora BSF (Bit Scan Forward). Procesor wykonuje selekcję w dokładnie 
+     1 cyklu zegara, ignorując wszystkie śpiące procesy na poziomie krzemu.
+
+  B. Asynchroniczność Zdarzeniowa (Pure Event-Driven):
+     Zadania nie otrzymują czasu procesora "z rozdzielnika" (jak w starym 
+     Round-Robin). Wątek (np. GUI) posiada w masce stan '0' (jest ignorowany), 
+     dopóki nie nastąpi fizyczne zdarzenie. W momencie gdy sterownik (np. USB) 
+     zarejestruje ruch myszką, jednym rozkazem "zapala" bit procesu. GUI 
+     otrzymuje czas procesora natychmiast, gwarantując perfekcyjną płynność.
+
+  C. Lockless No-Allocation Context (Brak Blokad i Alokacji):
+     Stan procesora (rejestry RAX-R15) nie jest kopiowany do struktur w RAM. 
+     Pełna ramka stanu jest zrzucana bezpośrednio na stos jądra danego zadania. 
+     Przełączenie kontekstu polega wyłącznie na modyfikacji rejestru RSP.
+
+
+2. SPECYFIKACJA STRUKTURY STOSU I RAMKI PRZERWANIA
+---------------------------------------------------
+Podczas operacji dyspaczowania (`scheduler_dispatch`), stos aktywnego wątku 
+zostaje zmodyfikowany tak, aby przechowywał pełny stan procesora. Wierzchołek 
+stosu (RSP) wskazuje na poniższą strukturę:
+
+    [Wysoki adres RAM] -> |---------------------------------------|
+
+                          | SS (Segment Danych)                   | <-- Ramka
+                          | RSP (Wskaźnik stosu aplikacji)        |     sprzętowa
+                          | RFLAGS (Rejestr flag procesora)       |     wrzucana
+                          | CS (Segment Kodu)                     |     przez CPU
+                          | RIP (Adres powrotu do programu)       | <-- lub IRETQ
+                          |---------------------------------------|
+                          | R15 .. R8                             | <-- Rejestry
+                          | RBP, RDI, RSI, RDX, RCX, RBX, RAX     |     rozszerzone
+    [Niski adres RAM]  -> |---------------------------------------| <-- Aktualny RSP
+
+
+3. DOKUMENTACJA API (INTERFEJS PROGRAMISTYCZNY)
+-----------------------------------------------
+
+--- FUNKCJA: scheduler_init ---
+Opis:         Inicjalizuje dispatcher. Rejestruje główny rdzeń (Kernel) pod ID 0.
+Wejście:      Brak
+Wyjście:      Brak
+Zasada:       Ustawia bit 0 w `system_ready_mask` na 1. Wywołać raz przy starcie 
+              jądra, przed uruchomieniem przerwań sprzętowych (`sti`).
+
+--- FUNKCJA: scheduler_create_task ---
+Opis:         Rejestruje nowy proces/wątek (np. pętlę graficzną GUI) w systemie.
+Wejście:      RCX = Adres funkcji/punktu startowego programu (RIP).
+              RDX = Adres wierzchołka przydzielonego dla zadania stosu (RAM).
+Wyjście:      RAX = ID przydzielonego zadania (0 do 63) lub -1 przy braku miejsc.
+Zasada:       Funkcja alokuje slot w tabeli, ręcznie konstruuje opisaną wyżej 
+              ramkę na stosie nowej aplikacji (ustawiając flagę IF w RFLAGS, by 
+              wątek akceptował przerwania) i zapisuje RSP. Wątek domyślnie śpi.
+
+--- FUNKCJA: scheduler_trigger_event ---
+Opis:         Asynchroniczne wybudzenie procesu.
+Wejście:      RCX = ID zadania, które ma zostać natychmiast wybudzone (0-63).
+Wyjście:      Brak
+Zasada:       Wykorzystuje atomową instrukcję `lock bts`, dzięki czemu funkcja 
+              jest w 100% bezpieczna w środowiskach wielordzeniowych (SMP). 
+              Może być bezpiecznie wywoływana wewnątrz innych przerwań (ISR).
+
+--- FUNKCJA: scheduler_yield ---
+Opis:         Dobrowolne oddanie czasu procesora przez program (uśpienie wątku).
+We/Wy:        Brak
+Zasada:       Wywoływane przez aplikację (np. gdy GUI obsłużyło kolejkę myszki 
+              i nie ma więcej pracy). Zeruje bit wątku w masce za pomocą `lock btr` 
+              i wywołuje programowe przerwanie `int 0x80`, wymuszając dispatch.
+
+--- FUNKCJA: scheduler_dispatch ---
+Opis:         Serce systemu – sprzętowy przełącznik zadań.
+We/Wy:        Brak (Działa na poziomie rejestrów procesora)
+Zasada:       Wywoływana przez timer (np. APIC Timer). Zapisuje rejestry obecnego 
+              programu, wykonuje rozkaz `bsf rsi, [system_ready_mask]`. Jeśli maska 
+              jest pusta (brak zdarzeń w systemie), procesor bezpiecznie ładuje 
+              zadanie 0 (Kernel Idle), który usypia procesor instrukcją `hlt` 
+              w celu oszczędzania energii, czekając na fizyczne przerwanie.
+
+
+4. INSTRUKCJA INTEGRACJI I KOMPILACJI
+--------------------------------------
+A. Kompilacja modułu w środowisku deweloperskim:
+   $ nasm -f elf64 scheduler_custom.asm -o scheduler_custom.o
+
+B. Linkowanie jądra (wspólnie z pozostałymi napisanymi modułami):
+   $ ld -T linker.ld kernel.o pmm.o video_gop.o scheduler_custom.o -o kernel.bin
+
+C. Wywołanie zdarzenia ze sterownika sprzętowego (Przykład dla sterownika myszy):
+   W momencie odebrania pakietu ruchu z przedniego panelu USB (sterownik xHCI), 
+   aby obudzić GUI (załóżmy, że GUI ma przypisane ID = 5), sterownik wykonuje:
+   
+   mov rcx, 5
+   call scheduler_trigger_event   ; GUI natychmiast wraca do maski obliczeń
+================================================================================
