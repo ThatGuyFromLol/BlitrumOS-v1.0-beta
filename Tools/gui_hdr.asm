@@ -251,4 +251,147 @@ gui_draw_window:
     pop rcx
     pop rbx
     pop rax
+    
+; ==============================================================================
+; FUNKCJA: gui_draw_cursor
+; Rysuje kursor myszy (strzałka 12x12) w backbufferze.
+; Wejście: RCX = X, RDX = Y
+; ==============================================================================
+global gui_draw_cursor
+
+section .data
+align 8
+cursor_x_prev:  dq 0            ; Poprzednia pozycja X (do kasowania)
+cursor_y_prev:  dq 0            ; Poprzednia pozycja Y (do kasowania)
+
+; Bitmapa kursora 12x12 (1 = rysuj, 0 = przezroczysty)
+; Klasyczna strzałka skierowana w lewo-górę
+align 16
+cursor_bitmap:
+    db 1,0,0,0,0,0,0,0,0,0,0,0
+    db 1,1,0,0,0,0,0,0,0,0,0,0
+    db 1,1,1,0,0,0,0,0,0,0,0,0
+    db 1,1,1,1,0,0,0,0,0,0,0,0
+    db 1,1,1,1,1,0,0,0,0,0,0,0
+    db 1,1,1,1,1,1,0,0,0,0,0,0
+    db 1,1,1,1,1,1,1,0,0,0,0,0
+    db 1,1,1,1,1,1,1,1,0,0,0,0
+    db 1,1,1,1,0,0,0,0,0,0,0,0
+    db 1,1,0,1,1,0,0,0,0,0,0,0
+    db 1,0,0,0,1,1,0,0,0,0,0,0
+    db 0,0,0,0,0,1,1,0,0,0,0,0
+
+CURSOR_W equ 12
+CURSOR_H equ 12
+CURSOR_COLOR     equ 0x0000FFFFFFFFFFFF  ; Biały (64-bit HDR)
+CURSOR_OUTLINE   equ 0x0000000000000000  ; Czarny (obrys)
+
+section .text
+
+gui_draw_cursor:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx                ; R12 = nowe X
+    mov r13, rdx                ; R13 = nowe Y
+
+    ; --- KROK 1: Skasuj stary kursor (nadpisz czernią) ---
+    mov r14, [cursor_x_prev]
+    mov r15, [cursor_y_prev]
+
+    xor rsi, rsi                ; RSI = wiersz
+.erase_y:
+    cmp rsi, CURSOR_H
+    jge .draw_cursor
+    xor rdi, rdi                ; RDI = kolumna
+.erase_x:
+    cmp rdi, CURSOR_W
+    jge .erase_next_y
+
+    lea rax, [rel cursor_bitmap]
+    mov rbx, rsi
+    imul rbx, CURSOR_W
+    add rbx, rdi
+    movzx eax, byte [rax + rbx]
+    test al, al
+    jz .erase_skip
+
+    push rcx
+    push rdx
+    mov ecx, r14d
+    add ecx, edi
+    mov edx, r15d
+    add edx, esi
+    mov r8, 0x0000000000000000  ; Czarny
+    call gui_draw_to_backbuffer
+    pop rdx
+    pop rcx
+
+.erase_skip:
+    inc rdi
+    jmp .erase_x
+.erase_next_y:
+    inc rsi
+    jmp .erase_y
+
+    ; --- KROK 2: Narysuj nowy kursor ---
+.draw_cursor:
+    xor rsi, rsi
+.draw_y:
+    cmp rsi, CURSOR_H
+    jge .cursor_done
+    xor rdi, rdi
+.draw_x:
+    cmp rdi, CURSOR_W
+    jge .draw_next_y
+
+    lea rax, [rel cursor_bitmap]
+    mov rbx, rsi
+    imul rbx, CURSOR_W
+    add rbx, rdi
+    movzx eax, byte [rax + rbx]
+    test al, al
+    jz .draw_skip
+
+    push rcx
+    push rdx
+    mov ecx, r12d
+    add ecx, edi
+    mov edx, r13d
+    add edx, esi
+    mov r8, CURSOR_COLOR
+    call gui_draw_to_backbuffer
+    pop rdx
+    pop rcx
+
+.draw_skip:
+    inc rdi
+    jmp .draw_x
+.draw_next_y:
+    inc rsi
+    jmp .draw_y
+
+.cursor_done:
+    ; Zapisz nową pozycję jako poprzednią
+    mov [cursor_x_prev], r12
+    mov [cursor_y_prev], r13
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
