@@ -15,6 +15,7 @@ global _start
 ; ==============================================================================
 ; INDEKS STEROWNIKÓW I SYSTEMU (Podpięcie Twoich plików ze zdjęć)
 ; ==============================================================================
+extern bsod_init
 extern scheduler_event_loop
 extern hid_init
 extern idt_init                 ; z idt.asm (Tabela Przerwań)
@@ -181,7 +182,8 @@ _start:
 
     ; --- 9. INICJALIZACJA SCHEDULERA ZDARZENIOWEGO (BME-QD) ---
     call scheduler_init         ; Przygotowanie 64-bitowej maski procesów
-    call hid_init  
+    call hid_init
+    call bsod_init  
     call shell_init             ; Inicjalizacja parsera klawiatury i myszy
     ; --- KROK 10: URUCHOMIENIE INTERFEJSU GRAFICZNEGO ---
     cmp byte [tgfs_active], 1
