@@ -37,8 +37,6 @@ extern scheduler_trigger_event  ; z custom_sceduler.asm
 ; Wektory systemu aktualizacji AHS-TUS
 extern update_system_init       ; z ahs-tus.asm
 extern update_register_vector   ; z ahs-tus.asm
-extern scheduler_event_loop
-extern hid_init
 extern update_check
 extern update_apply
 extern update_is_pending
@@ -93,18 +91,6 @@ _start:
     mov qword [fb_width], 0
     mov qword [fb_height], 0
     mov qword [fb_pps], 0
-
-.boot_common:
-    ; --- 2. ODCZYT PARAMETRÓW ROZDZIELCZOŚCI Z BOOTLOADERA ---
-    ; UWAGA: bootloader skoczył tu instrukcją `jmp` (bez `call`), więc nie odłożył
-    ; adresu powrotu. Parametry leżą na stosie bootloadera od [rsp+32] w górę.
-    ; Musimy je odczytać ZANIM przełączymy stos na własny.
-    mov eax, [rsp + 32]         ; Szerokość ekranu (Width)
-    mov [fb_width], eax
-    mov eax, [rsp + 40]         ; Wysokość ekranu (Height)
-    mov [fb_height], eax
-    mov eax, [rsp + 48]         ; Pixels Per Scan Line (PPS)
-    mov [fb_pps], eax
 
     ; --- ODCZYT MAPY PAMIĘCI UEFI PRZEKAZANEJ PRZEZ BOOTLOADER ---
     mov rax, [rsp + 56]         ; Wskaźnik na mapę pamięci (EFI_MEMORY_DESCRIPTOR[])
