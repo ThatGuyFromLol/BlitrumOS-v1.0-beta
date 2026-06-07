@@ -15,6 +15,8 @@ global _start
 ; ==============================================================================
 ; INDEKS STEROWNIKÓW I SYSTEMU (Podpięcie Twoich plików ze zdjęć)
 ; ==============================================================================
+extern scheduler_event_loop
+extern hid_init
 extern idt_init                 ; z idt.asm (Tabela Przerwań)
 extern pmm_init                 ; z ppm.asm (Menedżer RAM - w skrypcie jako ppm.o)
 extern gui_init                 ; z gui_hdr.asm (Inicjalizacja Wektorowego GUI)
@@ -198,7 +200,7 @@ _start:
 
     ; --- 9. INICJALIZACJA SCHEDULERA ZDARZENIOWEGO (BME-QD) ---
     call scheduler_init         ; Przygotowanie 64-bitowej maski procesów
-
+    call hid_init               ; Inicjalizacja parsera klawiatury i myszy
     ; --- KROK 10: URUCHOMIENIE INTERFEJSU GRAFICZNEGO ---
     cmp byte [tgfs_active], 1
     jne .fallback_render
@@ -233,9 +235,9 @@ _start:
     ; --- 11. ROZPOCZĘCIE ASYNCHRONICZNEJ PRACY EKOSYSTEMU ---
     sti                         ; Całkowite zezwolenie na sprzętowe przerwania procesora
 
-    ; Bezczynna pętla jądra (Idle Thread - Zadanie 0).
+    ; Bezczynna pętla jądra (Idle Thread - Zadanie 0
 .kernel_idle_loop:
-    hlt                         ; Energooszczędne wyłączenie rdzenia do nadejścia przerwania
+    call scheduler_event_loop
     jmp .kernel_idle_loop
 
 ; Przechwytywanie awarii krytycznej (Kernel Panic)
