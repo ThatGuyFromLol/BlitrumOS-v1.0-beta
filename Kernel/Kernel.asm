@@ -238,7 +238,7 @@ msg_boot: db "Kernel uruchomiony!", 0
     cli
 .panic_loop:
     hlt
-    jmp panic_loop
+    jmp .panic_loop
 
 section .data
 align 8
