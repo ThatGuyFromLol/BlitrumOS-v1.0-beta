@@ -3,9 +3,6 @@ section .text
 
 extern isr_pit_handler
 global idt_init
-global bsod_handler
-extern bsod_handler
-global bsod_handler
 extern bsod_handler
 
 ; ISR sprzętowy USB 3.0 (xHCI) z usb_interrupts.asm.
@@ -137,7 +134,6 @@ ISR_NOERR 31
 ; WSPÓLNY HANDLER WYJĄTKÓW
 ; ==============================================================================
 common_exception_handler:
-extern bsod_handler   
  ; Na stosie: [rsp+0]=wektor, [rsp+8]=kod błędu
     ; Przekaż kontrolę do BSOD handlera
     call bsod_handler
