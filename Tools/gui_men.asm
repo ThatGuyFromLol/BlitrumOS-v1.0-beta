@@ -56,7 +56,8 @@ gui_manager_init:
     mov dword [component_table + 8], 0
     mov dword [component_table + 12], 1920
     mov dword [component_table + 16], 1080
-    mov qword [component_table + 20], 0x0000222233334444
+    mov rax, 0x0000222233334444
+    mov [component_table + 20], rax
     pop rax
     ret
 

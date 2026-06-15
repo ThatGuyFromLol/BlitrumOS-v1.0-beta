@@ -81,12 +81,12 @@ find_usb_controllers:
     mov cl, 0x14
     call pci_read_config_dword
     shl rax, 32             ; Przesuń wyższą część na właściwą pozycję
-    and rdx, 0xFFFFFFF0     ; Wyczyść bity konfiguracyjne dolnej części
+    and rdx, -16           ; Wyczyść bity konfiguracyjne dolnej części
     or rdx, rax             ; Połącz dolną i górną część w pełny adres 64-bitowy
     jmp .handshake_start
 
 .bar_32bit:
-    and rdx, 0xFFFFFFF0     ; Dla starego mapowania wyczyść tylko bity konfiguracyjne
+    and rdx, -16          ; Dla starego mapowania wyczyść tylko bity konfiguracyjne
 
 .handshake_start:
     mov rax, rdx            ; RAX zawiera teraz PEŁNY 64-bitowy adres MMIO

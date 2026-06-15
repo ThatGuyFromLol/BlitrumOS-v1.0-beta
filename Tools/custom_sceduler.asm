@@ -8,6 +8,8 @@ global scheduler_trigger_event
 global scheduler_yield
 global scheduler_dispatch
 
+extern shell_run
+
 ; Maksymalna liczba zadań/wątków w systemie (64 bity = 64 zadania)
 MAX_TASKS equ 64
 
@@ -110,7 +112,7 @@ scheduler_trigger_event:
 ; Wywoływane przez aplikację, gdy obsłużyła zdarzenie i przechodzi w sen.
 ; ==============================================================================
 scheduler_yield:
-    movzx ecx, dword [current_task_id]
+    mov ecx, [current_task_id]
     lock btr [system_ready_mask], rcx  ; Bezpieczne atomowe wyczyszczenie bitu
     int 0x80                    ; Wywołanie przerwania programowego dla dispatchera
     ret
@@ -138,7 +140,7 @@ scheduler_dispatch:
     push r15
 
     ; Zapis wskaźnika RSP aktualnego wątku
-    movzx ecx, dword [current_task_id]
+    mov ecx, [current_task_id]
     mov [task_rsp_table + rcx * 8], rsp
 
     ; 2. --- SPRZĘTOWY WYBÓR W JEDNYM CYKLU (BME-QD) ---

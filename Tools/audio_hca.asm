@@ -78,12 +78,12 @@ find_hda_controller:
     mov cl, 0x14
     call pci_read_config_dword
     shl rax, 32             
-    and rdx, 0xFFFFFFF0     ; Wyczyść bity konfiguracyjne dolnej części
+    and rdx, -16           ; Wyczyść bity konfiguracyjne dolnej części
     or rdx, rax             ; Połącz w pełny adres 64-bitowy
     jmp .done
 
 .bar_32bit:
-    and rdx, 0xFFFFFFF0     ; Wyczyść bity konfiguracyjne dla 32-bit BAR
+    and rdx, -16          ; Wyczyść bity konfiguracyjne dla 32-bit BAR
 
 .done:
     mov rax, rdx            ; RAX zawiera poprawny adres MMIO dla Intel HD Audio
