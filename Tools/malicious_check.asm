@@ -325,7 +325,7 @@ malicious_check_runtime:
 ; Zwraca: RAX = ostatni kod błędu
 ; ==============================================================================
 mcd_get_last_error:
-    movzx rax, dword [last_error]
+    mov rax, [last_error]
     ret
 
 
