@@ -234,11 +234,11 @@ msg_boot: db "Kernel uruchomiony!", 0
     jmp .kernel_idle_loop
 
 ; Przechwytywanie awarii krytycznej (Kernel Panic)
-.kernel_panic:
+kernel_panic:
     cli
-.panic_loop:
+panic_loop:
     hlt
-    jmp .panic_loop
+    jmp panic_loop
 
 section .data
 align 8
