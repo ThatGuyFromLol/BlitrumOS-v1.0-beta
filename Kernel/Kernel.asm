@@ -62,12 +62,12 @@ _start:
 
        ; Sprawdź sygnaturę bootloadera
     cmp rdx, 0x55454649         ; "UEFI"
-    je .boot_uefi
+    je boot_uefi
     cmp rcx, 0x42494F53         ; "BIOS" (Legacy)
-    je .boot_legacy
-    jmp .kernel_panic
+    je boot_legacy
+    jmp kernel_panic
 
-.boot_uefi:
+boot_uefi:
     ; Odczyt parametrów UEFI ze stosu (jak było wcześniej)
     mov eax, [rsp + 32]
     mov [fb_width], eax
@@ -81,9 +81,9 @@ _start:
     mov [mmap_size], rax
     mov rax, [rsp + 72]
     mov [mmap_descsz], rax
-    jmp .boot_common
+    jmp boot_common
 
-.boot_legacy:
+boot_legacy:
     ; Odczyt mapy E820 przekazanej przez Legacy bootloader
     mov rax, [rsp + 40]         ; Adres bufora E820 (0x6000)
     mov [mmap_ptr], rax
@@ -196,14 +196,14 @@ msg_boot: db "Kernel uruchomiony!", 0
              ; Inicjalizacja parsera klawiatury i myszy
     ; --- KROK 10: URUCHOMIENIE INTERFEJSU GRAFICZNEGO ---
     cmp byte [tgfs_active], 1
-    jne .fallback_render
+    jne fallback_render
 
     ; Szukamy na dysku TGFS binarnego pliku GUI (np. pod unikalnym ID = 5)
     mov rcx, 0                  ; Port SATA 0
     mov rdx, 5                  ; ID pliku w Tag Registry
     mov r8, 0x00800000          ; Bezpieczna przestrzeń w RAM na rozpakowanie kodu
     call tgfs_load_and_map_file ; JMP-Loader parsuje (Natywny/ELF/EXE), relokuje Zero-Copy
-    
+
     ; Przekazujemy punkt startowy zwrócony w RAX do Schedulera
     mov rcx, rax                ; RCX = RIP aplikacji startowej (GUI)
     mov rdx, 0x00A00000         ; RDX = Adres nowo utworzonego stosu dla GUI wątku
@@ -212,9 +212,9 @@ msg_boot: db "Kernel uruchomiony!", 0
     ; Zapalamy bit wątku GUI w masce
     mov rcx, rax                
     call scheduler_trigger_event
-    jmp .system_execute
+    jmp system_execute
 
-.fallback_render:
+fallback_render:
     ; AWARYJNY RENDERING (gdy uruchamiasz system na czystym dysku bez plików TGFS)
     mov ecx, 150                ; Współrzędna X
     mov edx, 150                ; Współrzędna Y
@@ -224,21 +224,21 @@ msg_boot: db "Kernel uruchomiony!", 0
 
     call gui_refresh_screen     ; AVX-2 Blitter konwertuje i wyrzuca obraz na HDMI/DP
 
-.system_execute:
+system_execute:
     ; --- 11. ROZPOCZĘCIE ASYNCHRONICZNEJ PRACY EKOSYSTEMU ---
     sti                         ; Całkowite zezwolenie na sprzętowe przerwania procesora
 
     ; Bezczynna pętla jądra (Idle Thread - Zadanie 0
-.kernel_idle_loop:
+kernel_idle_loop:
     call scheduler_event_loop
-    jmp .kernel_idle_loop
+    jmp kernel_idle_loop
 
 ; Przechwytywanie awarii krytycznej (Kernel Panic)
-.kernel_panic:
+kernel_panic:
     cli
-.panic_loop:
+panic_loop:
     hlt
-    jmp .panic_loop
+    jmp panic_loop
 
 section .data
 align 8
