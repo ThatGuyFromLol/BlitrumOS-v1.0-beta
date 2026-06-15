@@ -102,6 +102,7 @@ boot_legacy:
     mov r13, r8                 ; R13 = Aktualny rejestr CR3
     mov r14, r9                 ; R14 = Fizyczny adres Framebuffera GOP (HDMI/DP)
 
+boot_common:
     ; Teraz bezpiecznie uruchamiamy własny stos jądra (BSP)
     mov rsp, stack_top
 
