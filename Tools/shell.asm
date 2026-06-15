@@ -164,7 +164,9 @@ shell_run:
     ; Usuń ostatni znak z bufora
     dec dword [shell_input_len]
     lea rbx, [rel shell_input_buf]
-    mov byte [rbx + ecx - 1], 0
+    mov rdx, rcx
+    sub rdx, 1
+    mov byte [rbx + rdx], 0
 
     ; Cofnij kursor i nadpisz spacją
     call shell_backspace_char
@@ -182,7 +184,8 @@ shell_run:
 
     ; Null-terminate bufor
     lea rbx, [rel shell_input_buf]
-    mov byte [rbx + ecx], 0
+    mov rdx, rcx
+    mov byte [rbx + rdx], 0
 
     ; Wykonaj komendę
     lea rcx, [rel shell_input_buf]
