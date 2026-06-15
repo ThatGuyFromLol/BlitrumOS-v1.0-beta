@@ -128,7 +128,7 @@ update_hot_swap_driver:
     ; zaczyna wskazywać na nową wersję sterownika.
     lea rdi, [system_vector_table + r12 * 8]
     
-    lock xchg [rdi], rax        ; RAX dostaje STARY adres sterownika, a w tabeli ląduje NOWY!
+    xchg [rdi], rax        ; RAX dostaje STARY adres sterownika, a w tabeli ląduje NOWY!
 
     ; Stary adres sterownika (zwrócony w RAX) można teraz bezpiecznie zwolnić 
     ; lub zachować w celu wykonania automatycznego ROLLBACKU w przypadku awarii.
