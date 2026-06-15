@@ -255,7 +255,7 @@ tgfs_load_and_map_file:
     call ahci_read_sectors
     mov eax, [r13 + 0x3C]
     add rax, r13
-    movzx rax, dword [rax + 0x28]
+    mov eax, [rax + 0x28]
     add rax, r13
     jmp .clean_exit
 
