@@ -40,7 +40,8 @@ nasm -f elf64 Tools/tgfs_vfs.asm -o tgfs_vfs.o
 
 echo "-> Linking with LLVM LLD..."
 
-clang -nostdlib -Wl,-T,linker.ld \
+clang -ffreestanding -nostdlib -fno-builtin \
+-Wl,-T,linker.ld \
 kernel.o idt.o pmm.o gui_hdr.o gui_men.o video_gop.o \
 usb_interrupts.o multicore_legacy.o ahci.o audio_hca.o \
 pci_dyski.o usb_controller.o custom_sceduler.o hid_parser.o \
