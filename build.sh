@@ -30,7 +30,7 @@ nasm -f elf64 Tools/usb_controller.asm -o usb_controller.o
 nasm -f elf64 Tools/custom_sceduler.asm -o custom_sceduler.o
 nasm -f elf64 Tools/hid_parser.asm -o hid_parser.o
 nasm -f elf64 Tools/shell.asm -o shell.o
-nasm -f elf64 Tools/bsod.asm -o bsod.o
+nasm -f elf64 Tools/bosd.asm -o bsod.o
 nasm -f elf64 Tools/serial.asm -o serial.o
 nasm -f elf64 Tools/pit_timer.asm -o pit_timer.o
 nasm -f elf64 Tools/ahs-tus.asm -o ahs-tus.o
