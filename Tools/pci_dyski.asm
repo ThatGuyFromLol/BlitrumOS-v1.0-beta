@@ -160,4 +160,4 @@ xhci_bios_handshake:
     ret
 
 
-; Funkcja pci_read_config_dword znajduje się w pci_(dyski).asm (wspólna implementacja).
+; Funkcja pci_read_config_dword znajduje się w pci_dyski.asm (wspólna implementacja).

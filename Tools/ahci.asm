@@ -6,7 +6,7 @@ global find_ahci_controller
 global init_ahci_controller
 global check_ahci_ports
 global ahci_read_sectors
-; BUGFIX: `pci_read_config_dword` jest zdefiniowane w pci_(dyski).asm.
+; BUGFIX: `pci_read_config_dword` jest zdefiniowane w pci_dyski.asm.
 ; Wcześniej ahci.asm definiowało własną kopię -> "multiple definition".
 ; Używamy wspólnej implementacji jako extern.
 extern pci_read_config_dword
@@ -332,4 +332,4 @@ align 8
 ahci_mmio_base: dq 0            ; Adres bazowy MMIO kontrolera AHCI (z init_ahci_controller)
 
 section .text
-; Funkcja pci_read_config_dword znajduje się w pci_(dyski).asm (wspólna implementacja).
+; Funkcja pci_read_config_dword znajduje się w pci_dyski.asm (wspólna implementacja).

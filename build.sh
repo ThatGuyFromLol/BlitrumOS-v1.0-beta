@@ -25,7 +25,7 @@ nasm -f elf64 Tools/usb_interrupts.asm -o usb_interrupts.o
 nasm -f elf64 Tools/multicore_legacy.asm -o multicore_legacy.o
 nasm -f elf64 Tools/ahci.asm -o ahci.o
 nasm -f elf64 Tools/audio_hca.asm -o audio_hca.o
-nasm -f elf64 Tools/pci_(dyski).asm -o pci_dyski.o
+nasm -f elf64 Tools/pci_dyski.asm -o pci_dyski.o
 nasm -f elf64 Tools/usb_controller.asm -o usb_controller.o
 nasm -f elf64 Tools/custom_sceduler.asm -o custom_sceduler.o
 nasm -f elf64 Tools/hid_parser.asm -o hid_parser.o
