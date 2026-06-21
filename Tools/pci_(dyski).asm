@@ -4,12 +4,10 @@
 bits 64
 section .text
 
-global find_usb_controllers
-; BUGFIX: `pci_read_config_dword` jest zdefiniowane w pci_(dyski).asm.
-; Eksportowanie go również tutaj dawało "multiple definition" przy linkowaniu.
-; Używamy wspólnej implementacji jako extern.
-extern pci_read_config_dword
 
+
+extern pci_read_config_dword
+extern find_usb_controllers
 ; ==============================================================================
 ; FUNKCJA: find_usb_controllers
 ; Przeszukuje magistralę PCI w poszukiwaniu kontrolera USB 3.0 (xHCI).
@@ -19,12 +17,6 @@ extern pci_read_config_dword
 ;   RAX = Pełny, 64-bitowy adres fizyczny rejestrów MMIO kontrolera xHCI
 ;   Flaga Carry (CF): wyczyszczona (0) = sukces, ustawiona (1) = nie znaleziono USB 3.0
 ; ==============================================================================
-find_usb_controllers:
-    push rbx
-    push rcx
-    push rdx
-
-    mov bh, 0               ; BH = Bus (Magistrala, zaczynamy od 0)
 .loop_bus:
     mov bl, 0               ; BL = Device (Urządzenie, zaczynamy od 0)
 .loop_dev:
