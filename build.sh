@@ -40,17 +40,13 @@ nasm -f elf64 Tools/tgfs_vfs.asm -o tgfs_vfs.o
 
 echo "-> Linking with LLVM LLD..."
 
-ld.lld \
--T linker.ld \
--nostdlib \
---oformat elf64-x86-64 \
+clang -nostdlib -Wl,-T,linker.ld \
 kernel.o idt.o pmm.o gui_hdr.o gui_men.o video_gop.o \
 usb_interrupts.o multicore_legacy.o ahci.o audio_hca.o \
 pci_dyski.o usb_controller.o custom_sceduler.o hid_parser.o \
 shell.o bsod.o serial.o pit_timer.o ahs-tus.o \
 update_loader.o malicious_check.o tgfs_vfs.o \
 -o kernel.bin
-
 echo "===================================================================="
 echo "[OK] kernel.bin built (ELF64)"
 echo "===================================================================="
