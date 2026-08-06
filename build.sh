@@ -124,4 +124,3 @@ if [[ "$(uname -s)" == *MINGW* || "$(uname -s)" == *MSYS* ]]; then
   echo "If you prefer WSL, run this script inside WSL and install packages there (nasm, binutils, qemu, ovmf, python3)."
 fi
 
-echo "Done. If you hit errors, paste the console output here and I'll help debug."
