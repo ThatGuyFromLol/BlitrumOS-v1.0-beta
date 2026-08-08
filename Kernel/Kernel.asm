@@ -82,25 +82,56 @@ boot_uefi:
     mov rax, [rsp + 72]
     mov [mmap_descsz], rax
     jmp boot_common
-
 boot_legacy:
-    ; Odczyt mapy E820 przekazanej przez Legacy bootloader
-    mov rax, [rsp + 40]         ; Adres bufora E820 (0x6000)
-    mov [mmap_ptr], rax
-    mov rax, [rsp + 32]         ; Liczba deskryptorów
-    mov rbx, 24
-    mul rbx                     ; Rozmiar mapy = liczba * 24
-    mov [mmap_size], rax
-    mov qword [mmap_descsz], 24 ; Deskryptor E820 = 24 bajty
-    ; Brak framebuffera GOP — GUI działa w trybie tekstowym VGA
-    mov qword [fb_width], 0
-    mov qword [fb_height], 0
-    mov qword [fb_pps], 0
 
-    ; Przenosimy parametry z bootloadera do rejestrów nieulotnych zgodnie z ABI
-    mov r12, rcx                ; R12 = Adres UEFI sys_table
-    mov r13, r8                 ; R13 = Aktualny rejestr CR3
-    mov r14, r9                 ; R14 = Fizyczny adres Framebuffera GOP (HDMI/DP)
+    ; ==================================================================
+    ; LEGACY BIOS BOOTINFO
+    ;
+    ; Stage 2 zapisuje BOOTINFO pod 0x5000:
+    ;
+    ; +0x08 = adres E820
+    ; +0x10 = liczba wpisów E820
+    ; +0x18 = rozmiar wpisu E820
+    ; +0x20 = framebuffer = 0
+    ; +0x28 = width = 0
+    ; +0x2C = height = 0
+    ; +0x30 = pixels per scanline = 0
+    ; ==================================================================
+
+    ; Adres E820
+    mov rax, [0x5008]
+    mov [mmap_ptr], rax
+
+    ; Liczba wpisów
+    movzx rax, word [0x5010]
+
+    ; Rozmiar pojedynczego wpisu
+    mov rbx, [0x5018]
+
+    ; mmap_size = liczba wpisów * rozmiar wpisu
+    mul rbx
+
+    mov [mmap_size], rax
+
+    ; Descriptor size
+    mov rax, [0x5018]
+    mov [mmap_descsz], rax
+
+    ; ==================================================================
+    ; Legacy BIOS nie daje nam GOP framebuffer
+    ; ==================================================================
+
+    mov dword [fb_width], 0
+    mov dword [fb_height], 0
+    mov dword [fb_pps], 0
+
+    ; Brak framebuffer address
+    xor r14, r14
+
+    ; CR3 przekazane przez Stage 2
+    mov r13, r8
+
+    jmp boot_common
 
 boot_common:
     ; Teraz bezpiecznie uruchamiamy własny stos jądra (BSP)
