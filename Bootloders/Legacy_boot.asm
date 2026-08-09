@@ -31,7 +31,7 @@ STAGE2_ADDRESS  equ 0x8000
 ;
 ; Stage2 is 16KB, so load the full 32 sectors.
 ;
-STAGE2_SECTORS  equ 32
+STAGE2_SECTORS  equ 35
 
 ; -----------------------------------------------------------------------------
 ; Start
