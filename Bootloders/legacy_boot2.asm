@@ -37,8 +37,8 @@ E820_BUFFER         equ 0x00006000
 KERNEL_TEMP         equ 0x00020000
 KERNEL_ADDRESS      equ 0x00100000
 
-STACK32             equ 0x00090000
-STACK64             equ 0x00090000
+STACK32             equ 0x000B0000
+STACK64             equ 0x000B0000
 
 PML4_ADDRESS        equ 0x00070000
 PDPT_ADDRESS        equ 0x00071000
