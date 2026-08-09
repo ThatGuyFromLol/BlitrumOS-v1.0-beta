@@ -50,8 +50,8 @@ PD_ADDRESS          equ 0x00072000
 ; =============================================================================
 
 ; Stage 1 = sektor 1
-; Stage 2 = sektory 2... (32 sektory)
-; Kernel zaczyna się od LBA 34
+; Stage 2 = sektory 2... (35 sektory)
+; Kernel zaczyna się od LBA 36+
 
 KERNEL_LBA          equ 36
 
