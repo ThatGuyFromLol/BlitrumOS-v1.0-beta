@@ -551,7 +551,7 @@ setup_page_tables:
 
     xor eax, eax
 
-    mov ecx, 512
+    mov ecx, 1024
 
     rep stosd
 
@@ -563,7 +563,7 @@ setup_page_tables:
 
     xor eax, eax
 
-    mov ecx, 512
+    mov ecx, 1024
 
     rep stosd
 
@@ -575,7 +575,7 @@ setup_page_tables:
 
     xor eax, eax
 
-    mov ecx, 512
+    mov ecx, 1024
 
     rep stosd
 
