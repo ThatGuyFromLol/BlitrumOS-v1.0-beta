@@ -50,10 +50,10 @@ PD_ADDRESS          equ 0x00072000
 ; =============================================================================
 
 ; Stage 1 = sektor 1
-; Stage 2 = sektory 2...
-; Kernel zaczyna się od LBA 17
+; Stage 2 = sektory 2... (32 sektory)
+; Kernel zaczyna się od LBA 34
 
-KERNEL_LBA          equ 17
+KERNEL_LBA          equ 34
 
 ; Maksymalny rozmiar kernela:
 ; 1024 * 512 = 512 KiB

@@ -27,12 +27,11 @@ STAGE2_ADDRESS  equ 0x8000
 ; Stage 2 occupies sectors immediately after boot sector.
 ;
 ; 1 = 512 bytes
-; 16 = 8192 bytes
+; 32 = 16384 bytes
 ;
-; Na początek zostawiamy 16 sektorów.
-; Później build.sh może policzyć to automatycznie.
+; Stage2 is 16KB, so load the full 32 sectors.
 ;
-STAGE2_SECTORS  equ 16
+STAGE2_SECTORS  equ 32
 
 ; -----------------------------------------------------------------------------
 ; Start
@@ -48,7 +47,7 @@ _start:
     ; ---------------------------------------------------------
 
     mov [boot_drive], dl
-    mov [4FF0],dl
+    mov [0x4FF0], dl
     ; ---------------------------------------------------------
     ; Initialize segments
     ; ---------------------------------------------------------

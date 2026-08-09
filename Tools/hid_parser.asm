@@ -22,6 +22,8 @@ global hid_get_mouse_x
 global hid_get_mouse_y
 global hid_get_last_key
 global hid_get_mouse_buttons
+global mouse_x
+global mouse_y
 
 extern usb_pop_event
 extern gui_draw_cursor
