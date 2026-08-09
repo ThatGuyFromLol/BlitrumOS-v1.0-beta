@@ -840,3 +840,11 @@ PD:
 ; =============================================================================
 
 stage2_end:  
+
+STAGE2_MAX_SIZE equ 35 * 512
+
+%if (stage2_end - $$) > STAGE2_MAX_SIZE
+    %error "Stage 2 is larger than 35 sectors!"
+%endif
+
+times STAGE2_MAX_SIZE - (stage2_end - $$) db 0
