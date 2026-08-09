@@ -75,24 +75,43 @@ _start:
     ;   physical address 0x8000
     ; ---------------------------------------------------------
 
-    mov ax, 0x0000
-    mov es, ax
+    ; ==============================================================================
+; LOAD STAGE 2 USING INT 13h EXTENSIONS (AH=42h)
+; ==============================================================================
 
-    mov bx, STAGE2_ADDRESS
+    ; DS = 0
+    xor ax, ax
+    mov ds, ax
 
-    mov ah, 0x02
-    mov al, STAGE2_SECTORS
+    ; --------------------------------------------------------------------------
+    ; Przygotuj Disk Address Packet (DAP)
+    ; --------------------------------------------------------------------------
 
-    mov ch, 0
-    mov cl, 2
+    mov word [dap], 0x0010          ; rozmiar DAP = 16 bajtów
+    mov byte [dap + 2], 0x00        ; reserved
+    mov word [dap + 4], STAGE2_SECTORS ; liczba sektorów
+    mov word [dap + 6], STAGE2_ADDRESS  ; offset = 0x8000
+    mov word [dap + 8], 0x0000      ; segment = 0x0000
 
-    mov dh, 0
+    ; LBA = 1
+    ; Stage 1 zajmuje LBA 0, więc Stage 2 zaczyna się od LBA 1.
+    mov dword [dap + 10], 1
+    mov dword [dap + 14], 0
 
+    ; --------------------------------------------------------------------------
+    ; BIOS Extended Read
+    ; --------------------------------------------------------------------------
+
+    mov si, dap
     mov dl, [boot_drive]
 
+    mov ah, 0x42
     int 0x13
 
     jc disk_error
+
+    ; Stage 2 znajduje się pod 0x8000
+    jmp STAGE2_ADDRESS
 
     ; ---------------------------------------------------------
     ; Enable A20
