@@ -282,7 +282,9 @@ load_kernel:
 .small_chunk:
 
     mov [dap.count], ax
-
+    ; Zachowaj liczbę sektorów żądaną od BIOS-u.
+    ; BIOS może zmienić DAP.count po INT 13h.
+    mov [last_read_count], ax
     ; -------------------------------------------------------------------------
     ; Destination -> segment:offset
     ;
