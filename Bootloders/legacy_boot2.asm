@@ -757,19 +757,18 @@ dap:
 align 4
 
 boot_drive:
-
     db 0
 
-current_sector_count:
+last_read_count:
+    dw 0
 
+current_sector_count:
     dw 0
 
 current_lba_low:
-
     dd 0
 
 current_destination:
-
     dd 0
 
 
