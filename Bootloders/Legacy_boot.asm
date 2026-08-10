@@ -163,19 +163,16 @@ _start:
 
     mov ah, 0x42
     int 0x13
-
     jc stage2_disk_error
 
     ; =========================================================================
-    ; SPRAWDZENIE LICZBY ODCZYTANYCH SEKTORÓW
+    ; ODCZYT ZAKOŃCZONY
     ;
-    ; BIOS może zmodyfikować DAP.count.
+    ; Nie sprawdzamy DAP.count.
+    ;
+    ; INT 13h AH=42h sygnalizuje błąd przez CF.
+    ; BIOS nie musi zachowywać DAP.count w formie, której oczekujemy.
     ; =========================================================================
-
-    mov ax, [dap + 2]
-
-    cmp ax, STAGE2_SECTORS
-    jne stage2_disk_error
 
     ; =========================================================================
     ; STAGE 2 JEST JUŻ W RAM
