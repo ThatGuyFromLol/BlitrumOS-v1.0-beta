@@ -326,16 +326,22 @@ load_kernel:
     jc kernel_disk_error
 
     ; -------------------------------------------------------------------------
-    ; Ile sektorów faktycznie odczytaliśmy
+    ; BIOS AH=42h zakończył odczyt bez błędu.
+    ;
+    ; Używamy liczby sektorów, które ZLECILIŚMY BIOS-owi.
+    ; Nie polegamy na modyfikowaniu DAP.count przez BIOS.
     ; -------------------------------------------------------------------------
 
     mov ax, [dap.count]
+
+    ; Zachowaj liczbę sektorów dla dalszych obliczeń.
+    mov [last_read_count], ax
 
     ; -------------------------------------------------------------------------
     ; current_lba += count
     ; -------------------------------------------------------------------------
 
-    movzx eax, ax
+    movzx eax, word [last_read_count]
 
     add [current_lba_low], eax
 
@@ -351,7 +357,7 @@ load_kernel:
     ; remaining -= count
     ; -------------------------------------------------------------------------
 
-    mov ax, [dap.count]
+    mov ax, [last_read_count]
 
     sub [current_sector_count], ax
 
