@@ -22,6 +22,9 @@ align 8
 gop_framebuffer:   dq 0         ; Fizyczny adres 32-bitowego ekranu z UEFI GOP
 gui_backbuffer:    dq 0         ; Adres naszego ukrytego 64-bitowego bufora HDR w RAM
 
+global screen_width
+global screen_height
+
 screen_width:      dd 0         ; Szerokość ekranu w pikselach
 screen_height:     dd 0         ; Wysokość ekranu w pikselach
 screen_pps:        dd 0         ; Pixels Per Scan Line
