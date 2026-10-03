@@ -11,7 +11,6 @@ bits 64
 section .text
 
 ; --- DEKLARACJE GLOBALNE API ---
-global gui_init
 global gui_get_backbuffer_addr
 global gui_draw_to_backbuffer
 global gui_refresh_screen
