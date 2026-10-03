@@ -5,29 +5,49 @@
 ; Architektura : x86-64
 ; Składnia     : NASM
 ;
-; Boot:
-;   UEFI -> BOOTX64.EFI
-;       -> GOP
-;       -> \Blitrum\kernel.bin
-;       -> kernel @ 0x00100000
-;       -> UEFI Memory Map
-;       -> BootInfo
-;       -> ExitBootServices()
-;       -> RCX = BootInfo
-;       -> JMP 0x00100000
+; Przepływ:
+;
+;   UEFI
+;     |
+;     v
+;   BOOTX64.EFI
+;     |
+;     +--> GOP
+;     |
+;     +--> Loaded Image Protocol
+;     |       |
+;     |       +--> DeviceHandle
+;     |               |
+;     |               +--> Simple File System
+;     |
+;     +--> \Blitrum\kernel.bin
+;     |
+;     +--> kernel @ 0x00100000
+;     |
+;     +--> GetMemoryMap()
+;     |
+;     +--> BootInfo
+;     |
+;     +--> ExitBootServices()
+;     |
+;     +--> RCX = BootInfo
+;     |
+;     +--> JMP 0x00100000
+;
+; ==============================================================================
 ;
 ; BootInfo:
 ;
-; +0x00  framebuffer address
-; +0x08  framebuffer size
-; +0x10  width
-; +0x14  height
-; +0x18  pixels per scanline
-; +0x1C  pixel format
-; +0x20  memory map pointer
-; +0x28  memory map size
-; +0x30  descriptor size
-; +0x38  descriptor version
+; +0x00 = framebuffer address
+; +0x08 = framebuffer size
+; +0x10 = width
+; +0x14 = height
+; +0x18 = pixels per scanline
+; +0x1C = pixel format
+; +0x20 = EFI memory map pointer
+; +0x28 = EFI memory map size
+; +0x30 = EFI descriptor size
+; +0x38 = EFI descriptor version
 ;
 ; Zgodne z Kernel/Kernel.asm
 ;
@@ -44,7 +64,10 @@ global _start
 ; UEFI GUIDS
 ; ==============================================================================
 
+; ------------------------------------------------------------------------------
 ; EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID
+; ------------------------------------------------------------------------------
+
 gop_guid:
     dd 0x9042A9DE
     dw 0x23DC
@@ -52,7 +75,10 @@ gop_guid:
     db 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A
 
 
+; ------------------------------------------------------------------------------
 ; EFI_LOADED_IMAGE_PROTOCOL_GUID
+; ------------------------------------------------------------------------------
+
 loaded_image_guid:
     dd 0x5B1B31A1
     dw 0x9562
@@ -60,7 +86,10 @@ loaded_image_guid:
     db 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B
 
 
+; ------------------------------------------------------------------------------
 ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID
+; ------------------------------------------------------------------------------
+
 simple_fs_guid:
     dd 0x964E5B22
     dw 0x6459
@@ -68,7 +97,10 @@ simple_fs_guid:
     db 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B
 
 
+; ------------------------------------------------------------------------------
 ; EFI_FILE_INFO_ID
+; ------------------------------------------------------------------------------
+
 file_info_guid:
     dd 0x09576E92
     dw 0x6D3F
@@ -77,72 +109,239 @@ file_info_guid:
 
 
 ; ==============================================================================
-; STAŁE
+; UEFI CONSTANTS
 ; ==============================================================================
 
 KERNEL_LOAD_ADDRESS equ 0x00100000
 
-EFI_ALLOCATE_ADDRESS equ 2
-EFI_LOADER_DATA       equ 4
+PAGE_SIZE           equ 0x1000
 
-EFI_FILE_MODE_READ    equ 1
+; EFI_ALLOCATE_TYPE
+EFI_ALLOCATE_ANY_PAGES   equ 0
+EFI_ALLOCATE_MAX_ADDRESS equ 1
+EFI_ALLOCATE_ADDRESS     equ 2
 
-EFI_SUCCESS            equ 0
-EFI_BUFFER_TOO_SMALL   equ 0x8000000000000005
-EFI_INVALID_PARAMETER  equ 0x8000000000000002
+; EFI_MEMORY_TYPE
+EFI_LOADER_DATA equ 4
 
-; ------------------------------------------------------------------------------
+; EFI_FILE_MODE
+EFI_FILE_MODE_READ equ 1
 
-FB_WIDTH_MIN  equ 640
-FB_WIDTH_MAX  equ 7680
+; EFI_SUCCESS
+EFI_SUCCESS equ 0
 
-FB_HEIGHT_MIN equ 480
-FB_HEIGHT_MAX equ 4320
+; EFI_BUFFER_TOO_SMALL
+EFI_BUFFER_TOO_SMALL equ 0x8000000000000005
 
-; ------------------------------------------------------------------------------
+; EFI_INVALID_PARAMETER
+EFI_INVALID_PARAMETER equ 0x8000000000000002
 
-MMAP_BUF_SIZE equ 262144
-FILE_INFO_SIZE equ 4096
+; EFI_LOAD_ERROR
+EFI_LOAD_ERROR equ 0x8000000000000001
 
 
 ; ==============================================================================
-; ENTRY
+; SYSTEM TABLE OFFSETS
+; ==============================================================================
 ;
-; UEFI x64:
+; EFI_SYSTEM_TABLE:
+;
+; +0x00 Header
+; +0x18 FirmwareVendor
+; +0x20 FirmwareRevision
+; +0x28 ConsoleInHandle
+; +0x30 ConIn
+; +0x38 ConsoleOutHandle
+; +0x40 ConOut
+; +0x48 StandardErrorHandle
+; +0x50 StdErr
+; +0x58 RuntimeServices
+; +0x60 BootServices
+; +0x68 NumberOfTableEntries
+; +0x70 ConfigurationTable
+;
+; ==============================================================================
+
+SYSTEM_TABLE_CON_OUT       equ 0x40
+SYSTEM_TABLE_RUNTIME       equ 0x58
+SYSTEM_TABLE_BOOT_SERVICES  equ 0x60
+
+
+; ==============================================================================
+; BOOT SERVICES OFFSETS
+; ==============================================================================
+;
+; EFI_BOOT_SERVICES:
+;
+; +0x28 AllocatePages
+; +0x30 FreePages
+; +0x38 GetMemoryMap
+; +0x40 AllocatePool
+; +0x48 FreePool
+;
+; +0x98 HandleProtocol
+;
+; +0xC8 LocateProtocol
+;
+; +0xE8 ExitBootServices
+;
+; ==============================================================================
+
+BS_ALLOCATE_PAGES      equ 0x28
+BS_FREE_PAGES          equ 0x30
+BS_GET_MEMORY_MAP      equ 0x38
+BS_ALLOCATE_POOL       equ 0x40
+BS_FREE_POOL           equ 0x48
+
+BS_HANDLE_PROTOCOL     equ 0x98
+BS_LOCATE_PROTOCOL     equ 0x140
+BS_EXIT_BOOT_SERVICES  equ 0xE8
+
+
+; ==============================================================================
+; GOP OFFSETS
+; ==============================================================================
+
+GOP_MODE_OFFSET        equ 0x18
+
+
+; ==============================================================================
+; GOP MODE OFFSETS
+; ==============================================================================
+
+GOP_MODE_INFO_OFFSET        equ 0x08
+GOP_MODE_FB_BASE_OFFSET     equ 0x18
+GOP_MODE_FB_SIZE_OFFSET     equ 0x20
+
+
+; ==============================================================================
+; GOP MODE INFO OFFSETS
+; ==============================================================================
+
+GOP_INFO_VERSION_OFFSET     equ 0x00
+GOP_INFO_WIDTH_OFFSET       equ 0x04
+GOP_INFO_HEIGHT_OFFSET      equ 0x08
+GOP_INFO_FORMAT_OFFSET      equ 0x0C
+GOP_INFO_PPS_OFFSET         equ 0x10
+
+
+; ==============================================================================
+; EFI FILE PROTOCOL OFFSETS
+; ==============================================================================
+
+EFI_FILE_OPEN_OFFSET        equ 0x08
+EFI_FILE_CLOSE_OFFSET       equ 0x10
+EFI_FILE_DELETE_OFFSET      equ 0x18
+EFI_FILE_READ_OFFSET        equ 0x20
+EFI_FILE_WRITE_OFFSET       equ 0x28
+EFI_FILE_GET_POSITION       equ 0x30
+EFI_FILE_SET_POSITION       equ 0x38
+EFI_FILE_GET_INFO_OFFSET    equ 0x40
+
+
+; ==============================================================================
+; LOADED IMAGE PROTOCOL OFFSETS
+; ==============================================================================
+
+LOADED_IMAGE_DEVICE_HANDLE equ 0x18
+
+
+; ==============================================================================
+; FILE INFO
+; ==============================================================================
+
+; 64 KiB is enough for the EFI_FILE_INFO structure.
+FILE_INFO_BUFFER_SIZE equ 0x10000
+
+
+; ==============================================================================
+; MEMORY MAP BUFFER
+; ==============================================================================
+;
+; 1 MiB static buffer.
+;
+; UEFI memory maps are normally much smaller, but 1 MiB gives us substantial
+; headroom while keeping the loader simple.
+;
+; Jeżeli GetMemoryMap() zwróci BUFFER_TOO_SMALL nawet dla tego bufora,
+; loader zatrzyma się zamiast przekazać uszkodzoną mapę do kernela.
+;
+; ==============================================================================
+
+MEMORY_MAP_BUFFER_SIZE equ 0x100000
+
+
+; ==============================================================================
+; KERNEL SIZE LIMIT
+; ==============================================================================
+;
+; Kernel jest ładowany od 1 MiB.
+;
+; PMM rezerwuje pierwsze 32 MiB, więc trzymamy kernel zdecydowanie poniżej
+; tego zakresu.
+;
+; 16 MiB:
+;
+;   0x00100000 - 0x01100000
+;
+; ==============================================================================
+
+MAX_KERNEL_SIZE equ 0x01000000
+
+
+; ==============================================================================
+; UEFI ENTRY
+; ==============================================================================
 ;
 ; RCX = ImageHandle
 ; RDX = EFI_SYSTEM_TABLE
+;
+; UEFI x64 używa Microsoft x64 ABI.
+;
 ; ==============================================================================
 
 _start:
 
     ; --------------------------------------------------------------------------
-    ; Zachowaj parametry UEFI
+    ; Wyłączamy przerwania podczas pracy loadera.
+    ; --------------------------------------------------------------------------
+
+    cli
+
+    ; --------------------------------------------------------------------------
+    ; Zachowaj parametry wejściowe.
     ; --------------------------------------------------------------------------
 
     mov [rel image_handle], rcx
     mov [rel sys_table], rdx
 
-    ; Windows x64 / UEFI ABI shadow space
-    sub rsp, 40
+    ; --------------------------------------------------------------------------
+    ; Stack frame.
+    ;
+    ; 0x40 = shadow space + miejsce na argumenty stosowe.
+    ;
+    ; Przy tej wartości:
+    ;
+    ; arg5 = [rsp + 0x40]
+    ; arg6 = [rsp + 0x48]
+    ;
+    ; --------------------------------------------------------------------------
+
+    sub rsp, 0x40
 
 
     ; ==========================================================================
     ; 1. BOOT SERVICES
     ; ==========================================================================
-    ;
-    ; EFI_SYSTEM_TABLE:
-    ;
-    ; +0x60 = RuntimeServices
-    ; +0x68 = BootServices
-    ;
-    ; Poprzedni loader używał +0x60.
-    ; To było BŁĘDNE.
-    ; ==========================================================================
 
     mov rbx, [rel sys_table]
 
-    mov rax, [rbx + 0x68]
+    test rbx, rbx
+    jz hang
+
+    ; EFI_SYSTEM_TABLE->BootServices = +0x60
+
+    mov rax, [rbx + SYSTEM_TABLE_BOOT_SERVICES]
 
     mov [rel boot_services], rax
 
@@ -151,41 +350,22 @@ _start:
 
 
     ; ==========================================================================
-    ; 2. CONSOLE OUTPUT
+    ; 2. GOP
     ; ==========================================================================
-
-    mov rbx, [rel sys_table]
-
-    ; EFI_SYSTEM_TABLE->ConOut = +0x48
-    mov rbx, [rbx + 0x48]
-
-    test rbx, rbx
-    jz .skip_console
-
-    mov rcx, rbx
-
-    lea rdx, [rel hello_str]
-
-    ; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString
-    ; Revision + 8 = OutputString
-
-    call qword [rbx + 8]
-
-
-.skip_console:
-
-
-    ; ==========================================================================
-    ; 3. GOP
+    ;
+    ; LocateProtocol(
+    ;     Protocol,
+    ;     Registration,
+    ;     Interface
+    ; )
+    ;
+    ; RCX = GUID
+    ; RDX = NULL
+    ; R8  = &gop_ptr
+    ;
     ; ==========================================================================
 
     mov r11, [rel boot_services]
-
-    ; LocateProtocol(
-    ;     &GopGuid,
-    ;     NULL,
-    ;     &Gop
-    ; )
 
     lea rcx, [rel gop_guid]
 
@@ -193,23 +373,27 @@ _start:
 
     lea r8, [rel gop_ptr]
 
-    call qword [r11 + 320]
+    call qword [r11 + BS_LOCATE_PROTOCOL]
 
     test rax, rax
     jnz hang
 
 
-    ; ==========================================================================
-    ; 4. GOP MODE
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Sprawdź GOP.
+    ; --------------------------------------------------------------------------
 
     mov rbx, [rel gop_ptr]
 
     test rbx, rbx
     jz hang
 
-    ; GOP->Mode
-    mov rsi, [rbx + 24]
+
+    ; ==========================================================================
+    ; 3. GOP MODE
+    ; ==========================================================================
+
+    mov rsi, [rbx + GOP_MODE_OFFSET]
 
     test rsi, rsi
     jz hang
@@ -220,6 +404,8 @@ _start:
     ; --------------------------------------------------------------------------
     ; GOP_MODE_INFO
     ;
+    ; GOP_MODE:
+    ;
     ; +0x00 MaxMode
     ; +0x04 Mode
     ; +0x08 Info
@@ -228,7 +414,7 @@ _start:
     ; +0x20 FrameBufferSize
     ; --------------------------------------------------------------------------
 
-    mov rdi, [rsi + 8]
+    mov rdi, [rsi + GOP_MODE_INFO_OFFSET]
 
     test rdi, rdi
     jz hang
@@ -238,7 +424,7 @@ _start:
     ; Framebuffer base
     ; --------------------------------------------------------------------------
 
-    mov rax, [rsi + 24]
+    mov rax, [rsi + GOP_MODE_FB_BASE_OFFSET]
 
     mov [rel fb_base], rax
 
@@ -250,7 +436,7 @@ _start:
     ; Framebuffer size
     ; --------------------------------------------------------------------------
 
-    mov rax, [rsi + 32]
+    mov rax, [rsi + GOP_MODE_FB_SIZE_OFFSET]
 
     mov [rel fb_size], rax
 
@@ -259,24 +445,40 @@ _start:
 
 
     ; --------------------------------------------------------------------------
-    ; Resolution
+    ; Width
     ; --------------------------------------------------------------------------
 
-    mov eax, [rdi + 4]
+    mov eax, [rdi + GOP_INFO_WIDTH_OFFSET]
 
     mov [rel fb_width], eax
 
+    test eax, eax
+    jz hang
 
-    mov eax, [rdi + 8]
+
+    ; --------------------------------------------------------------------------
+    ; Height
+    ; --------------------------------------------------------------------------
+
+    mov eax, [rdi + GOP_INFO_HEIGHT_OFFSET]
 
     mov [rel fb_height], eax
+
+    test eax, eax
+    jz hang
 
 
     ; --------------------------------------------------------------------------
     ; Pixel format
+    ;
+    ; 0 = PixelRedGreenBlueReserved8BitPerColor
+    ; 1 = PixelBlueGreenRedReserved8BitPerColor
     ; --------------------------------------------------------------------------
 
-    mov eax, [rdi + 12]
+    mov eax, [rdi + GOP_INFO_FORMAT_OFFSET]
+
+    cmp eax, 1
+    ja hang
 
     mov [rel fb_pixel_format], eax
 
@@ -285,68 +487,37 @@ _start:
     ; PixelsPerScanLine
     ; --------------------------------------------------------------------------
 
-    mov eax, [rdi + 16]
+    mov eax, [rdi + GOP_INFO_PPS_OFFSET]
 
     mov [rel fb_pps], eax
-
-
-    ; --------------------------------------------------------------------------
-    ; Walidacja szerokości
-    ; --------------------------------------------------------------------------
-
-    mov eax, [rel fb_width]
-
-    cmp eax, FB_WIDTH_MIN
-    jb hang
-
-    cmp eax, FB_WIDTH_MAX
-    ja hang
-
-
-    ; --------------------------------------------------------------------------
-    ; Walidacja wysokości
-    ; --------------------------------------------------------------------------
-
-    mov eax, [rel fb_height]
-
-    cmp eax, FB_HEIGHT_MIN
-    jb hang
-
-    cmp eax, FB_HEIGHT_MAX
-    ja hang
-
-
-    ; --------------------------------------------------------------------------
-    ; Walidacja PPS
-    ; --------------------------------------------------------------------------
-
-    mov eax, [rel fb_pps]
 
     test eax, eax
     jz hang
 
-    cmp eax, 7680
-    ja hang
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź czy PPS >= width.
+    ; --------------------------------------------------------------------------
+
+    mov edx, [rel fb_width]
+
+    cmp eax, edx
+    jb hang
 
 
     ; ==========================================================================
-    ; 5. LOADED IMAGE PROTOCOL
+    ; 4. LOADED IMAGE PROTOCOL
     ; ==========================================================================
     ;
-    ; Potrzebujemy DeviceHandle, czyli urządzenia, z którego uruchomiono
-    ; BOOTX64.EFI.
+    ; HandleProtocol(
+    ;     ImageHandle,
+    ;     LoadedImageGUID,
+    ;     &LoadedImage
+    ; )
+    ;
     ; ==========================================================================
 
     mov r11, [rel boot_services]
-
-    ; OpenProtocol(
-    ;   ImageHandle,
-    ;   LoadedImageGUID,
-    ;   &LoadedImage,
-    ;   ImageHandle,
-    ;   NULL,
-    ;   BY_HANDLE_PROTOCOL
-    ; )
 
     mov rcx, [rel image_handle]
 
@@ -354,38 +525,27 @@ _start:
 
     lea r8, [rel loaded_image]
 
-    mov r9, [rel image_handle]
-
-    ; Stack:
-    ; +0x28 = AgentHandle
-    ; +0x30 = ControllerHandle
-    ; +0x38 = Attributes
-
-    mov qword [rsp + 0x20], 0
-    mov qword [rsp + 0x28], 0
-    mov qword [rsp + 0x30], 0x02
-
-    call qword [r11 + 280]
+    call qword [r11 + BS_HANDLE_PROTOCOL]
 
     test rax, rax
     jnz hang
 
 
-    ; ==========================================================================
-    ; 6. DEVICE HANDLE
-    ; ==========================================================================
-    ;
-    ; EFI_LOADED_IMAGE_PROTOCOL:
-    ;
-    ; +0x18 = DeviceHandle
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Loaded Image pointer.
+    ; --------------------------------------------------------------------------
 
     mov rbx, [rel loaded_image]
 
     test rbx, rbx
     jz hang
 
-    mov rax, [rbx + 0x18]
+
+    ; --------------------------------------------------------------------------
+    ; DeviceHandle.
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rbx + LOADED_IMAGE_DEVICE_HANDLE]
 
     mov [rel device_handle], rax
 
@@ -394,19 +554,18 @@ _start:
 
 
     ; ==========================================================================
-    ; 7. SIMPLE FILE SYSTEM
+    ; 5. SIMPLE FILE SYSTEM
+    ; ==========================================================================
+    ;
+    ; HandleProtocol(
+    ;     DeviceHandle,
+    ;     SimpleFileSystemGUID,
+    ;     &SimpleFS
+    ; )
+    ;
     ; ==========================================================================
 
     mov r11, [rel boot_services]
-
-    ; OpenProtocol(
-    ;   DeviceHandle,
-    ;   SimpleFileSystemGUID,
-    ;   &SimpleFS,
-    ;   ImageHandle,
-    ;   NULL,
-    ;   BY_HANDLE_PROTOCOL
-    ; )
 
     mov rcx, [rel device_handle]
 
@@ -414,54 +573,78 @@ _start:
 
     lea r8, [rel simple_fs]
 
-    mov r9, [rel image_handle]
-
-    mov qword [rsp + 0x20], 0
-    mov qword [rsp + 0x28], 0
-    mov qword [rsp + 0x30], 0x02
-
-    call qword [r11 + 280]
+    call qword [r11 + BS_HANDLE_PROTOCOL]
 
     test rax, rax
     jnz hang
 
 
-    ; ==========================================================================
-    ; 8. OPEN VOLUME
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Sprawdź SimpleFS.
+    ; --------------------------------------------------------------------------
 
     mov rbx, [rel simple_fs]
 
     test rbx, rbx
     jz hang
 
-    ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL.OpenVolume
+
+    ; ==========================================================================
+    ; 6. OPEN VOLUME
+    ; ==========================================================================
     ;
-    ; Revision + 8
+    ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL:
+    ;
+    ; +0x00 Revision
+    ; +0x08 OpenVolume
+    ;
+    ; ==========================================================================
 
     mov rcx, rbx
 
     lea rdx, [rel root_dir]
 
-    call qword [rbx + 8]
+    call qword [rbx + 0x08]
 
     test rax, rax
     jnz hang
 
 
-    ; ==========================================================================
-    ; 9. OPEN KERNEL FILE
-    ; ==========================================================================
-    ;
-    ; \Blitrum\kernel.bin
-    ;
-    ; CHAR16 / UTF-16
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Sprawdź root directory.
+    ; --------------------------------------------------------------------------
 
     mov rbx, [rel root_dir]
 
     test rbx, rbx
     jz hang
+
+
+    ; ==========================================================================
+    ; 7. OPEN KERNEL FILE
+    ; ==========================================================================
+    ;
+    ; EFI_FILE_PROTOCOL.Open:
+    ;
+    ; Open(
+    ;     This,
+    ;     NewHandle,
+    ;     FileName,
+    ;     OpenMode,
+    ;     Attributes
+    ; )
+    ;
+    ; RCX = This
+    ; RDX = NewHandle
+    ; R8  = FileName
+    ; R9  = OpenMode
+    ; arg5 = Attributes
+    ;
+    ; Przy naszym stack frame:
+    ;
+    ; [rsp + 0x40] = Attributes
+    ;
+    ; ==========================================================================
 
     mov rcx, rbx
 
@@ -471,43 +654,57 @@ _start:
 
     mov r9, EFI_FILE_MODE_READ
 
-    ; Attributes = 0
-    mov qword [rsp + 0x20], 0
+    xor rax, rax
 
-    call qword [rbx + 8]
+    mov [rsp + 0x40], rax
+
+    call qword [rbx + EFI_FILE_OPEN_OFFSET]
 
     test rax, rax
     jnz hang
 
 
-    ; ==========================================================================
-    ; 10. GET FILE INFO
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Sprawdź kernel file.
+    ; --------------------------------------------------------------------------
 
     mov rbx, [rel kernel_file]
 
     test rbx, rbx
     jz hang
 
-    ; BufferSize
-    mov qword [rel file_info_buffer_size], FILE_INFO_SIZE
+
+    ; ==========================================================================
+    ; 8. GET FILE INFO
+    ; ==========================================================================
+    ;
+    ; GetInfo(
+    ;     This,
+    ;     InformationType,
+    ;     BufferSize,
+    ;     Buffer
+    ; )
+    ;
+    ; ==========================================================================
+
+    mov qword [rel file_info_size], FILE_INFO_BUFFER_SIZE
 
     mov rcx, rbx
 
     lea rdx, [rel file_info_guid]
 
-    lea r8, [rel file_info_buffer_size]
+    lea r8, [rel file_info_size]
 
     lea r9, [rel file_info_buffer]
 
-    call qword [rbx + 64]
+    call qword [rbx + EFI_FILE_GET_INFO_OFFSET]
 
     test rax, rax
     jnz hang
 
 
     ; ==========================================================================
-    ; 11. KERNEL FILE SIZE
+    ; 9. ODCZYTAJ ROZMIAR KERNELA
     ; ==========================================================================
     ;
     ; EFI_FILE_INFO:
@@ -515,6 +712,709 @@ _start:
     ; +0x00 Size
     ; +0x08 FileSize
     ; +0x10 PhysicalSize
+    ;
     ; ==========================================================================
 
-    mov r
+    mov rax, [rel file_info_buffer + 0x08]
+
+    mov [rel kernel_size], rax
+
+    test rax, rax
+    jz hang
+
+    cmp rax, MAX_KERNEL_SIZE
+    ja hang
+
+
+    ; ==========================================================================
+    ; 10. OBLICZ LICZBĘ STRON
+    ; ==========================================================================
+
+    mov rax, [rel kernel_size]
+
+    add rax, PAGE_SIZE - 1
+
+    shr rax, 12
+
+    test rax, rax
+    jz hang
+
+    mov [rel kernel_pages], rax
+
+
+    ; ==========================================================================
+    ; 11. ZAREZERWUJ PAMIĘĆ POD KERNEL
+    ; ==========================================================================
+    ;
+    ; AllocatePages(
+    ;     AllocateAddress,
+    ;     EfiLoaderData,
+    ;     NumberOfPages,
+    ;     &Memory
+    ; )
+    ;
+    ; RCX = 2
+    ; RDX = 4
+    ; R8  = pages
+    ; R9  = &kernel_load_address
+    ;
+    ; ==========================================================================
+
+    mov r11, [rel boot_services]
+
+    mov rcx, EFI_ALLOCATE_ADDRESS
+
+    mov rdx, EFI_LOADER_DATA
+
+    mov r8, [rel kernel_pages]
+
+    lea r9, [rel kernel_load_address]
+
+    call qword [r11 + BS_ALLOCATE_PAGES]
+
+    test rax, rax
+    jnz hang
+
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź czy firmware rzeczywiście przydzielił 1 MiB.
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rel kernel_load_address]
+
+    cmp rax, KERNEL_LOAD_ADDRESS
+    jne hang
+
+
+    ; ==========================================================================
+    ; 12. WYCZYŚĆ OBSZAR KERNELA
+    ; ==========================================================================
+    ;
+    ; Czyścimy zaalokowany obszar przed Read().
+    ;
+    ; Nie używamy BootServices->SetMem, ponieważ chcemy ograniczyć liczbę
+    ; zależności i działać na zwykłej pamięci.
+    ;
+    ; ==========================================================================
+
+    mov rdi, KERNEL_LOAD_ADDRESS
+
+    mov rcx, [rel kernel_pages]
+
+    shl rcx, 12
+
+    xor eax, eax
+
+    rep stosb
+
+
+    ; ==========================================================================
+    ; 13. READ KERNEL
+    ; ==========================================================================
+    ;
+    ; EFI_FILE_PROTOCOL.Read(
+    ;     This,
+    ;     BufferSize,
+    ;     Buffer
+    ; )
+    ;
+    ; ==========================================================================
+
+    mov rbx, [rel kernel_file]
+
+    mov rcx, rbx
+
+    lea rdx, [rel kernel_read_size]
+
+    mov rax, [rel kernel_size]
+
+    mov [rel kernel_read_size], rax
+
+    mov r8, KERNEL_LOAD_ADDRESS
+
+    call qword [rbx + EFI_FILE_READ_OFFSET]
+
+    test rax, rax
+    jnz hang
+
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź czy przeczytano cały plik.
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rel kernel_read_size]
+
+    cmp rax, [rel kernel_size]
+    jne hang
+
+
+    ; ==========================================================================
+    ; 14. ZAMKNIJ KERNEL FILE
+    ; ==========================================================================
+    ;
+    ; Zamknięcie pliku wykonujemy przed ostatnim GetMemoryMap().
+    ;
+    ; ==========================================================================
+
+    mov rbx, [rel kernel_file]
+
+    mov rcx, rbx
+
+    call qword [rbx + EFI_FILE_CLOSE_OFFSET]
+
+    test rax, rax
+    jnz hang
+
+    mov qword [rel kernel_file], 0
+
+
+    ; ==========================================================================
+    ; 15. PRZYGOTUJ BOOTINFO
+    ; ==========================================================================
+
+    mov rax, [rel fb_base]
+
+    mov [rel boot_info + 0x00], rax
+
+
+    mov rax, [rel fb_size]
+
+    mov [rel boot_info + 0x08], rax
+
+
+    mov eax, [rel fb_width]
+
+    mov [rel boot_info + 0x10], eax
+
+
+    mov eax, [rel fb_height]
+
+    mov [rel boot_info + 0x14], eax
+
+
+    mov eax, [rel fb_pps]
+
+    mov [rel boot_info + 0x18], eax
+
+
+    mov eax, [rel fb_pixel_format]
+
+    mov [rel boot_info + 0x1C], eax
+
+
+    ; Memory map fields zostaną ustawione poniżej.
+
+
+    ; ==========================================================================
+    ; 16. POBIERZ WYMAGANY ROZMIAR MEMORY MAP
+    ; ==========================================================================
+    ;
+    ; Pierwsze GetMemoryMap:
+    ;
+    ;   MemoryMapSize = 0
+    ;   MemoryMap     = NULL
+    ;
+    ; powinno zwrócić EFI_BUFFER_TOO_SMALL oraz wymagany rozmiar.
+    ;
+    ; ==========================================================================
+
+    mov r11, [rel boot_services]
+
+    xor eax, eax
+
+    mov [rel mmap_size], rax
+
+    mov rcx, mmap_size
+
+    xor rdx, rdx
+
+    xor r8, r8
+
+    xor r9, r9
+
+    call qword [r11 + BS_GET_MEMORY_MAP]
+
+    ; --------------------------------------------------------------------------
+    ; Oczekujemy EFI_BUFFER_TOO_SMALL.
+    ; --------------------------------------------------------------------------
+
+    cmp rax, EFI_BUFFER_TOO_SMALL
+    jne hang
+
+
+    ; ==========================================================================
+    ; 17. SPRAWDŹ ROZMIAR
+    ; ==========================================================================
+
+    mov rax, [rel mmap_size]
+
+    ; Dodaj zapas na kilka zmian w mapie.
+    add rax, 0x1000
+
+    ; Zaokrąglij do strony.
+    add rax, PAGE_SIZE - 1
+
+    and rax, -PAGE_SIZE
+
+    cmp rax, MEMORY_MAP_BUFFER_SIZE
+    ja hang
+
+
+    ; ==========================================================================
+    ; 18. POBIERZ MEMORY MAP DO STATYCZNEGO BUFORA
+    ; ==========================================================================
+    ;
+    ; Używamy bufora w obrazie EFI, więc nie potrzebujemy AllocatePool().
+    ;
+    ; ==========================================================================
+
+    mov r11, [rel boot_services]
+
+    mov qword [rel mmap_map_key], 0
+    mov qword [rel mmap_desc_size], 0
+    mov qword [rel mmap_desc_version], 0
+
+    mov rax, MEMORY_MAP_BUFFER_SIZE
+
+    mov [rel mmap_size], rax
+
+    mov rcx, mmap_size
+
+    lea rdx, [rel mmap_buffer]
+
+    lea r8, [rel mmap_map_key]
+
+    lea r9, [rel mmap_desc_size]
+
+    ; arg5 = DescriptorVersion
+
+    lea rax, [rel mmap_desc_version]
+
+    ; GetMemoryMap ma 5 argumentów:
+    ;
+    ; arg1 = RCX
+    ; arg2 = RDX
+    ; arg3 = R8
+    ; arg4 = R9
+    ; arg5 = [rsp + 0x40]
+    ;
+    ; Niestety arg5 jest wartością UINT32, a nie wskaźnikiem.
+
+    mov dword [rsp + 0x40], 0
+
+    call qword [r11 + BS_GET_MEMORY_MAP]
+
+    test rax, rax
+    jnz hang
+
+
+    ; ==========================================================================
+    ; 19. WALIDACJA MEMORY MAP
+    ; ==========================================================================
+
+    cmp qword [rel mmap_size], 0
+    je hang
+
+    cmp qword [rel mmap_desc_size], 0
+    je hang
+
+
+    ; ==========================================================================
+    ; 20. BOOTINFO - MEMORY MAP
+    ; ==========================================================================
+
+    lea rax, [rel mmap_buffer]
+
+    mov [rel boot_info + 0x20], rax
+
+
+    mov rax, [rel mmap_size]
+
+    mov [rel boot_info + 0x28], rax
+
+
+    mov rax, [rel mmap_desc_size]
+
+    mov [rel boot_info + 0x30], rax
+
+
+    mov eax, [rel mmap_desc_version]
+
+    mov [rel boot_info + 0x38], eax
+
+
+    ; ==========================================================================
+    ; 21. OSTATNI EXIT BOOT SERVICES
+    ; ==========================================================================
+    ;
+    ; WAŻNE:
+    ;
+    ; Po ostatnim GetMemoryMap() nie wykonujemy już żadnych Boot Services
+    ; przed ExitBootServices().
+    ;
+    ; ExitBootServices(
+    ;     ImageHandle,
+    ;     MapKey
+    ; )
+    ;
+    ; ==========================================================================
+
+.exit_boot_services:
+
+    mov r11, [rel boot_services]
+
+    mov rcx, [rel image_handle]
+
+    mov rdx, [rel mmap_map_key]
+
+    call qword [r11 + BS_EXIT_BOOT_SERVICES]
+
+    test rax, rax
+
+    jz .boot_services_exited
+
+
+    ; --------------------------------------------------------------------------
+    ; EFI_INVALID_PARAMETER:
+    ;
+    ; Memory map zmieniła się między GetMemoryMap() i ExitBootServices().
+    ;
+    ; Musimy ponowić GetMemoryMap().
+    ; --------------------------------------------------------------------------
+
+    cmp rax, EFI_INVALID_PARAMETER
+
+    jne hang
+
+
+    ; ==========================================================================
+    ; 22. PONOWNY GET MEMORY MAP
+    ; ==========================================================================
+    ;
+    ; Nie wykonujemy żadnych innych operacji Boot Services.
+    ;
+    ; ==========================================================================
+
+.retry_memory_map:
+
+    mov r11, [rel boot_services]
+
+    mov rax, MEMORY_MAP_BUFFER_SIZE
+
+    mov [rel mmap_size], rax
+
+    mov qword [rel mmap_map_key], 0
+    mov qword [rel mmap_desc_size], 0
+    mov qword [rel mmap_desc_version], 0
+
+    mov rcx, mmap_size
+
+    lea rdx, [rel mmap_buffer]
+
+    lea r8, [rel mmap_map_key]
+
+    lea r9, [rel mmap_desc_size]
+
+    mov dword [rsp + 0x40], 0
+
+    call qword [r11 + BS_GET_MEMORY_MAP]
+
+    test rax, rax
+    jnz hang
+
+
+    ; --------------------------------------------------------------------------
+    ; Zaktualizuj BootInfo.
+    ; --------------------------------------------------------------------------
+
+    lea rax, [rel mmap_buffer]
+
+    mov [rel boot_info + 0x20], rax
+
+    mov rax, [rel mmap_size]
+
+    mov [rel boot_info + 0x28], rax
+
+    mov rax, [rel mmap_desc_size]
+
+    mov [rel boot_info + 0x30], rax
+
+    mov eax, [rel mmap_desc_version]
+
+    mov [rel boot_info + 0x38], eax
+
+
+    ; ==========================================================================
+    ; 23. PONOWNY EXIT BOOT SERVICES
+    ; ==========================================================================
+
+    mov r11, [rel boot_services]
+
+    mov rcx, [rel image_handle]
+
+    mov rdx, [rel mmap_map_key]
+
+    call qword [r11 + BS_EXIT_BOOT_SERVICES]
+
+    test rax, rax
+
+    jz .boot_services_exited
+
+
+    cmp rax, EFI_INVALID_PARAMETER
+
+    je .retry_memory_map
+
+
+    jmp hang
+
+
+    ; ==========================================================================
+    ; 24. BOOT SERVICES ZAKOŃCZONE
+    ; ==========================================================================
+
+.boot_services_exited:
+
+    ; --------------------------------------------------------------------------
+    ; Po ExitBootServices nie wolno już używać Boot Services.
+    ; --------------------------------------------------------------------------
+
+    mov qword [rel boot_services], 0
+
+
+    ; --------------------------------------------------------------------------
+    ; Ustaw argument kernela:
+    ;
+    ; RCX = BootInfo
+    ;
+    ; --------------------------------------------------------------------------
+
+    lea rcx, [rel boot_info]
+
+
+    ; --------------------------------------------------------------------------
+    ; Skok do kernela.
+    ; --------------------------------------------------------------------------
+
+    mov rax, KERNEL_LOAD_ADDRESS
+
+    jmp rax
+
+
+; ==============================================================================
+; HANG
+; ==============================================================================
+
+hang:
+
+    cli
+
+.hang_loop:
+
+    hlt
+
+    jmp .hang_loop
+
+
+; ==============================================================================
+; DATA
+; ==============================================================================
+
+section .data
+
+align 8
+
+
+; ==============================================================================
+; UEFI PARAMETERS
+; ==============================================================================
+
+image_handle:
+    dq 0
+
+sys_table:
+    dq 0
+
+boot_services:
+    dq 0
+
+
+; ==============================================================================
+; GOP
+; ==============================================================================
+
+gop_ptr:
+    dq 0
+
+gop_mode:
+    dq 0
+
+
+fb_base:
+    dq 0
+
+fb_size:
+    dq 0
+
+fb_width:
+    dd 0
+
+fb_height:
+    dd 0
+
+fb_pps:
+    dd 0
+
+fb_pixel_format:
+    dd 0
+
+
+; ==============================================================================
+; FILE SYSTEM
+; ==============================================================================
+
+device_handle:
+    dq 0
+
+loaded_image:
+    dq 0
+
+simple_fs:
+    dq 0
+
+root_dir:
+    dq 0
+
+kernel_file:
+    dq 0
+
+
+; ==============================================================================
+; KERNEL
+; ==============================================================================
+
+kernel_load_address:
+    dq KERNEL_LOAD_ADDRESS
+
+kernel_size:
+    dq 0
+
+kernel_pages:
+    dq 0
+
+kernel_read_size:
+    dq 0
+
+
+; ==============================================================================
+; MEMORY MAP
+; ==============================================================================
+
+mmap_size:
+    dq 0
+
+mmap_map_key:
+    dq 0
+
+mmap_desc_size:
+    dq 0
+
+mmap_desc_version:
+    dq 0
+
+
+; ==============================================================================
+; BOOTINFO
+; ==============================================================================
+
+align 16
+
+boot_info:
+
+    ; +0x00 framebuffer address
+    dq 0
+
+    ; +0x08 framebuffer size
+    dq 0
+
+    ; +0x10 width
+    dd 0
+
+    ; +0x14 height
+    dd 0
+
+    ; +0x18 pixels per scanline
+    dd 0
+
+    ; +0x1C pixel format
+    dd 0
+
+    ; +0x20 memory map pointer
+    dq 0
+
+    ; +0x28 memory map size
+    dq 0
+
+    ; +0x30 descriptor size
+    dq 0
+
+    ; +0x38 descriptor version
+    dq 0
+
+
+; ==============================================================================
+; KERNEL PATH
+; ==============================================================================
+
+align 2
+
+kernel_path:
+
+    dw '\'
+    dw 'B'
+    dw 'l'
+    dw 'i'
+    dw 't'
+    dw 'r'
+    dw 'u'
+    dw 'm'
+    dw '\'
+    dw 'k'
+    dw 'e'
+    dw 'r'
+    dw 'n'
+    dw 'e'
+    dw 'l'
+    dw '.'
+    dw 'b'
+    dw 'i'
+    dw 'n'
+    dw 0
+
+
+; ==============================================================================
+; FILE INFO BUFFER
+; ==============================================================================
+
+align 8
+
+file_info_size:
+    dq FILE_INFO_BUFFER_SIZE
+
+
+; ==============================================================================
+; MEMORY MAP BUFFER
+; ==============================================================================
+
+align 4096
+
+section .bss
+
+mmap_buffer:
+    resb MEMORY_MAP_BUFFER_SIZE
+
+
+align 16
+
+file_info_buffer:
+    resb FILE_INFO_BUFFER_SIZE
