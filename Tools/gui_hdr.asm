@@ -1,3 +1,25 @@
+; =============================================================================
+;              BLITRUM OS - HDR GUI CORE / BACKBUFFER
+; =============================================================================
+; Architektura: x86-64
+; Składnia:     NASM Intel
+;
+; Backbuffer:
+;   - dynamicznie przydzielany przez PMM
+;   - 64-bit ARGB
+;   - 1 piksel = 8 bajtów
+;
+; GOP:
+;   - standardowy framebuffer 32-bit
+;   - XRGB32 / RGBX32 zależnie od firmware
+;
+; Wejście gui_init:
+;   RCX  = framebuffer GOP
+;   EDX  = width
+;   R8D  = height
+;   R9D  = pixels per scanline
+; =============================================================================
+
 bits 64
 
 section .text
@@ -9,41 +31,63 @@ global gui_refresh_screen
 global gui_draw_window
 global gui_draw_cursor
 
+; Udostępniane HID oraz innym modułom.
+global screen_width
+global screen_height
+global screen_pps
+
 extern pmm_alloc_contiguous
+
+
+; =============================================================================
+; DATA
+; =============================================================================
 
 section .data
 
 align 8
 
-gop_framebuffer:   dq 0
-gui_backbuffer:    dq 0
+gop_framebuffer:
+    dq 0
 
-screen_width:      dd 0
-screen_height:     dd 0
-screen_pps:        dd 0
+gui_backbuffer:
+    dq 0
 
-backbuffer_size_b: dq 0
+screen_width:
+    dd 0
 
-cursor_x_prev:     dq 0
-cursor_y_prev:     dq 0
+screen_height:
+    dd 0
 
+screen_pps:
+    dd 0
 
-section .text
+backbuffer_size_b:
+    dq 0
+
+cursor_x_prev:
+    dq 0
+
+cursor_y_prev:
+    dq 0
+
 
 ; =============================================================================
 ; GUI INIT
 ;
-; RCX = adres GOP framebuffer
-; EDX = szerokość
-; R8D = wysokość
+; RCX = GOP framebuffer
+; EDX = width
+; R8D = height
 ; R9D = pixels per scanline
 ;
-; Backbuffer:
+; Backbuffer size:
 ;
-;   height * PPS * 8
+;     height * PPS * 8
 ;
-; Następnie PMM przydziela odpowiednią liczbę ciągłych stron 4 KiB.
+; PMM dostaje liczbę wymaganych stron 4 KiB.
 ; =============================================================================
+
+section .text
 
 gui_init:
 
@@ -57,7 +101,7 @@ gui_init:
     push r11
 
     ; -------------------------------------------------------------------------
-    ; Zachowaj informacje o framebufferze
+    ; Zapamiętaj framebuffer i parametry ekranu
     ; -------------------------------------------------------------------------
 
     mov [gop_framebuffer], rcx
@@ -65,52 +109,72 @@ gui_init:
     mov [screen_height], r8d
     mov [screen_pps], r9d
 
+    ; -------------------------------------------------------------------------
+    ; Walidacja podstawowych parametrów
+    ; -------------------------------------------------------------------------
+
+    test edx, edx
+    jz .allocation_failed
+
+    test r8d, r8d
+    jz .allocation_failed
+
+    test r9d, r9d
+    jz .allocation_failed
 
     ; -------------------------------------------------------------------------
-    ; Oblicz rozmiar backbuffera
+    ; Oblicz:
     ;
-    ; height * PPS * 8
+    ; pixels = height * PPS
+    ; bytes  = pixels * 8
     ; -------------------------------------------------------------------------
 
     mov eax, r8d
     mul r9d
 
+    ; Jeśli RDX != 0, nastąpiło przepełnienie 32-bitowego mnożenia.
+    test rdx, rdx
+    jnz .allocation_failed
+
     shl rax, 3
 
+    ; Po przesunięciu również sprawdź overflow.
+    jc .allocation_failed
+
     mov [backbuffer_size_b], rax
-
-
-    ; -------------------------------------------------------------------------
-    ; Walidacja
-    ; -------------------------------------------------------------------------
 
     test rax, rax
     jz .allocation_failed
 
-    ; Maksymalnie 256 MiB
+    ; -------------------------------------------------------------------------
+    ; Maksymalny backbuffer:
+    ;
+    ; 256 MiB
+    ; -------------------------------------------------------------------------
+
     cmp rax, 0x10000000
     ja .allocation_failed
 
-
     ; -------------------------------------------------------------------------
-    ; Oblicz liczbę stron:
-    ;
     ; pages = (size + 4095) / 4096
     ; -------------------------------------------------------------------------
 
     mov r10, rax
 
     add r10, 4095
+    jc .allocation_failed
+
     shr r10, 12
 
+    test r10, r10
+    jz .allocation_failed
 
     ; -------------------------------------------------------------------------
-    ; Alokacja przez PMM
+    ; PMM
     ;
     ; RCX = liczba stron
-    ;
     ; RAX = fizyczny adres pierwszej strony
-    ; RAX = 0 -> brak pamięci
+    ; RAX = 0 -> błąd
     ; -------------------------------------------------------------------------
 
     mov rcx, r10
@@ -120,29 +184,27 @@ gui_init:
     test rax, rax
     jz .allocation_failed
 
-
     ; -------------------------------------------------------------------------
     ; Zapisz adres backbuffera
     ; -------------------------------------------------------------------------
 
     mov [gui_backbuffer], rax
 
-
     ; -------------------------------------------------------------------------
     ; Wyzeruj cały backbuffer
+    ;
+    ; backbuffer_size_b jest wielokrotnością 8.
     ; -------------------------------------------------------------------------
 
     mov rdi, rax
 
     mov rcx, [backbuffer_size_b]
 
-    ; bytes -> qwords
     shr rcx, 3
 
     xor rax, rax
 
     rep stosq
-
 
     ; -------------------------------------------------------------------------
     ; Sukces
@@ -184,7 +246,7 @@ gui_init:
 ; =============================================================================
 ; GET BACKBUFFER ADDRESS
 ;
-; RAX = adres backbuffera
+; RAX = fizyczny adres backbuffera
 ; =============================================================================
 
 gui_get_backbuffer_addr:
@@ -200,22 +262,40 @@ gui_get_backbuffer_addr:
 ; ECX = X
 ; EDX = Y
 ; R8  = kolor ARGB64
+;
+; ARGB64:
+;
+;   bits 63..48 = Alpha
+;   bits 47..32 = Red
+;   bits 31..16 = Green
+;   bits 15..0  = Blue
 ; =============================================================================
 
 gui_draw_to_backbuffer:
 
+    ; -------------------------------------------------------------------------
+    ; Sprawdź X
+    ; -------------------------------------------------------------------------
+
     cmp ecx, [screen_width]
-    jae .out
+    jae .pixel_out
+
+    ; -------------------------------------------------------------------------
+    ; Sprawdź Y
+    ; -------------------------------------------------------------------------
 
     cmp edx, [screen_height]
-    jae .out
+    jae .pixel_out
 
     push rax
     push rbx
 
+    ; -------------------------------------------------------------------------
     ; offset = (Y * PPS + X) * 8
+    ; -------------------------------------------------------------------------
 
     mov eax, edx
+
     mov ebx, [screen_pps]
 
     mul ebx
@@ -224,21 +304,49 @@ gui_draw_to_backbuffer:
 
     shl rax, 3
 
+    ; -------------------------------------------------------------------------
+    ; Adres backbuffera
+    ; -------------------------------------------------------------------------
+
     mov rbx, [gui_backbuffer]
 
+    test rbx, rbx
+    jz .pixel_out_pop
+
     mov [rbx + rax], r8
+
+.pixel_out_pop:
 
     pop rbx
     pop rax
 
-.out:
+.pixel_out:
+
     ret
 
 
 ; =============================================================================
 ; REFRESH SCREEN
 ;
-; Kopiuje ARGB64 backbuffer -> GOP XRGB32
+; Kopiuje:
+;
+;   ARGB64 backbuffer
+;
+; do:
+;
+;   XRGB32 GOP framebuffer
+;
+; Konwersja:
+;
+;   AAAAAAAA RRRRRRRR GGGGGGGG BBBBBBBB
+;              ↓        ↓        ↓
+;             RR       GG       BB
+;
+; wynik:
+;
+;   00RRGGBB
+;
+; Zakładamy GOP PixelFormat = RGB/BGR standardowo używany przez framebuffer.
 ; =============================================================================
 
 gui_refresh_screen:
@@ -249,52 +357,123 @@ gui_refresh_screen:
     push rdx
     push rsi
     push rdi
+    push r8
+
+    ; -------------------------------------------------------------------------
+    ; Pobierz adresy
+    ; -------------------------------------------------------------------------
 
     mov rsi, [gui_backbuffer]
+
     mov rdi, [gop_framebuffer]
 
-    ; Liczba pikseli = height * PPS
+    test rsi, rsi
+    jz .refresh_done
+
+    test rdi, rdi
+    jz .refresh_done
+
+    ; -------------------------------------------------------------------------
+    ; Liczba pikseli:
+    ;
+    ; height * PPS
+    ; -------------------------------------------------------------------------
 
     mov eax, [screen_height]
+
     mov edx, [screen_pps]
 
     mul edx
 
+    test rdx, rdx
+    jnz .refresh_done
+
     mov rcx, rax
+
+    test rcx, rcx
+    jz .refresh_done
 
 
 .blit_loop:
 
+    ; -------------------------------------------------------------------------
+    ; Pobierz ARGB64
+    ; -------------------------------------------------------------------------
+
     mov rbx, [rsi]
 
     ; -------------------------------------------------------------------------
-    ; Konwersja ARGB64 -> XRGB32
+    ; RED
+    ;
+    ; ARGB64:
+    ; R = bits 47..32
+    ;
+    ; Przesuwamy do:
+    ; bits 7..0
     ; -------------------------------------------------------------------------
 
-    xor eax, eax
+    mov rax, rbx
 
-    ; B
-    mov al, bh
+    shr rax, 32
 
-    ; G
-    shr rbx, 16
-    mov ah, bh
+    shr eax, 8
 
-    ; R
-    shr rbx, 16
+    and eax, 0xFF
+
     shl eax, 16
-    mov al, bh
 
-    ror eax, 16
+    mov r8d, eax
 
-    mov [rdi], eax
+    ; -------------------------------------------------------------------------
+    ; GREEN
+    ;
+    ; G = bits 31..16
+    ; -------------------------------------------------------------------------
+
+    mov rax, rbx
+
+    shr rax, 16
+
+    shr eax, 8
+
+    and eax, 0xFF
+
+    shl eax, 8
+
+    or r8d, eax
+
+    ; -------------------------------------------------------------------------
+    ; BLUE
+    ;
+    ; B = bits 15..0
+    ; -------------------------------------------------------------------------
+
+    mov rax, rbx
+
+    shr eax, 8
+
+    and eax, 0xFF
+
+    or r8d, eax
+
+    ; -------------------------------------------------------------------------
+    ; Zapisz XRGB32
+    ; -------------------------------------------------------------------------
+
+    mov [rdi], r8d
 
     add rsi, 8
+
     add rdi, 4
 
-    loop .blit_loop
+    dec rcx
+
+    jnz .blit_loop
 
 
+.refresh_done:
+
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -310,8 +489,8 @@ gui_refresh_screen:
 ;
 ; ECX = X
 ; EDX = Y
-; R8D = szerokość
-; R9D = wysokość
+; R8D = width
+; R9D = height
 ; =============================================================================
 
 gui_draw_window:
@@ -338,22 +517,28 @@ gui_draw_window:
 
     xor rsi, rsi
 
+
 .win_y_loop:
 
     cmp rsi, r15
+
     jge .win_title_bar
 
     xor rdi, rdi
 
+
 .win_x_loop:
 
     cmp rdi, r14
+
     jge .next_win_y
 
     mov ecx, r12d
+
     add ecx, edi
 
     mov edx, r13d
+
     add edx, esi
 
     mov r8, 0x0000D3D3D3D3D3D3
@@ -372,30 +557,36 @@ gui_draw_window:
     jmp .win_y_loop
 
 
+; =============================================================================
+; TITLE BAR
+; =============================================================================
+
 .win_title_bar:
 
-    ; -------------------------------------------------------------------------
-    ; Pasek tytułu
-    ; -------------------------------------------------------------------------
-
     xor rsi, rsi
+
 
 .title_y_loop:
 
     cmp rsi, 24
+
     jge .win_done
 
     xor rdi, rdi
 
+
 .title_x_loop:
 
     cmp rdi, r14
+
     jge .next_title_y
 
     mov ecx, r12d
+
     add ecx, edi
 
     mov edx, r13d
+
     add edx, esi
 
     mov r8, 0x0000000000008888
@@ -462,21 +653,30 @@ gui_draw_cursor:
 
     xor rsi, rsi
 
+
+; =============================================================================
+; ERASE PREVIOUS CURSOR
+; =============================================================================
+
 .erase_y:
 
     cmp rsi, 12
+
     jge .draw_cursor
 
     xor rdi, rdi
 
+
 .erase_x:
 
     cmp rdi, 12
+
     jge .erase_next_y
 
     lea rax, [rel cursor_bitmap]
 
     mov rbx, rsi
+
     imul rbx, 12
 
     add rbx, rdi
@@ -484,15 +684,18 @@ gui_draw_cursor:
     movzx eax, byte [rax + rbx]
 
     test al, al
+
     jz .erase_skip
 
     push rcx
     push rdx
 
     mov ecx, r14d
+
     add ecx, edi
 
     mov edx, r15d
+
     add edx, esi
 
     xor r8, r8
@@ -501,6 +704,7 @@ gui_draw_cursor:
 
     pop rdx
     pop rcx
+
 
 .erase_skip:
 
@@ -516,25 +720,34 @@ gui_draw_cursor:
     jmp .erase_y
 
 
+; =============================================================================
+; DRAW NEW CURSOR
+; =============================================================================
+
 .draw_cursor:
 
     xor rsi, rsi
 
+
 .draw_y:
 
     cmp rsi, 12
+
     jge .cursor_done
 
     xor rdi, rdi
 
+
 .draw_x:
 
     cmp rdi, 12
+
     jge .draw_next_y
 
     lea rax, [rel cursor_bitmap]
 
     mov rbx, rsi
+
     imul rbx, 12
 
     add rbx, rdi
@@ -542,15 +755,18 @@ gui_draw_cursor:
     movzx eax, byte [rax + rbx]
 
     test al, al
+
     jz .draw_skip
 
     push rcx
     push rdx
 
     mov ecx, r12d
+
     add ecx, edi
 
     mov edx, r13d
+
     add edx, esi
 
     mov r8, 0x0000FFFFFFFFFFFF
@@ -559,6 +775,7 @@ gui_draw_cursor:
 
     pop rdx
     pop rcx
+
 
 .draw_skip:
 
@@ -577,6 +794,7 @@ gui_draw_cursor:
 .cursor_done:
 
     mov [cursor_x_prev], r12
+
     mov [cursor_y_prev], r13
 
     pop r15
