@@ -143,10 +143,15 @@ _start:
 
     ; 32 bajty shadow space + miejsce na argumenty stosowe.
     ;
-    ; Przy tym układzie:
-    ;   [rsp + 0x20] = pierwszy argument stosowy
-    ;   ...
-    ;   [rsp + 0x68] = piąty argument funkcji UEFI
+    ; Dla wywołań UEFI:
+    ;   [rsp + 0x20] = piąty argument funkcji
+    ;
+    ; UEFI korzysta z konwencji x64:
+    ;   RCX = argument 1
+    ;   RDX = argument 2
+    ;   R8  = argument 3
+    ;   R9  = argument 4
+    ;   [rsp+0x20] = argument 5
     ;
     sub rsp, 0x40
 
@@ -375,7 +380,7 @@ _start:
 ; RDX = NewHandle
 ; R8  = FileName
 ; R9  = OpenMode
-; [RSP+0x68] = Attributes
+; [RSP+0x20] = Attributes
 ;
 ; ==============================================================================
 
@@ -390,7 +395,7 @@ _start:
     xor rax, rax
 
     ; 5. argument = Attributes
-    mov [rsp + 0x68], rax
+    mov [rsp + 0x20], rax
 
     call qword [rbx + EFI_FILE_OPEN_OFFSET]
 
@@ -587,7 +592,7 @@ _start:
     ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
-    mov [rsp + 0x68], rax
+    mov [rsp + 0x20], rax
 
     call qword [r11 + BS_GET_MEMORY_MAP]
 
@@ -636,7 +641,7 @@ _start:
     ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
-    mov [rsp + 0x68], rax
+    mov [rsp + 0x20], rax
 
     call qword [r11 + BS_GET_MEMORY_MAP]
 
@@ -729,7 +734,7 @@ _start:
     ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
-    mov [rsp + 0x68], rax
+    mov [rsp + 0x20], rax
 
     call qword [r11 + BS_GET_MEMORY_MAP]
 
