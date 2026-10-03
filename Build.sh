@@ -54,7 +54,7 @@ compile_asm() {
 
 compile_asm Kernel/Kernel.asm "$BUILD/kernel.o"
 
-# Only valid file names
+# Keep only valid UEFI build modules
 compile_asm Tools/ppm.asm               "$BUILD/ppm.o"
 compile_asm Tools/idt.asm               "$BUILD/idt.o"
 compile_asm Tools/pit_timer.asm         "$BUILD/pit_timer.o"
@@ -63,20 +63,24 @@ compile_asm Tools/gui_hdr.asm           "$BUILD/gui_hdr.o"
 compile_asm Tools/gui_men.asm           "$BUILD/gui_men.o"
 compile_asm Tools/video_gop.asm         "$BUILD/video_gop.o"
 
-compile_asm Tools/custom_sceduler.asm    "$BUILD/custom_sceduler.o"
-compile_asm Tools/tgfs_vfs.asm           "$BUILD/tgfs_vfs.o"
+compile_asm Tools/custom_sceduler.asm   "$BUILD/custom_sceduler.o"
+compile_asm Tools/tgfs_vfs.asm          "$BUILD/tgfs_vfs.o"
+
 compile_asm Tools/ahs-tus.asm           "$BUILD/ahs-tus.o"
 compile_asm Tools/update_loader.asm     "$BUILD/update_loader.o"
 compile_asm Tools/malicious_check.asm   "$BUILD/malicious_check.o"
+
 compile_asm Tools/ahci.asm              "$BUILD/ahci.o"
 compile_asm Tools/usb_controller.asm    "$BUILD/usb_controller.o"
 compile_asm Tools/usb_interrupts.asm    "$BUILD/usb_interrupts.o"
-compile_asm Tools/audio_hca.asm          "$BUILD/audio_hca.o"
+compile_asm Tools/audio_hca.asm         "$BUILD/audio_hca.o"
 
-# Corrected names
+# Correct file names
 compile_asm Tools/hid_parser.asm        "$BUILD/hid_parser.o"
+
 compile_asm Tools/shell.asm             "$BUILD/shell.o"
 compile_asm Tools/bosd.asm              "$BUILD/bosd.o"
+
 compile_asm Tools/serial.asm            "$BUILD/serial.o"
 
 echo "[6/8] Linking kernel..."
@@ -87,5 +91,5 @@ echo "[7/8] Converting ELF to raw binary..."
 
 echo "[8/8] Build complete"
 echo
-echo "UEFI:       $UEFI_EFI"
-echo "KERNEL:     $KERNEL_BIN"
+echo "UEFI:   $UEFI_EFI"
+echo "KERNEL: $KERNEL_BIN"
