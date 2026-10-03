@@ -239,3 +239,264 @@ _start:
 
     mov edx, [fb_width]
     mov r8d, [fb_height]
+    mov r9d, [fb_pps]
+
+    call gui_init
+
+
+    ; --------------------------------------------------------------------------
+    ; Zarejestruj GUI w AHS-TUS
+    ; --------------------------------------------------------------------------
+
+    mov rcx, VECTOR_GRAPHICS
+
+    lea rdx, [rel gui_refresh_screen]
+
+    call update_register_vector
+
+
+    ; ==========================================================================
+    ; AUDIO
+    ; ==========================================================================
+
+    call find_hda_controller
+
+    jc .skip_audio
+
+    call init_hda_controller
+
+    mov rcx, VECTOR_AUDIO
+    mov rdx, rax
+
+    call update_register_vector
+
+.skip_audio:
+
+
+    ; ==========================================================================
+    ; USB / xHCI
+    ; ==========================================================================
+
+    call find_usb_controllers
+
+    jc .skip_usb
+
+    mov [xhci_base_mmio], rax
+
+    mov rcx, rax
+
+    call usb_interrupts_init
+
+    mov rcx, VECTOR_USB
+
+    mov rdx, [xhci_base_mmio]
+
+    call update_register_vector
+
+.skip_usb:
+
+
+    ; ==========================================================================
+    ; AHCI / TGFS
+    ; ==========================================================================
+
+    call find_ahci_controller
+
+    jc .skip_storage
+
+    call init_ahci_controller
+
+    xor rcx, rcx
+
+    call vfs_mount_drive
+
+    cmp rax, 1
+
+    jne .skip_storage
+
+    mov byte [tgfs_active], 1
+
+    mov rcx, VECTOR_STORAGE
+
+    lea rdx, [rel tgfs_load_and_map_file]
+
+    call update_register_vector
+
+.skip_storage:
+
+
+    ; ==========================================================================
+    ; UPDATE CHECK
+    ; ==========================================================================
+
+    cmp byte [tgfs_active], 1
+
+    jne .skip_update_check
+
+    call update_check
+
+    cmp rax, 1
+
+    jne .skip_update_check
+
+    call update_apply
+
+.skip_update_check:
+
+
+    ; ==========================================================================
+    ; SCHEDULER / HID / SYSTEM
+    ; ==========================================================================
+
+    call scheduler_init
+
+    call hid_init
+
+    call bsod_init
+
+    call shell_init
+
+    call serial_init
+
+    call pit_init
+
+
+    ; ==========================================================================
+    ; SERIAL
+    ; ==========================================================================
+
+    lea rsi, [rel msg_boot]
+
+    call serial_log
+
+
+    ; ==========================================================================
+    ; START GUI / APPLICATION
+    ; ==========================================================================
+
+    cmp byte [tgfs_active], 1
+
+    jne fallback_render
+
+
+    ; --------------------------------------------------------------------------
+    ; TGFS GUI
+    ; --------------------------------------------------------------------------
+
+    xor rcx, rcx
+
+    mov rdx, 5
+
+    mov r8, 0x00800000
+
+    call tgfs_load_and_map_file
+
+    mov rcx, rax
+
+    mov rdx, 0x00A00000
+
+    call scheduler_create_task
+
+    mov rcx, rax
+
+    call scheduler_trigger_event
+
+    jmp system_execute
+
+
+; ==============================================================================
+; FALLBACK GUI
+; ==============================================================================
+
+fallback_render:
+
+    mov ecx, 150
+    mov edx, 150
+
+    mov r8d, 500
+    mov r9d, 350
+
+    call gui_draw_window
+
+    call gui_refresh_screen
+
+
+; ==============================================================================
+; SYSTEM EXECUTION
+; ==============================================================================
+
+system_execute:
+
+    sti
+
+
+kernel_idle_loop:
+
+    call scheduler_event_loop
+
+    jmp kernel_idle_loop
+
+
+; ==============================================================================
+; KERNEL PANIC
+; ==============================================================================
+
+kernel_panic:
+
+    cli
+
+panic_loop:
+
+    hlt
+
+    jmp panic_loop
+
+
+; ==============================================================================
+; DATA
+; ==============================================================================
+
+section .data
+
+align 8
+
+xhci_base_mmio:
+    dq 0
+
+mmap_ptr:
+    dq 0
+
+mmap_size:
+    dq 0
+
+mmap_descsz:
+    dq 0
+
+fb_width:
+    dd 0
+
+fb_height:
+    dd 0
+
+fb_pps:
+    dd 0
+
+tgfs_active:
+    db 0
+
+msg_boot:
+    db "Kernel uruchomiony!", 0
+
+
+; ==============================================================================
+; KERNEL STACK
+; ==============================================================================
+
+section .bss
+
+align 16
+
+kernel_stack_bottom:
+    resb 16384
+
+stack_top:
