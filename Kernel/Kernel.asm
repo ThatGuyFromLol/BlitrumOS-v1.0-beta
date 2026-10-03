@@ -53,6 +53,74 @@ VECTOR_STORAGE  equ 2
 VECTOR_GRAPHICS equ 3
 
 section .text
+; ==============================================================================
+; PUNKT WEJŚCIA BLITRUM OS - UEFI ONLY
+;
+; Wejście:
+;   RCX = adres struktury BootInfo przekazanej przez uefi_boot.asm
+;
+; BootInfo:
+;   +0x00 = framebuffer
+;   +0x08 = framebuffer_size
+;   +0x10 = width
+;   +0x14 = height
+;   +0x18 = pixels_per_scanline
+;   +0x1C = pixel_format
+;   +0x20 = memory_map
+;   +0x28 = memory_map_size
+;   +0x30 = descriptor_size
+;   +0x38 = RSDP
+; ==============================================================================
+
+_start:
+    cli
+
+    ; RCX musi zawierać poprawny BootInfo
+    test rcx, rcx
+    jz kernel_panic
+
+    ; Zachowaj adres BootInfo
+    mov rbx, rcx
+
+    ; --------------------------------------------------------------------------
+    ; FRAMEBUFFER
+    ; --------------------------------------------------------------------------
+
+    mov r14, [rbx + 0x00]
+
+    mov eax, [rbx + 0x10]
+    mov [fb_width], eax
+
+    mov eax, [rbx + 0x14]
+    mov [fb_height], eax
+
+    mov eax, [rbx + 0x18]
+    mov [fb_pps], eax
+
+    ; --------------------------------------------------------------------------
+    ; MEMORY MAP UEFI
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rbx + 0x20]
+    mov [mmap_ptr], rax
+
+    mov rax, [rbx + 0x28]
+    mov [mmap_size], rax
+
+    mov rax, [rbx + 0x30]
+    mov [mmap_descsz], rax
+
+    ; --------------------------------------------------------------------------
+    ; WŁASNY STOS KERNELA
+    ; --------------------------------------------------------------------------
+
+    mov rsp, stack_top
+    and rsp, -16
+
+    jmp boot_common
+
+boot_common:
+    mov rsp, stack_top
 
     ; --- 4. AKTYWACJA UNIKALNEJ TABELI AKTUALIZACJI (AHS-TUS) ---
     call update_system_init     ; Przygotowuje tabelę w locie na dynamiczne wektory w RAM
