@@ -6,7 +6,10 @@ global pmm_init
 global pmm_alloc_page
 global pmm_free_page
 
-BITMAP_ADDRESS equ 0x00200000
+; set by boot code from a safe aligned address
+extern bitmap_base
+extern bitmap_size
+
 EFI_CONVENTIONAL_MEMORY equ 7
 
 ; ==============================================================================
