@@ -2,11 +2,10 @@ bits 64
 section .text
 
 extern isr_pit_handler
-global idt_init
 extern bsod_handler
-
-; ISR sprzętowy USB 3.0 (xHCI) z usb_interrupts.asm.
 extern isr_xhci_handler
+
+global idt_init
 
 USB_INTERRUPT_VECTOR equ 0x28
 
@@ -19,9 +18,7 @@ idt_init:
     push rcx
     push rdi
 
-    ; Rejestrujemy WSZYSTKIE 32 wyjątki procesora (0..31).
-    ; BUGFIX: wcześniej podpięte były tylko 3 wektory (0, 13, 14). Każdy inny
-    ; wyjątek trafiał na pusty wpis IDT -> Triple Fault -> restart komputera.
+    ; Rejestrujemy WSZYSTKIE 32 wyjątki procesora (0..31)
     xor rcx, rcx
     lea rbx, [rel isr_stub_table]
 .fill_exceptions:
@@ -31,7 +28,17 @@ idt_init:
     cmp rcx, 32
     jl .fill_exceptions
 
-    ; Rejestracja PIT Timer (IRQ0 → wektor 0x20)
+    ; Wypełniamy wszystkie pozostałe pola IDT (32..255) bezpiecznym stubem,
+    ; aby żaden nie został pozostawiony niezainicjalizowany.
+    mov rcx, 32
+.fill_defaults:
+    mov rdx, default_isr_stub
+    call idt_set_gate
+    inc rcx
+    cmp rcx, 256
+    jl .fill_defaults
+
+    ; Rejestracja PIT Timer (IRQ0 -> wektor 0x20)
     mov rcx, 0x20
     lea rdx, [rel isr_pit_handler]
     call idt_set_gate
@@ -131,11 +138,19 @@ ISR_ERR   30   ; #SX Security Exception
 ISR_NOERR 31
 
 ; ==============================================================================
+; DEFAULT ISR STUB
+; Zapobiega przejściu do nieznanego miejsca w pamięci po nieznanym IRQ/exception.
+; ==============================================================================
+default_isr_stub:
+    push qword 0
+    push qword 0
+    jmp common_exception_handler
+
+; ==============================================================================
 ; WSPÓLNY HANDLER WYJĄTKÓW
 ; ==============================================================================
 common_exception_handler:
- ; Na stosie: [rsp+0]=wektor, [rsp+8]=kod błędu
-    ; Przekaż kontrolę do BSOD handlera
+    ; Na stosie: [rsp+0]=wektor, [rsp+8]=kod błędu
     call bsod_handler
     cli
 .halt:
