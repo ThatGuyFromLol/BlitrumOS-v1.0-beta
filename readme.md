@@ -1,179 +1,275 @@
-# 🖥️ Blitrum OS
+BLITRUM OS
 
-> Eksperymentalny system operacyjny x86-64 pisany w czystym NASM Assembly.  
-> Modularny, wektorowy, z hot-swappingiem sterowników w locie.
+Eksperymentalny system operacyjny x86-64 pisany w czystym NASM Assembly.
+Modularny, wektorowy, z hot-swappingiem sterowników w locie.
 
 ---
 
-## ✨ Co to jest?
+CO TO JEST?
 
-Własny system operacyjny napisany od zera w asemblerze NASM dla architektury x86-64.  
+Własny system operacyjny napisany od zera w asemblerze NASM dla architektury x86-64.
 Projekt implementuje kompletny stos — od bootloadera UEFI po shell tekstowy i system aktualizacji.
 
-**Kluczowe innowacje:**
-- 🔄 **AHS-TUS** — sterowniki wymieniane w locie bez restartu
-- 🗂️ **TGFS** — własny system plików oparty o tagi z emulacją syscalli Linuxa (ELF64 / PE)
-- 🎨 **HDR GUI Engine** — 64-bit ARGB backbuffer z AVX-2 blitterem na HDMI/DisplayPort
-- ⚡ **BME-QD Scheduler** — Bit-Matrix Event-Driven Quantum Dispatcher
-- 🌐 **Multicore** — bootstrapping rdzeni AP przez Local APIC SIPI
-- 🔄 **System aktualizacji** — hot-swap modułów przez paczki `.pkg`
-- 🛡️ **Antymalware** — statyczny skaner + runtime guard modułów
-- 🐚 **Shell tekstowy** — interaktywna konsola z komendami
-- 💊 **BSOD** — niebieski ekran paniki z pełnymi informacjami o crashu
-- 🔌 **Serial debug** — logi przez COM1 (QEMU `-serial stdio`)
-- ⏱️ **PIT Timer** — 1000Hz system timer, scheduler dispatch co 1ms
+KLUCZOWE INNOWACJE:
+- AHS-TUS — sterowniki wymieniane w locie bez restartu
+- TGFS — własny system plików oparty o tagi z emulacją syscalli Linuxa (ELF64 / PE)
+- HDR GUI Engine — 64-bit ARGB backbuffer z AVX-2 blitterem na HDMI/DisplayPort
+- BME-QD Scheduler — Bit-Matrix Event-Driven Quantum Dispatcher
+- System aktualizacji — hot-swap modułów przez paczki .pkg
+- Antymalware — statyczny skaner + runtime guard modułów
+- Shell tekstowy — interaktywna konsola z komendami
+- BSOD — niebieski ekran paniki z pełnymi informacjami o crashu
+- Serial debug — logi przez COM1 (QEMU -serial stdio)
+- PIT Timer — 1000Hz system timer, scheduler dispatch co 1ms
 
 ---
 
-## 🏗️ Architektura
-Copy
-┌─────────────────────────────────────────────────────┐ │ UEFI GOP Bootloader │ │ (ExitBootServices + mapa pamięci) │ └──────────────────────┬──────────────────────────────┘ │ jmp 0x00100000 ┌──────────────────────▼──────────────────────────────┐ │ Kernel (Kernel.asm) │ │ Serial → PIT → PMM → IDT → GUI → AHCI → USB → ... │ └──────────┬──────────────────────────┬───────────────┘ │ │ ┌────────▼────────┐ ┌──────────▼────────────┐ │ AHS-TUS │ │ TGFS + VFS │ │ (wektor tabela)│ │ (Tag File System) │ └────────┬────────┘ └──────────┬─────────────┘ │ │ ┌────────▼──────────────────────────▼─────────────┐ │ HDR GUI Engine + Shell │ │ gui_hdr.asm (skalar) / simd_argb-64 (AVX-2) │ │ gui_men.asm (widgety) + shell.asm │ └──────────────────────────────────────────────────┘
+ARCHITEKTURA
+
+UEFI Bootloader (uefi_boot.asm)
+    ↓
+Long Mode (64-bit)
+    ↓
+Kernel (Kernel.asm)
+    ↓
+Core Subsystems:
+- IDT (wyjątki procesora)
+- PMM (menedżer pamięci fizycznej)
+- Scheduler (BME-QD)
+    ↓
+Hardware:
+- AHCI (dyski SATA)
+- USB 3.0 xHCI (klawatura, mysz)
+- Intel HD Audio (dźwięk)
+- GOP (grafika UEFI)
+    ↓
+Services:
+- TGFS (system plików)
+- GUI Engine (HDR backbuffer)
+- Shell (konsola)
+- AHS-TUS (hot-swap updates)
 
 ---
 
-## 📁 Struktura katalogów
-Copy
-BlitrumOS/ ├── Bootloders/ │ ├── uefi_boot.asm # Bootloader UEFI GOP (HDMI/DisplayPort) │ └── Legacy_boot.asm # Bootloader Legacy BIOS + E820 memory map │ ├── Kernel/ │ └── Kernel.asm # Główny punkt wejścia OS │ ├── Tools/ │ ├── ppm.asm # PMM — Physical Memory Manager │ ├── idt.asm # IDT — Interrupt Descriptor Table │ ├── pit_timer.asm # PIT Timer 1000Hz │ ├── ahci.asm # AHCI — sterownik dysków SATA │ ├── usb_controller.asm # xHCI — USB 3.0 controller │ ├── usb_interrupts.asm # Ring buffer zdarzeń USB │ ├── hid_parser.asm # HID parser — klawiatura + mysz │ ├── audio_hca.asm # Intel HD Audio │ ├── gui_hdr.asm # HDR GUI Engine — 64-bit ARGB │ ├── simd_argb-64.asm # HDR GUI Engine — AVX-2 (alternatywna) │ ├── gui_men.asm # Widget manager │ ├── shell.asm # Shell tekstowy │ ├── bsod.asm # Blue Screen of Death │ ├── serial.asm # Serial debug COM1 │ ├── custom_sceduler.asm # BME-QD Scheduler │ ├── ahs-tus.asm # Hot-swap wektorów sterowników │ ├── update_loader.asm # System aktualizacji hot-swap │ ├── malicious_check.asm # Antymalware — skaner + runtime guard │ ├── tgfs_vfs.asm # TGFS + VFS + Linux syscall emulation │ ├── tgfs_writer.py # Narzędzie do tworzenia dysków TGFS │ ├── multicore_legacy.asm # SMP — bootstrapping rdzeni AP │ └── pci_dyski.asm # pci_read_config_dword │ ├── Soureses/ # Dokumentacja i specyfikacje │ ├── MEMORY_LAYOUT.md │ ├── rodemap.md │ ├── aktualizacje.md # Instrukcja systemu aktualizacji │ └── ... │ ├── build.sh # Skrypt kompilacji (NASM + ld) └── linker.ld # Skrypt linkera GNU ld
+STRUKTURA KATALOGÓW
+
+BlitrumOS/
+├── Bootloders/
+│   └── uefi_boot.asm          # Bootloader UEFI GOP (HDMI/DisplayPort)
+├── Kernel/
+│   └── Kernel.asm             # Główne jądro systemu
+├── Tools/
+│   ├── ppm.asm                # Physical Memory Manager
+│   ├── idt.asm                # Interrupt Descriptor Table
+│   ├── pit_timer.asm          # PIT Timer (1000Hz)
+│   ├── gui_hdr.asm            # HDR GUI Engine (64-bit ARGB)
+│   ├── gui_men.asm            # GUI Manager + Widgets
+│   ├── video_gop.asm          # Graphics Output Protocol (UEFI)
+│   ├── custom_sceduler.asm    # BME-QD Scheduler
+│   ├── ahci.asm               # SATA AHCI Controller
+│   ├── usb_controller.asm     # USB 3.0 xHCI Controller
+│   ├── usb_interrupts.asm     # USB Interrupt Handlers
+│   ├── audio_hca.asm          # Intel HD Audio
+│   ├── hid_parser.asm         # Keyboard/Mouse Parser
+│   ├── tgfs_vfs.asm           # Tag-based File System
+│   ├── ahs-tus.asm            # Atomic Hot-Swap Update System
+│   ├── update_loader.asm      # Update Loader
+│   ├── malicious_check.asm    # Antimalware Scanner
+│   ├── shell.asm              # Text Shell
+│   ├── bosd.asm               # Blue Screen of Death
+│   ├── serial.asm             # Serial Port (COM1) Debug
+│   └── tgfs_writer.py         # Python tool: create TGFS disk images
+├── Soureses/
+│   └── (documentation files)
+├── Build.sh                   # Build script (UEFI only)
+├── linker.ld                  # GNU LD linker script
+├── LICENSE                    # MIT license
+└── readme.md                  # This file
 
 ---
 
-## 🚀 Budowanie
+BUDOWANIE
 
-### Wymagania
+WYMAGANIA:
 
-```bash
-# Ubuntu / Debian
-sudo apt install nasm binutils qemu-system-x86 ovmf python3
+Ubuntu / Debian:
+sudo apt install nasm binutils-x86-64-linux-gnu llvm qemu-system-x86 ovmf python3
 
-# Arch Linux
-sudo pacman -S nasm binutils qemu ovmf python
-Copy
-Kompilacja
-bash build.sh
-Copy
-Wynik: plik kernel.bin.
+Arch Linux:
+sudo pacman -S nasm binutils llvm qemu ovmf python
 
-Testowanie w QEMU
+macOS (with Homebrew):
+brew install nasm llvm qemu
+
+Fedora / RHEL:
+sudo dnf install nasm binutils llvm-tools qemu ovmf python3
+
+KOMPILACJA:
+
+bash Build.sh
+
+OUTPUT:
+- build/EFI/BOOT/BOOTX64.EFI — UEFI bootloader
+- build/Blitrum/kernel.bin — kernel binary
+- build/kernel.elf — ELF with symbols (for debugging)
+
+---
+
+TESTOWANIE W QEMU
+
+TYLKO KERNEL (BEZ DYSKU):
+
 qemu-system-x86_64 \
   -bios /usr/share/ovmf/OVMF.fd \
-  -drive format=raw,file=kernel.bin \
+  -drive format=raw,file=build/Blitrum/kernel.bin \
   -m 512M \
   -serial stdio \
   -vga std
-Copy
-Logi kernela pojawią się w terminalu przez COM1.
 
-Przygotowanie dysku TGFS
-# Utwórz obraz dysku 64MB
+Logi kernela pojawią się w terminalu (serial port).
+
+Z DYSKIEM TGFS:
+
+1. Utwórz obraz dysku TGFS:
 python3 Tools/tgfs_writer.py create disk.img 64
 
-# Dodaj plik GUI (ID=5, TAG_GUI=2)
+2. Dodaj pliki (opcjonalnie):
 python3 Tools/tgfs_writer.py add disk.img gui.bin 5 2
-
-# Dodaj plikę aktualizacji (ID=99, TAG_SYSTEM=1)
 python3 Tools/tgfs_writer.py add disk.img update.pkg 99 1
-
-# Sprawdź zawartość dysku
 python3 Tools/tgfs_writer.py list disk.img
-Copy
-QEMU z dyskiem TGFS
+
+3. Uruchom w QEMU z dyskiem:
 qemu-system-x86_64 \
   -bios /usr/share/ovmf/OVMF.fd \
-  -drive format=raw,file=kernel.bin \
+  -drive format=raw,file=build/Blitrum/kernel.bin \
   -drive format=raw,file=disk.img \
   -m 512M \
   -serial stdio \
   -vga std
-Copy
 
-🧠 Mapa pamięci RAM
-Adres fizyczny	Rozmiar	Przeznaczenie
-0x00000000	1 MB	IVT, BIOS, bootloader
-0x00100000	~256 KB	Kernel
-0x00200000	128 KB	Bitmapa PMM
-0x00400000	16 KB	Bufory DMA AHCI
-0x00800000	8 MB	Obszar ładowania TGFS
-0x01000000	~16 MB	HDR Backbuffer (64-bit ARGB)
-0x03000000	1 MB	Moduły aktualizacji
-0x03100000	512 KB	Backup wektorów (rollback)
-0x03200000	512 KB	Bufor paczki .pkg
-0x04000000+	wolne	Strony zarządzane przez PMM
+---
 
-🐚 Shell — dostępne komendy
-Komenda	Opis
-help	Lista dostępnych komend
-ver	Wersja systemu
-clear	Czyszczenie ekranu
-halt	Zatrzymanie systemu
-mem	Informacje o pamięci
+MAPA PAMIĘCI RAM
 
-🛡️ System aktualizacji
+0x00000000  1 MB           IVT, BIOS, bootloader
+0x00100000  ~256 KB        Kernel
+0x00200000  128 KB         Bitmapa PMM
+0x00400000  16 KB          Bufory DMA AHCI
+0x00800000  8 MB           Obszar ładowania TGFS
+0x01000000  ~16 MB         HDR Backbuffer (64-bit ARGB)
+0x03000000  1 MB           Moduły aktualizacji
+0x03100000  512 KB         Backup wektorów (rollback)
+0x03200000  512 KB         Bufor paczki .pkg
+0x04000000+ wolne          Strony zarządzane przez PMM
+
+---
+
+SHELL - DOSTĘPNE KOMENDY
+
+help   - Lista dostępnych komend
+ver    - Wersja systemu
+clear  - Czyszczenie ekranu
+halt   - Zatrzymanie systemu
+mem    - Informacje o pamięci
+
+---
+
+SYSTEM AKTUALIZACJI (AHS-TUS)
+
 Szczegółowa instrukcja: Soureses/aktualizacje.md
 
-update.pkg → TGFS (ID=99) → boot → update_check() → 
-update_verify() → malicious_check_static() → update_apply() →
+Przepływ:
+update.pkg → TGFS (ID=99)
+    ↓
+boot: update_check()
+    ↓
+update_verify() → malicious_check_static()
+    ↓
+update_apply()
+    ↓
 AHS-TUS podmienia wektor → nowy sterownik działa bez restartu
-Copy
-
-## 🐛 Principais bugfixy v0.1 → v1.0-beta
-
-| Plik | Naprawione |
-|---|---|
-| `Build.sh` | Poprawione nazwy plików (hid_parser.asm, bosd.asm); usunięty simd_argb-64.asm (duplikat GUI) |
-| `linker.ld` | Zmieniono OUTPUT_FORMAT z binary na elf64-x86-64 dla kompatybilności z ld.lld |
-| `Kernel.asm` | Przesunięto msg_boot przed call serial_log (zapobieganie wykonaniu stringa jako instrukcji) |
-| `idt.asm` | Wszystkie 32 wyjątki + USB 0x28 + PIT 0x20 |
-| `gui_men.asm` | Scalone trzy kopie kodu; usunięty konflikt gui_draw_window |
-| `tgfs_vfs.asm` | Brakujący ret w syscall fallback; pełne implementacje syscalli |
-| `ppm.asm` | Argumenty PMM zapisywane przed rep stosq |
 
 ---
 
-## 🗺️ Roadmapa
+BUGFIXY V0.1 → V1.0-BETA
 
-- ✅ UEFI GOP bootloader (UEFI only)
-- ✅ Long Mode (64-bit)
-- ✅ PMM — Physical Memory Manager
-- ✅ IDT — obsługa wyjątków
-- ✅ PIT Timer 1000Hz
-- ✅ AHCI — odczyt dysków SATA
-- ✅ USB 3.0 xHCI + przerwania
-- ✅ Klawiatura + mysz (HID parser)
-- ✅ Intel HD Audio
-- ✅ HDR 64-bit GUI Engine
-- ✅ Widget Manager + kursor myszy
-- ✅ Shell tekstowy
-- ✅ BSOD — kernel panic screen
-- ✅ Serial debug (COM1)
-- ✅ BME-QD Scheduler
-- ✅ AHS-TUS Hot-Swap
-- ✅ System aktualizacji + antimalware
-- ✅ TGFS File System + Writer
-- 🔄 SMP Multicore boot (wersje przyszłe)
-- 🔄 Linux syscall emulation (wersje przyszłe)
-- 🔄 Virtual Memory Manager (wersje przyszłe)
-- 🔄 Networking (Ethernet) (wersje przyszłe)
+Build.sh
+- Poprawione nazwy plików (hid_parser.asm, bosd.asm)
+- Usunięty simd_argb-64.asm (duplikat GUI)
 
----
+linker.ld
+- Zmieniono OUTPUT_FORMAT z binary na elf64-x86-64
+- Kompatybilność z ld.lld
 
-## 📄 Licencja
+Kernel.asm
+- Poprawiono lokalizację msg_boot przed call serial_log
 
-Projekt hobbystyczny — kod publiczny.  
-Jeśli coś zbudujesz na bazie tego projektu — daj znać! 🚀
+idt.asm
+- Wszystkie 32 wyjątki + USB 0x28 + PIT 0x20
+
+gui_men.asm
+- Scalone trzy kopie kodu
+- Usunięty konflikt gui_draw_window
+
+tgfs_vfs.asm
+- Brakujący ret w fallbackzie syscall
+- Pełne implementacje syscalli
+
+ppm.asm
+- Argumenty PMM zapisywane przed rep stosq
 
 ---
 
-## 🤝 Wkład
+ROADMAPA
 
-Zapraszam do ulepszania projektu! Otwórz issue lub pull request.
+UKOŃCZONE:
+- UEFI GOP bootloader (UEFI only)
+- Long Mode (64-bit)
+- PMM — Physical Memory Manager
+- IDT — obsługa wyjątków
+- PIT Timer 1000Hz
+- AHCI — odczyt dysków SATA
+- USB 3.0 xHCI + przerwania
+- Klawiatura + mysz (HID parser)
+- Intel HD Audio
+- HDR 64-bit GUI Engine
+- Widget Manager + kursor myszy
+- Shell tekstowy
+- BSOD — kernel panic screen
+- Serial debug (COM1)
+- BME-QD Scheduler
+- AHS-TUS Hot-Swap
+- System aktualizacji + antimalware
+- TGFS File System + Writer
+
+W PRZYSZŁOŚCI:
+- SMP Multicore boot
+- Linux syscall emulation
+- Virtual Memory Manager
+- Networking (Ethernet)
 
 ---
 
-## ⚠️ UWAGA
+LICENCJA
 
-To jest eksperymentalny projekt OS. **Nie używaj w produkcji.**  
+Projekt udostępniony na licencji MIT.
+Zobacz plik LICENSE w katalogu głównym.
+
+---
+
+WKŁAD
+
+Zapraszam do ulepszania projektu!
+Otwórz issue lub pull request.
+
+---
+
+UWAGA
+
+To jest eksperymentalny projekt OS.
+Nie używaj w produkcji.
 Bezpieczeństwo i stabilność nie są gwarantowane.
 
 ---
 
-**Blitrum OS — pisany od zera w czystym NASM Assembly.**
+Blitrum OS — pisany od zera w czystym NASM Assembly.
