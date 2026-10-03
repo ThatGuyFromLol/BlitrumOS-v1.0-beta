@@ -5,18 +5,31 @@
 ; Architektura : x86-64
 ; Składnia     : NASM
 ;
-; Zadania:
-;   1. Inicjalizacja UEFI
-;   2. Pobranie GOP
-;   3. Pobranie framebuffer
-;   4. Otwarcie filesystemu urządzenia bootującego
-;   5. Załadowanie \Blitrum\kernel.bin
-;   6. Umieszczenie kernela pod 0x00100000
-;   7. Pobranie UEFI Memory Map
-;   8. ExitBootServices()
-;   9. Utworzenie BootInfo
-;  10. RCX = BootInfo
-;  11. JMP 0x00100000
+; Boot:
+;   UEFI -> BOOTX64.EFI
+;       -> GOP
+;       -> \Blitrum\kernel.bin
+;       -> kernel @ 0x00100000
+;       -> UEFI Memory Map
+;       -> BootInfo
+;       -> ExitBootServices()
+;       -> RCX = BootInfo
+;       -> JMP 0x00100000
+;
+; BootInfo:
+;
+; +0x00  framebuffer address
+; +0x08  framebuffer size
+; +0x10  width
+; +0x14  height
+; +0x18  pixels per scanline
+; +0x1C  pixel format
+; +0x20  memory map pointer
+; +0x28  memory map size
+; +0x30  descriptor size
+; +0x38  descriptor version
+;
+; Zgodne z Kernel/Kernel.asm
 ;
 ; ==============================================================================
 
@@ -28,11 +41,10 @@ global _start
 
 
 ; ==============================================================================
-; UEFI GUIDs
+; UEFI GUIDS
 ; ==============================================================================
 
 ; EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID
-; {9042A9DE-23DC-4A38-96FB-7ADE-D080-516A}
 gop_guid:
     dd 0x9042A9DE
     dw 0x23DC
@@ -41,7 +53,6 @@ gop_guid:
 
 
 ; EFI_LOADED_IMAGE_PROTOCOL_GUID
-; {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
 loaded_image_guid:
     dd 0x5B1B31A1
     dw 0x9562
@@ -50,7 +61,6 @@ loaded_image_guid:
 
 
 ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID
-; {964E5B22-6459-11D2-8E39-00A0C969723B}
 simple_fs_guid:
     dd 0x964E5B22
     dw 0x6459
@@ -59,7 +69,6 @@ simple_fs_guid:
 
 
 ; EFI_FILE_INFO_ID
-; {09576E92-6D3F-11D2-8E39-00A0C969723B}
 file_info_guid:
     dd 0x09576E92
     dw 0x6D3F
@@ -78,16 +87,26 @@ EFI_LOADER_DATA       equ 4
 
 EFI_FILE_MODE_READ    equ 1
 
-MMAP_BUF_SIZE         equ 65536
+EFI_SUCCESS            equ 0
+EFI_BUFFER_TOO_SMALL   equ 0x8000000000000005
+EFI_INVALID_PARAMETER  equ 0x8000000000000002
 
-; Framebuffer validation bounds
-FB_WIDTH_MIN          equ 640
-FB_WIDTH_MAX          equ 7680
-FB_HEIGHT_MIN         equ 480
-FB_HEIGHT_MAX         equ 4320
+; ------------------------------------------------------------------------------
+
+FB_WIDTH_MIN  equ 640
+FB_WIDTH_MAX  equ 7680
+
+FB_HEIGHT_MIN equ 480
+FB_HEIGHT_MAX equ 4320
+
+; ------------------------------------------------------------------------------
+
+MMAP_BUF_SIZE equ 262144
+FILE_INFO_SIZE equ 4096
+
 
 ; ==============================================================================
-; ENTRY POINT
+; ENTRY
 ;
 ; UEFI x64:
 ;
@@ -97,46 +116,70 @@ FB_HEIGHT_MAX         equ 4320
 
 _start:
 
-    ; Zachowaj UEFI parametry wejściowe
-    mov [image_handle], rcx
-    mov [sys_table], rdx
+    ; --------------------------------------------------------------------------
+    ; Zachowaj parametry UEFI
+    ; --------------------------------------------------------------------------
 
-    ; Zachowaj bezpieczny stos
+    mov [rel image_handle], rcx
+    mov [rel sys_table], rdx
+
+    ; Windows x64 / UEFI ABI shadow space
     sub rsp, 40
 
 
     ; ==========================================================================
-    ; 1. OUTPUT STRING
+    ; 1. BOOT SERVICES
+    ; ==========================================================================
+    ;
+    ; EFI_SYSTEM_TABLE:
+    ;
+    ; +0x60 = RuntimeServices
+    ; +0x68 = BootServices
+    ;
+    ; Poprzedni loader używał +0x60.
+    ; To było BŁĘDNE.
     ; ==========================================================================
 
-    mov rbx, [sys_table]
+    mov rbx, [rel sys_table]
 
-    ; EFI_SYSTEM_TABLE->ConOut
-    mov rbx, [rbx + 64]
+    mov rax, [rbx + 0x68]
+
+    mov [rel boot_services], rax
+
+    test rax, rax
+    jz hang
+
+
+    ; ==========================================================================
+    ; 2. CONSOLE OUTPUT
+    ; ==========================================================================
+
+    mov rbx, [rel sys_table]
+
+    ; EFI_SYSTEM_TABLE->ConOut = +0x48
+    mov rbx, [rbx + 0x48]
+
+    test rbx, rbx
+    jz .skip_console
 
     mov rcx, rbx
+
     lea rdx, [rel hello_str]
+
+    ; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString
+    ; Revision + 8 = OutputString
 
     call qword [rbx + 8]
 
 
-    ; ==========================================================================
-    ; 2. BOOT SERVICES
-    ; ==========================================================================
-
-    mov rbx, [sys_table]
-
-    ; EFI_SYSTEM_TABLE->BootServices
-    mov rax, [rbx + 96]
-
-    mov [boot_services], rax
+.skip_console:
 
 
     ; ==========================================================================
     ; 3. GOP
     ; ==========================================================================
 
-    mov r11, [boot_services]
+    mov r11, [rel boot_services]
 
     ; LocateProtocol(
     ;     &GopGuid,
@@ -145,7 +188,9 @@ _start:
     ; )
 
     lea rcx, [rel gop_guid]
+
     xor rdx, rdx
+
     lea r8, [rel gop_ptr]
 
     call qword [r11 + 320]
@@ -155,18 +200,25 @@ _start:
 
 
     ; ==========================================================================
-    ; 4. ODCZYT GOP MODE
+    ; 4. GOP MODE
     ; ==========================================================================
 
-    mov rbx, [gop_ptr]
+    mov rbx, [rel gop_ptr]
+
+    test rbx, rbx
+    jz hang
 
     ; GOP->Mode
     mov rsi, [rbx + 24]
 
-    mov [gop_mode], rsi
+    test rsi, rsi
+    jz hang
+
+    mov [rel gop_mode], rsi
 
 
-    ; EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE:
+    ; --------------------------------------------------------------------------
+    ; GOP_MODE_INFO
     ;
     ; +0x00 MaxMode
     ; +0x04 Mode
@@ -174,87 +226,295 @@ _start:
     ; +0x10 SizeOfInfo
     ; +0x18 FrameBufferBase
     ; +0x20 FrameBufferSize
-
-
-    ; --------------------------------------------------------------------------
-    ; Info
     ; --------------------------------------------------------------------------
 
     mov rdi, [rsi + 8]
 
+    test rdi, rdi
+    jz hang
+
 
     ; --------------------------------------------------------------------------
-    ; Framebuffer Base
+    ; Framebuffer base
     ; --------------------------------------------------------------------------
 
     mov rax, [rsi + 24]
-    mov [fb_base], rax
+
+    mov [rel fb_base], rax
+
+    test rax, rax
+    jz hang
 
 
     ; --------------------------------------------------------------------------
-    ; Framebuffer Size
+    ; Framebuffer size
     ; --------------------------------------------------------------------------
 
     mov rax, [rsi + 32]
-    mov [fb_size], rax
+
+    mov [rel fb_size], rax
+
+    test rax, rax
+    jz hang
 
 
     ; --------------------------------------------------------------------------
-    ; Horizontal Resolution
-    ; EFI_GRAPHICS_OUTPUT_MODE_INFORMATION:
-    ;
-    ; +0x00 Version
-    ; +0x04 HorizontalResolution
-    ; +0x08 VerticalResolution
-    ; +0x0C PixelFormat
-    ; +0x10 PixelInformation / PixelsPerScanLine
+    ; Resolution
     ; --------------------------------------------------------------------------
 
     mov eax, [rdi + 4]
-    mov [fb_width], eax
+
+    mov [rel fb_width], eax
+
 
     mov eax, [rdi + 8]
-    mov [fb_height], eax
+
+    mov [rel fb_height], eax
+
+
+    ; --------------------------------------------------------------------------
+    ; Pixel format
+    ; --------------------------------------------------------------------------
 
     mov eax, [rdi + 12]
-    mov [fb_pixel_format], eax
+
+    mov [rel fb_pixel_format], eax
+
+
+    ; --------------------------------------------------------------------------
+    ; PixelsPerScanLine
+    ; --------------------------------------------------------------------------
 
     mov eax, [rdi + 16]
-    mov [fb_pps], eax
 
-    ; --- FRAMEBUFFER VALIDATION ---
-    ; Sprawdzamy czy wymiary są rozsądne i nie spowodują przepełnienia bufora HDR
-    mov eax, [fb_width]
+    mov [rel fb_pps], eax
+
+
+    ; --------------------------------------------------------------------------
+    ; Walidacja szerokości
+    ; --------------------------------------------------------------------------
+
+    mov eax, [rel fb_width]
+
     cmp eax, FB_WIDTH_MIN
-    jl hang
+    jb hang
+
     cmp eax, FB_WIDTH_MAX
-    jg hang
+    ja hang
 
-    mov eax, [fb_height]
+
+    ; --------------------------------------------------------------------------
+    ; Walidacja wysokości
+    ; --------------------------------------------------------------------------
+
+    mov eax, [rel fb_height]
+
     cmp eax, FB_HEIGHT_MIN
-    jl hang
+    jb hang
+
     cmp eax, FB_HEIGHT_MAX
-    jg hang
+    ja hang
 
-    ; Sprawdzamy czy rozmiar framebuffera ma sens
-    mov rax, [fb_size]
-    test rax, rax
+
+    ; --------------------------------------------------------------------------
+    ; Walidacja PPS
+    ; --------------------------------------------------------------------------
+
+    mov eax, [rel fb_pps]
+
+    test eax, eax
     jz hang
-    cmp rax, 0x10000000     ; Max 256MB
-    jg hang
+
+    cmp eax, 7680
+    ja hang
+
 
     ; ==========================================================================
-    ; 5. ODNALEZIENIE LOADED IMAGE PROTOCOL
+    ; 5. LOADED IMAGE PROTOCOL
+    ; ==========================================================================
     ;
-    ; Potrzebujemy DeviceHandle urządzenia, z którego wystartował BOOTX64.EFI.
+    ; Potrzebujemy DeviceHandle, czyli urządzenia, z którego uruchomiono
+    ; BOOTX64.EFI.
     ; ==========================================================================
 
-    mov r11, [boot_services]
+    mov r11, [rel boot_services]
 
     ; OpenProtocol(
-    ;     ImageHandle,
-    ;     LoadedImageGUID,
-    ;     &LoadedImage,
-    ;     ImageHandle,
-    ;     NULL,
+    ;   ImageHandle,
+    ;   LoadedImageGUID,
+    ;   &LoadedImage,
+    ;   ImageHandle,
+    ;   NULL,
+    ;   BY_HANDLE_PROTOCOL
+    ; )
+
+    mov rcx, [rel image_handle]
+
+    lea rdx, [rel loaded_image_guid]
+
+    lea r8, [rel loaded_image]
+
+    mov r9, [rel image_handle]
+
+    ; Stack:
+    ; +0x28 = AgentHandle
+    ; +0x30 = ControllerHandle
+    ; +0x38 = Attributes
+
+    mov qword [rsp + 0x20], 0
+    mov qword [rsp + 0x28], 0
+    mov qword [rsp + 0x30], 0x02
+
+    call qword [r11 + 280]
+
+    test rax, rax
+    jnz hang
+
+
+    ; ==========================================================================
+    ; 6. DEVICE HANDLE
+    ; ==========================================================================
     ;
+    ; EFI_LOADED_IMAGE_PROTOCOL:
+    ;
+    ; +0x18 = DeviceHandle
+    ; ==========================================================================
+
+    mov rbx, [rel loaded_image]
+
+    test rbx, rbx
+    jz hang
+
+    mov rax, [rbx + 0x18]
+
+    mov [rel device_handle], rax
+
+    test rax, rax
+    jz hang
+
+
+    ; ==========================================================================
+    ; 7. SIMPLE FILE SYSTEM
+    ; ==========================================================================
+
+    mov r11, [rel boot_services]
+
+    ; OpenProtocol(
+    ;   DeviceHandle,
+    ;   SimpleFileSystemGUID,
+    ;   &SimpleFS,
+    ;   ImageHandle,
+    ;   NULL,
+    ;   BY_HANDLE_PROTOCOL
+    ; )
+
+    mov rcx, [rel device_handle]
+
+    lea rdx, [rel simple_fs_guid]
+
+    lea r8, [rel simple_fs]
+
+    mov r9, [rel image_handle]
+
+    mov qword [rsp + 0x20], 0
+    mov qword [rsp + 0x28], 0
+    mov qword [rsp + 0x30], 0x02
+
+    call qword [r11 + 280]
+
+    test rax, rax
+    jnz hang
+
+
+    ; ==========================================================================
+    ; 8. OPEN VOLUME
+    ; ==========================================================================
+
+    mov rbx, [rel simple_fs]
+
+    test rbx, rbx
+    jz hang
+
+    ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL.OpenVolume
+    ;
+    ; Revision + 8
+
+    mov rcx, rbx
+
+    lea rdx, [rel root_dir]
+
+    call qword [rbx + 8]
+
+    test rax, rax
+    jnz hang
+
+
+    ; ==========================================================================
+    ; 9. OPEN KERNEL FILE
+    ; ==========================================================================
+    ;
+    ; \Blitrum\kernel.bin
+    ;
+    ; CHAR16 / UTF-16
+    ; ==========================================================================
+
+    mov rbx, [rel root_dir]
+
+    test rbx, rbx
+    jz hang
+
+    mov rcx, rbx
+
+    lea rdx, [rel kernel_file]
+
+    lea r8, [rel kernel_path]
+
+    mov r9, EFI_FILE_MODE_READ
+
+    ; Attributes = 0
+    mov qword [rsp + 0x20], 0
+
+    call qword [rbx + 8]
+
+    test rax, rax
+    jnz hang
+
+
+    ; ==========================================================================
+    ; 10. GET FILE INFO
+    ; ==========================================================================
+
+    mov rbx, [rel kernel_file]
+
+    test rbx, rbx
+    jz hang
+
+    ; BufferSize
+    mov qword [rel file_info_buffer_size], FILE_INFO_SIZE
+
+    mov rcx, rbx
+
+    lea rdx, [rel file_info_guid]
+
+    lea r8, [rel file_info_buffer_size]
+
+    lea r9, [rel file_info_buffer]
+
+    call qword [rbx + 64]
+
+    test rax, rax
+    jnz hang
+
+
+    ; ==========================================================================
+    ; 11. KERNEL FILE SIZE
+    ; ==========================================================================
+    ;
+    ; EFI_FILE_INFO:
+    ;
+    ; +0x00 Size
+    ; +0x08 FileSize
+    ; +0x10 PhysicalSize
+    ; ==========================================================================
+
+    mov r
