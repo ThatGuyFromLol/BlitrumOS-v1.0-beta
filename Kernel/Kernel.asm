@@ -13,7 +13,7 @@ section .text
 global _start
 
 ; ==============================================================================
-; INDEKS STEROWNIKÓW I SYSTEMU (Podpięcie Twoich plików ze zdjęć)
+; INDEKS STEROWNIKÓW I SYSTEMU
 ; ==============================================================================
 extern pit_init
 extern bsod_init
@@ -21,27 +21,26 @@ extern serial_init
 extern serial_log
 extern scheduler_event_loop
 extern hid_init
-extern idt_init                 ; z idt.asm (Tabela Przerwań)
-extern pmm_init                 ; z ppm.asm (Menedżer RAM - w skrypcie jako ppm.o)
-extern gui_init                 ; z gui_hdr.asm (Inicjalizacja Wektorowego GUI)
-extern gui_draw_window          ; z gui_men.asm (Rysowanie Okien / Widgety)
-extern gui_refresh_screen       ; z video_gop.asm (AVX Blitter na monitor)
-extern find_ahci_controller     ; z ahci.asm (Sterownik SATA AHCI)
-extern init_ahci_controller     ; z ahci.asm
-extern vfs_mount_drive          ; z tgfs_vfs.asm (Tagowy System Plików TGFS)
-extern tgfs_load_and_map_file   ; z tgfs_vfs.asm (JMP-Loader / Emulacja)
-extern find_usb_controllers     ; z usb_controller.asm (Sterownik USB 3.0 xHCI)
-extern usb_interrupts_init      ; z usb_interrupts.asm (Sprzętowe Przerwania USB)
-extern find_hda_controller      ; z audio_hca.asm (Dźwięk Przedniego Panelu HDA)
-extern init_hda_controller      ; z audio_hca.asm
-extern scheduler_init           ; z custom_sceduler.asm (Scheduler BME-QD)
-extern scheduler_create_task    ; z custom_sceduler.asm
-extern scheduler_trigger_event  ; z custom_sceduler.asm
+extern idt_init
+extern pmm_init
+extern gui_init
+extern gui_draw_window
+extern gui_refresh_screen
+extern find_ahci_controller
+extern init_ahci_controller
+extern vfs_mount_drive
+extern tgfs_load_and_map_file
+extern find_usb_controllers
+extern usb_interrupts_init
+extern find_hda_controller
+extern init_hda_controller
+extern scheduler_init
+extern scheduler_create_task
+extern scheduler_trigger_event
 extern shell_init
 extern shell_run
-; Wektory systemu aktualizacji AHS-TUS
-extern update_system_init       ; z ahs-tus.asm
-extern update_register_vector   ; z ahs-tus.asm
+extern update_system_init
+extern update_register_vector
 extern update_check
 extern update_apply
 extern update_is_pending
@@ -52,7 +51,6 @@ VECTOR_USB      equ 1
 VECTOR_STORAGE  equ 2
 VECTOR_GRAPHICS equ 3
 
-section .text
 ; ==============================================================================
 ; PUNKT WEJŚCIA BLITRUM OS - UEFI ONLY
 ;
@@ -120,32 +118,29 @@ _start:
     jmp boot_common
 
 boot_common:
-
     ; Stos został ustawiony w _start.
     ; Od tego miejsca działamy już wyłącznie jako UEFI kernel.
 
     ; --- 4. AKTYWACJA UNIKALNEJ TABELI AKTUALIZACJI (AHS-TUS) ---
-    call update_system_init     ; Przygotowuje tabelę w locie na dynamiczne wektory w RAM
+    call update_system_init
 
     ; --- 5. INICJALIZACJA DYNAMICZNEGO MENEDŻERA RAM (PMM) ---
     ; PMM oczekuje (Microsoft x64 ABI): RCX=DescriptorSize, R8=MemoryMapSize,
-    ; R9=wskaźnik na mapę. Wcześniej wywołanie nie przekazywało żadnych argumentów,
-    ; więc PMM dostał śmieci i nie oznaczył żadnej wolnej strony RAM.
-    mov rcx, [mmap_descsz]      ; RCX = DescriptorSize
-    mov r8,  [mmap_size]        ; R8  = MemoryMapSize
-    mov r9,  [mmap_ptr]         ; R9  = wskaźnik na mapę pamięci
-    call pmm_init               ; Buduje krzemową bitmapę wolnych stron 4KB pamięci
+    ; R9=wskaźnik na mapę.
+    mov rcx, [mmap_descsz]
+    mov r8,  [mmap_size]
+    mov r9,  [mmap_ptr]
+    call pmm_init
 
     ; --- 6. URUCHOMIENIE TARCZY OCHRONNEJ PROCESORA (IDT) ---
-    call idt_init               ; Przechwytywanie wyjątków i ochrona przed Triple Fault
+    call idt_init
 
     ; --- 7. WEKTOROWA INICJALIZACJA GRAFIKI HDR (AVX-2 GUI ENGINE) ---
-    ; Pobieramy parametry rozdzielczości zapisane wcześniej w sekcji .data
-    mov edx, [fb_width]         ; Szerokość ekranu (Width)
-    mov r8d, [fb_height]        ; Wysokość ekranu (Height)
-    mov r9d, [fb_pps]           ; Pixels Per Scan Line (PPS)
-    mov rcx, r14                ; Baza pamięci wideo monitora
-    call gui_init               ; Zaalokowanie 64-bitowego Backbuffera i uzbrojenie AVX
+    mov edx, [fb_width]
+    mov r8d, [fb_height]
+    mov r9d, [fb_pps]
+    mov rcx, r14
+    call gui_init
 
     ; Rejestrujemy natywny silnik graficzny w systemie aktualizacji w locie (Wektor 3)
     mov rcx, VECTOR_GRAPHICS
@@ -153,44 +148,43 @@ boot_common:
     call update_register_vector
 
     ; --- 8. SKANOWANIE SPRZĘTU I REJESTRACJA DYNAMICZNA (PCI MATRIX) ---
-    
-    ; A. Karta Dźwiękowa Intel HD Audio (Plik: audio_hca.asm)
+
+    ; A. Karta Dźwiękowa Intel HD Audio
     call find_hda_controller
     jc .skip_audio
-    call init_hda_controller    ; Aktywacja układu i linii audio przedniego panelu
+    call init_hda_controller
     mov rcx, VECTOR_AUDIO
-    mov rdx, rax                ; RAX zawiera adres bazowy MMIO Audio
-    call update_register_vector ; Rejestracja wektora Audio (gotowy na hot-swap!)
+    mov rdx, rax
+    call update_register_vector
 .skip_audio:
 
-    ; B. Porty i Kontroler USB 3.0 (xHCI - Plik: usb_controller.asm)
-    call find_usb_controllers   ; Skanowanie PCI i odebranie kontroli od BIOS (Handshake)
+    ; B. Porty i Kontroler USB 3.0 (xHCI)
+    call find_usb_controllers
     jc .skip_usb
-    mov [xhci_base_mmio], rax   ; Zachowaj adres rejestrów
-    
-    ; Aktywacja asynchronicznych przerwań USB (Plik: usb_interrupts.asm)
-    mov rcx, rax                ; Przekaż adres MMIO w rejestrze RCX
-    call usb_interrupts_init    ; Włącza Local APIC, IOAPIC i Interrupter xHCI
-    
+    mov [xhci_base_mmio], rax
+
+    mov rcx, rax
+    call usb_interrupts_init
+
     mov rcx, VECTOR_USB
-    mov rdx, [xhci_base_mmio]   
-    call update_register_vector ; Rejestracja wektora USB 3.0 w tabeli aktualizacji
+    mov rdx, [xhci_base_mmio]
+    call update_register_vector
 .skip_usb:
 
     ; C. Kontroler Masowy SATA i Montowanie Systemu Plików TGFS
     call find_ahci_controller
     jc .skip_storage
-    call init_ahci_controller   ; Włączenie trybu AHCI dla dysków SSD/HDD
-    
-    mov rcx, 0                  ; Skanuj dysk na kanale SATA 0
-    call vfs_mount_drive        ; Odczyt Sektora 1, weryfikacja i montaż Tag Registry
-    cmp rax, 1                  ; Czy na dysku znajduje się system TGFS?
+    call init_ahci_controller
+
+    mov rcx, 0
+    call vfs_mount_drive
+    cmp rax, 1
     jne .skip_storage
-    mov byte [tgfs_active], 1   
-    
+    mov byte [tgfs_active], 1
+
     mov rcx, VECTOR_STORAGE
     lea rdx, [rel tgfs_load_and_map_file]
-    call update_register_vector ; Rejestracja systemu plików i loadera pod Wektor 2
+    call update_register_vector
 .skip_storage:
 
     ; --- SPRAWDZENIE AKTUALIZACJI ---
@@ -203,51 +197,48 @@ boot_common:
 .skip_update_check:
 
     ; --- 9. INICJALIZACJA SCHEDULERA ZDARZENIOWEGO (BME-QD) ---
-    call scheduler_init         ; Przygotowanie 64-bitowej maski procesów
+    call scheduler_init
     call hid_init
-    call bsod_init  
+    call bsod_init
     call shell_init
     call serial_init
     call pit_init
+
+    ; FIX: string must be defined before the call
+    ; otherwise the CPU will execute the bytes as instructions.
     lea rsi, [rel msg_boot]
     call serial_log
-msg_boot: db "Kernel uruchomiony!", 0
-             ; Inicjalizacja parsera klawiatury i myszy
+
     ; --- KROK 10: URUCHOMIENIE INTERFEJSU GRAFICZNEGO ---
     cmp byte [tgfs_active], 1
     jne fallback_render
 
-    ; Szukamy na dysku TGFS binarnego pliku GUI (np. pod unikalnym ID = 5)
-    mov rcx, 0                  ; Port SATA 0
-    mov rdx, 5                  ; ID pliku w Tag Registry
-    mov r8, 0x00800000          ; Bezpieczna przestrzeń w RAM na rozpakowanie kodu
-    call tgfs_load_and_map_file ; JMP-Loader parsuje (Natywny/ELF/EXE), relokuje Zero-Copy
+    mov rcx, 0
+    mov rdx, 5
+    mov r8, 0x00800000
+    call tgfs_load_and_map_file
 
-    ; Przekazujemy punkt startowy zwrócony w RAX do Schedulera
-    mov rcx, rax                ; RCX = RIP aplikacji startowej (GUI)
-    mov rdx, 0x00A00000         ; RDX = Adres nowo utworzonego stosu dla GUI wątku
-    call scheduler_create_task  
-    
-    ; Zapalamy bit wątku GUI w masce
-    mov rcx, rax                
+    mov rcx, rax
+    mov rdx, 0x00A00000
+    call scheduler_create_task
+
+    mov rcx, rax
     call scheduler_trigger_event
     jmp system_execute
 
 fallback_render:
-    ; AWARYJNY RENDERING (gdy uruchamiasz system na czystym dysku bez plików TGFS)
-    mov ecx, 150                ; Współrzędna X
-    mov edx, 150                ; Współrzędna Y
-    mov r8d, 500                ; Szerokość okna
-    mov r9d, 350                ; Wysokość okna
-    call gui_draw_window        ; Rysuje jasnoszare okno z granatową belką w Backbufferze
+    mov ecx, 150
+    mov edx, 150
+    mov r8d, 500
+    mov r9d, 350
+    call gui_draw_window
 
-    call gui_refresh_screen     ; AVX-2 Blitter konwertuje i wyrzuca obraz na HDMI/DP
+    call gui_refresh_screen
 
 system_execute:
     ; --- 11. ROZPOCZĘCIE ASYNCHRONICZNEJ PRACY EKOSYSTEMU ---
-    sti                         ; Całkowite zezwolenie na sprzętowe przerwania procesora
+    sti
 
-    ; Bezczynna pętla jądra (Idle Thread - Zadanie 0
 kernel_idle_loop:
     call scheduler_event_loop
     jmp kernel_idle_loop
@@ -259,20 +250,27 @@ panic_loop:
     hlt
     jmp panic_loop
 
+
+; ==============================================================================
+; DATA
+; ==============================================================================
 section .data
 align 8
-xhci_base_mmio:   dq 0          ; Przechowuje fizyczny adres rejestrów USB 3.0
-mmap_ptr:         dq 0          ; Wskaźnik na mapę pamięci UEFI
-mmap_size:        dq 0          ; Łączny rozmiar mapy pamięci w bajtach
-mmap_descsz:      dq 0          ; Rozmiar pojedynczego deskryptora pamięci
-fb_width:         dd 0          ; Szerokość ekranu przekazana przez bootloader
-fb_height:        dd 0          ; Wysokość ekranu przekazana przez bootloader
-fb_pps:           dd 0          ; Pixels Per Scan Line przekazane przez bootloader
-tgfs_active:      db 0          ; Flaga statusu systemu plików: 1 = Aktywny
+xhci_base_mmio:   dq 0
+mmap_ptr:         dq 0
+mmap_size:        dq 0
+mmap_descsz:      dq 0
+fb_width:         dd 0
+fb_height:        dd 0
+fb_pps:           dd 0
+tgfs_active:      db 0
+
+; FIX: place the string before the call site
+msg_boot:
+    db "Kernel uruchomiony!", 0
 
 section .bss
 align 16
-; Rezerwacja pamięci na stos jądra dla głównego rdzenia procesora
 kernel_stack_bottom:
-    resb 16384                  ; 16 KB bezpiecznego i szybkiego stosu
+    resb 16384
 stack_top:
