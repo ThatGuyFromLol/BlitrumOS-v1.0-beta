@@ -115,51 +115,65 @@ update_verify() → malicious_check_static() → update_apply() →
 AHS-TUS podmienia wektor → nowy sterownik działa bez restartu
 Copy
 
-🐛 Bugfixy v0.1 → v1.0
-Plik	Naprawione błędy
-linker.ld	Był skryptem bash — teraz poprawny GNU ld
-Kernel.asm	Odczyt framebuffera PRZED przełączeniem stosu, dual boot path
-uefi_boot.asm	UTF-16 string syntax, ExitBootServices
-Legacy_boot.asm	E820 memory map, zbędny cli
-ahci.asm	global ahci_read_sectors, extern pci_read_config_dword
-usb_controller.asm	Usunięcie duplikatu pci_read_config_dword
-multicore_legacy.asm	: MULTICORE syntax, duplikat _start
-gui_hdr.asm	Błąd ekstrakcji kanału zielonego
-gui_men.asm	Trzy kopie kodu scalone, conflict z gui_draw_window
-tgfs_vfs.asm	Brakujący ret w syscall fallback, pełne syscalle
-idt.asm	Wszystkie 32 wyjątki + USB 0x28 + PIT 0x20
-ppm.asm	Argumenty PMM zapisywane przed rep stosq
-build.sh	Literówki, brak set -e
+## 🐛 Principais bugfixy v0.1 → v1.0-beta
 
-🗺️ Roadmapa
- UEFI GOP + Legacy BIOS bootloader
- Long Mode (64-bit)
- PMM — Physical Memory Manager
- IDT — obsługa wyjątków
- PIT Timer 1000Hz
- AHCI — odczyt dysków SATA
- USB 3.0 xHCI + przerwania
- Klawiatura + mysz (HID parser)
- Intel HD Audio
- HDR 64-bit GUI Engine
- Widget Manager + kursor myszy
- Shell tekstowy
- BSOD — kernel panic screen
- Serial debug (COM1)
- BME-QD Scheduler
- AHS-TUS Hot-Swap
- System aktualizacji + antymalware
- TGFS File System + Writer
- SMP Multicore boot
- Linux syscall emulation
- Testy w QEMU
- Sieć (Ethernet)
- Więcej komend shell (ls, cat, run)
- Virtual Memory Manager
- Format paczek aplikacji
-📄 Licencja
-Projekt hobbystyczny — kod publiczny.
+| Plik | Naprawione |
+|---|---|
+| `Build.sh` | Poprawione nazwy plików (hid_parser.asm, bosd.asm); usunięty simd_argb-64.asm (duplikat GUI) |
+| `linker.ld` | Zmieniono OUTPUT_FORMAT z binary na elf64-x86-64 dla kompatybilności z ld.lld |
+| `Kernel.asm` | Przesunięto msg_boot przed call serial_log (zapobieganie wykonaniu stringa jako instrukcji) |
+| `idt.asm` | Wszystkie 32 wyjątki + USB 0x28 + PIT 0x20 |
+| `gui_men.asm` | Scalone trzy kopie kodu; usunięty konflikt gui_draw_window |
+| `tgfs_vfs.asm` | Brakujący ret w syscall fallback; pełne implementacje syscalli |
+| `ppm.asm` | Argumenty PMM zapisywane przed rep stosq |
+
+---
+
+## 🗺️ Roadmapa
+
+- ✅ UEFI GOP bootloader (UEFI only)
+- ✅ Long Mode (64-bit)
+- ✅ PMM — Physical Memory Manager
+- ✅ IDT — obsługa wyjątków
+- ✅ PIT Timer 1000Hz
+- ✅ AHCI — odczyt dysków SATA
+- ✅ USB 3.0 xHCI + przerwania
+- ✅ Klawiatura + mysz (HID parser)
+- ✅ Intel HD Audio
+- ✅ HDR 64-bit GUI Engine
+- ✅ Widget Manager + kursor myszy
+- ✅ Shell tekstowy
+- ✅ BSOD — kernel panic screen
+- ✅ Serial debug (COM1)
+- ✅ BME-QD Scheduler
+- ✅ AHS-TUS Hot-Swap
+- ✅ System aktualizacji + antimalware
+- ✅ TGFS File System + Writer
+- 🔄 SMP Multicore boot (wersje przyszłe)
+- 🔄 Linux syscall emulation (wersje przyszłe)
+- 🔄 Virtual Memory Manager (wersje przyszłe)
+- 🔄 Networking (Ethernet) (wersje przyszłe)
+
+---
+
+## 📄 Licencja
+
+Projekt hobbystyczny — kod publiczny.  
 Jeśli coś zbudujesz na bazie tego projektu — daj znać! 🚀
 
-Blitrum OS — pisany od zera w czystym NASM Assembly.
+---
 
+## 🤝 Wkład
+
+Zapraszam do ulepszania projektu! Otwórz issue lub pull request.
+
+---
+
+## ⚠️ UWAGA
+
+To jest eksperymentalny projekt OS. **Nie używaj w produkcji.**  
+Bezpieczeństwo i stabilność nie są gwarantowane.
+
+---
+
+**Blitrum OS — pisany od zera w czystym NASM Assembly.**
