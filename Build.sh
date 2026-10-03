@@ -1,361 +1,250 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 # ==============================================================================
-# BLITRUM OS - UEFI ONLY BUILD SCRIPT
+#                         BLITRUM OS BUILD SYSTEM
+# ==============================================================================
 #
-# Architektura:
-#   UEFI x86-64
-#   NASM
-#   Kernel x86-64
+# UEFI:
+#   EFI/BOOT/BOOTX64.EFI
 #
-# Wyniki:
-#   build/kernel.bin
-#   build/BOOTX64.EFI
-#   build/blitrum.img
+# Kernel:
+#   Blitrum/kernel.bin
 #
-# Wymagane:
-#   nasm
-#   ld.lld / lld-link
-#   objcopy
+# UEFI bootloader:
+#   Bootloders/uefi_boot.asm
 #
-# Opcjonalnie do obrazu FAT32:
-#   mtools: mformat, mmd, mcopy
+# Kernel:
+#   Kernel/Kernel.asm
 #
 # ==============================================================================
 
-set -euo pipefail
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$REPO_ROOT/build"
-
-BOOT_DIR="$BUILD_DIR/esp"
-EFI_DIR="$BOOT_DIR/EFI"
-EFI_BOOT_DIR="$EFI_DIR/BOOT"
-BLITRUM_DIR="$BOOT_DIR/Blitrum"
-
-KERNEL="$BUILD_DIR/kernel.bin"
-EFI_OUT="$BUILD_DIR/BOOTX64.EFI"
-IMAGE="$BUILD_DIR/blitrum.img"
+set -e
 
 echo
-echo "============================================================"
-echo "        BLITRUM OS - UEFI ONLY BUILD"
-echo "============================================================"
+echo "=============================================="
+echo "          BLITRUM OS BUILD SYSTEM"
+echo "=============================================="
 echo
 
-# ------------------------------------------------------------------------------
-# Narzędzia
-# ------------------------------------------------------------------------------
 
-: "${NASM:=nasm}"
-: "${OBJCOPY:=objcopy}"
+# ==============================================================================
+# KONFIGURACJA
+# ==============================================================================
 
-if command -v lld-link >/dev/null 2>&1; then
-    EFI_LINKER="lld-link"
-elif command -v ld.lld >/dev/null 2>&1; then
-    EFI_LINKER="ld.lld"
-else
-    echo "ERROR: Nie znaleziono lld-link ani ld.lld."
-    echo
-    echo "MSYS2:"
-    echo "  pacman -S mingw-w64-clang-x86_64-lld"
-    exit 1
-fi
+NASM="${NASM:-nasm}"
+LD="${LD:-ld.lld}"
+LLD_LINK="${LLD_LINK:-lld-link}"
+OBJCOPY="${OBJCOPY:-llvm-objcopy}"
 
-# ------------------------------------------------------------------------------
-# Sprawdzenie narzędzi
-# ------------------------------------------------------------------------------
+BUILD="build"
 
-for TOOL in "$NASM" "$OBJCOPY"; do
-    if ! command -v "$TOOL" >/dev/null 2>&1; then
-        echo "ERROR: Nie znaleziono: $TOOL"
-        exit 1
-    fi
-done
+EFI_DIR="$BUILD/EFI/BOOT"
+BLITRUM_DIR="$BUILD/Blitrum"
 
-echo "NASM:      $(command -v "$NASM")"
-echo "EFI linker: $(command -v "$EFI_LINKER")"
-echo "OBJCOPY:   $(command -v "$OBJCOPY")"
-echo
+UEFI_OBJ="$BUILD/uefi_boot.o"
+UEFI_EFI="$EFI_DIR/BOOTX64.EFI"
 
-# ------------------------------------------------------------------------------
-# Czyszczenie
-# ------------------------------------------------------------------------------
+KERNEL_ELF="$BUILD/kernel.elf"
+KERNEL_BIN="$BLITRUM_DIR/kernel.bin"
 
-echo "-> Czyszczenie build/"
 
-rm -rf "$BUILD_DIR"
+# ==============================================================================
+# CZYSZCZENIE
+# ==============================================================================
 
-mkdir -p "$BUILD_DIR"
-mkdir -p "$EFI_BOOT_DIR"
+echo "[1/8] Czyszczenie starego build..."
+
+rm -rf "$BUILD"
+
+mkdir -p "$BUILD"
+mkdir -p "$EFI_DIR"
 mkdir -p "$BLITRUM_DIR"
 
-# ------------------------------------------------------------------------------
-# 1. UEFI BOOTLOADER
-#
-# UEFI loader musi być PE/COFF.
-#
-# NASM:
-#   -f win64
-#
-# Nie używamy:
-#   -f elf64
-#
-# ponieważ BOOTX64.EFI jest aplikacją PE32+.
-# ------------------------------------------------------------------------------
 
-echo
-echo "-> Kompilowanie UEFI bootloadera"
+# ==============================================================================
+# SPRAWDZENIE NARZĘDZI
+# ==============================================================================
+
+echo "[2/8] Sprawdzanie narzędzi..."
+
+command -v "$NASM" >/dev/null 2>&1 || {
+    echo "ERROR: NASM nie został znaleziony."
+    exit 1
+}
+
+command -v "$LD" >/dev/null 2>&1 || {
+    echo "ERROR: ld.lld nie został znaleziony."
+    exit 1
+}
+
+command -v "$LLD_LINK" >/dev/null 2>&1 || {
+    echo "ERROR: lld-link nie został znaleziony."
+    exit 1
+}
+
+command -v "$OBJCOPY" >/dev/null 2>&1 || {
+    echo "ERROR: llvm-objcopy nie został znaleziony."
+    exit 1
+}
+
+
+# ==============================================================================
+# 3. UEFI BOOTLOADER
+# ==============================================================================
+
+echo "[3/8] Kompilowanie UEFI bootloadera..."
 
 "$NASM" \
     -f win64 \
-    "$REPO_ROOT/Bootloders/uefi_boot.asm" \
-    -o "$BUILD_DIR/uefi_boot.obj"
+    Bootloders/uefi_boot.asm \
+    -o "$UEFI_OBJ"
 
-# ------------------------------------------------------------------------------
-# 2. LINK UEFI BOOTLOADER
-# ------------------------------------------------------------------------------
+echo "      uefi_boot.o OK"
 
-echo
-echo "-> Linkowanie BOOTX64.EFI"
 
-if [[ "$EFI_LINKER" == "lld-link" ]]; then
+# ==============================================================================
+# 4. LINKOWANIE BOOTX64.EFI
+# ==============================================================================
 
-    "$EFI_LINKER" \
-        /subsystem:efi_application \
-        /entry:_start \
-        /machine:x64 \
-        /nodefaultlib \
-        /fixed:no \
-        /out:"$EFI_OUT" \
-        "$BUILD_DIR/uefi_boot.obj"
+echo "[4/8] Linkowanie BOOTX64.EFI..."
 
-else
+"$LLD_LINK" \
+    /subsystem:efi_application \
+    /entry:_start \
+    /machine:x64 \
+    /nodefaultlib \
+    /fixed \
+    /out:"$UEFI_EFI" \
+    "$UEFI_OBJ"
 
-    # ld.lld w trybie linkera COFF
-    "$EFI_LINKER" \
-        -flavor link \
-        /subsystem:efi_application \
-        /entry:_start \
-        /machine:x64 \
-        /nodefaultlib \
-        /fixed:no \
-        /out:"$EFI_OUT" \
-        "$BUILD_DIR/uefi_boot.obj"
+echo "      EFI/BOOT/BOOTX64.EFI OK"
 
-fi
 
-if [[ ! -f "$EFI_OUT" ]]; then
-    echo "ERROR: Nie utworzono BOOTX64.EFI"
-    exit 1
-fi
+# ==============================================================================
+# 5. KOMPILACJA KERNELA + TOOLS
+# ==============================================================================
 
-echo "OK: $EFI_OUT"
+echo "[5/8] Kompilowanie kernela i modułów..."
 
-# ------------------------------------------------------------------------------
-# 3. KERNEL
-# ------------------------------------------------------------------------------
+KERNEL_OBJECTS=()
 
-echo
-echo "-> Kompilowanie Kernel.asm"
 
-"$NASM" \
-    -f elf64 \
-    "$REPO_ROOT/Kernel/Kernel.asm" \
-    -o "$BUILD_DIR/kernel.o"
+compile_asm()
+{
+    local SRC="$1"
+    local OBJ="$2"
 
-# ------------------------------------------------------------------------------
-# 4. TOOLS
-# ------------------------------------------------------------------------------
-
-echo
-echo "-> Kompilowanie Tools/*.asm"
-
-TOOLS_OBJS=()
-
-shopt -s nullglob
-
-for ASM_FILE in "$REPO_ROOT"/Tools/*.asm; do
-
-    BASENAME="$(basename "$ASM_FILE" .asm)"
-    OBJ="$BUILD_DIR/${BASENAME}.o"
-
-    echo "   $BASENAME.asm"
+    echo "      $SRC"
 
     "$NASM" \
         -f elf64 \
-        "$ASM_FILE" \
+        "$SRC" \
         -o "$OBJ"
 
-    TOOLS_OBJS+=("$OBJ")
-done
-
-shopt -u nullglob
-
-# ------------------------------------------------------------------------------
-# 5. LINK KERNELA
-# ------------------------------------------------------------------------------
-
-echo
-echo "-> Linkowanie kernela"
-
-if [[ ! -f "$REPO_ROOT/linker.ld" ]]; then
-    echo "ERROR: Nie znaleziono linker.ld"
-    exit 1
-fi
-
-KERNEL_ELF="$BUILD_DIR/kernel.elf"
-
-KERNEL_OBJECTS=(
-    "$BUILD_DIR/kernel.o"
-)
-
-for OBJ in "${TOOLS_OBJS[@]}"; do
     KERNEL_OBJECTS+=("$OBJ")
-done
+}
 
-ld.lld \
-    -T "$REPO_ROOT/linker.ld" \
-    -nostdlib \
-    -static \
+
+# ------------------------------------------------------------------------------
+# KERNEL
+# ------------------------------------------------------------------------------
+
+compile_asm \
+    Kernel/Kernel.asm \
+    "$BUILD/kernel.o"
+
+
+# ------------------------------------------------------------------------------
+# TOOLS
+# ------------------------------------------------------------------------------
+
+compile_asm Tools/ppm.asm               "$BUILD/ppm.o"
+compile_asm Tools/idt.asm               "$BUILD/idt.o"
+compile_asm Tools/pit_timer.asm         "$BUILD/pit_timer.o"
+
+compile_asm Tools/gui_hdr.asm           "$BUILD/gui_hdr.o"
+compile_asm Tools/gui_men.asm           "$BUILD/gui_men.o"
+compile_asm Tools/video_gop.asm         "$BUILD/video_gop.o"
+compile_asm Tools/simd_argb-64.asm      "$BUILD/simd_argb-64.o"
+
+compile_asm Tools/custom_sceduler.asm   "$BUILD/custom_sceduler.o"
+
+compile_asm Tools/tgfs_vfs.asm          "$BUILD/tgfs_vfs.o"
+
+compile_asm Tools/ahs-tus.asm           "$BUILD/ahs-tus.o"
+compile_asm Tools/update_loader.asm     "$BUILD/update_loader.o"
+
+compile_asm Tools/malicious_check.asm   "$BUILD/malicious_check.o"
+
+compile_asm Tools/ahci.asm              "$BUILD/ahci.o"
+
+compile_asm Tools/usb_controller.asm   "$BUILD/usb_controller.o"
+compile_asm Tools/usb_interrupts.asm    "$BUILD/usb_interrupts.o"
+
+compile_asm Tools/audio_hca.asm         "$BUILD/audio_hca.o"
+
+compile_asm Tools/hid.asm               "$BUILD/hid.o"
+
+compile_asm Tools/shell.asm             "$BUILD/shell.o"
+
+compile_asm Tools/bsod.asm              "$BUILD/bsod.o"
+
+compile_asm Tools/serial.asm            "$BUILD/serial.o"
+
+
+# ==============================================================================
+# 6. LINKOWANIE KERNEL.ELF
+# ==============================================================================
+
+echo "[6/8] Linkowanie kernela..."
+
+"$LD" \
+    -T linker.ld \
     -o "$KERNEL_ELF" \
     "${KERNEL_OBJECTS[@]}"
 
-# ------------------------------------------------------------------------------
-# 6. ELF -> RAW KERNEL
-# ------------------------------------------------------------------------------
+echo "      kernel.elf OK"
 
-echo
-echo "-> Tworzenie kernel.bin"
+
+# ==============================================================================
+# 7. KONWERSJA ELF -> RAW BINARY
+# ==============================================================================
+
+echo "[7/8] Tworzenie kernel.bin..."
 
 "$OBJCOPY" \
     -O binary \
     "$KERNEL_ELF" \
-    "$KERNEL"
+    "$KERNEL_BIN"
 
-if [[ ! -f "$KERNEL" ]]; then
-    echo "ERROR: Nie utworzono kernel.bin"
-    exit 1
-fi
+echo "      Blitrum/kernel.bin OK"
 
-echo "OK: $KERNEL"
 
-# ------------------------------------------------------------------------------
-# 7. KOPIOWANIE DO STRUKTURY ESP
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 8. PODSUMOWANIE
+# ==============================================================================
 
 echo
-echo "-> Tworzenie struktury EFI System Partition"
-
-cp "$EFI_OUT" \
-   "$EFI_BOOT_DIR/BOOTX64.EFI"
-
-cp "$KERNEL" \
-   "$BLITRUM_DIR/kernel.bin"
-
-# ------------------------------------------------------------------------------
-# 8. TWORZENIE OBRAZU FAT32
-#
-# Wymagane:
-#   mformat
-#   mmd
-#   mcopy
-#
-# ------------------------------------------------------------------------------
-
-echo
-echo "-> Sprawdzanie mtools"
-
-if ! command -v mformat >/dev/null 2>&1 || \
-   ! command -v mmd >/dev/null 2>&1 || \
-   ! command -v mcopy >/dev/null 2>&1; then
-
-    echo
-    echo "UWAGA: Nie znaleziono mtools."
-    echo
-    echo "Pliki zostały poprawnie przygotowane tutaj:"
-    echo
-    echo "  $BOOT_DIR"
-    echo
-    echo "Zainstaluj mtools, aby automatycznie utworzyć blitrum.img."
-    echo
-    echo "MSYS2:"
-    echo "  pacman -S mtools"
-    echo
-
-else
-
-    echo "-> Tworzenie obrazu FAT32: $IMAGE"
-
-    # 128 MiB obraz
-    dd if=/dev/zero \
-       of="$IMAGE" \
-       bs=1M \
-       count=128 \
-       status=none
-
-    # Format FAT32
-    mformat \
-        -i "$IMAGE" \
-        -F \
-        -v BLITRUM \
-        ::
-
-    # Katalogi EFI
-    mmd -i "$IMAGE" ::/EFI
-    mmd -i "$IMAGE" ::/EFI/BOOT
-
-    # Katalog Blitrum
-    mmd -i "$IMAGE" ::/Blitrum
-
-    # Bootloader
-    mcopy \
-        -i "$IMAGE" \
-        "$EFI_OUT" \
-        ::/EFI/BOOT/BOOTX64.EFI
-
-    # Kernel
-    mcopy \
-        -i "$IMAGE" \
-        "$KERNEL" \
-        ::/Blitrum/kernel.bin
-
-    echo "OK: $IMAGE"
-
-fi
-
-# ------------------------------------------------------------------------------
-# 9. INFORMACJE
-# ------------------------------------------------------------------------------
-
-echo
-echo "============================================================"
-echo "                 BUILD ZAKOŃCZONY"
-echo "============================================================"
+echo "=============================================="
+echo "              BUILD ZAKOŃCZONY"
+echo "=============================================="
 echo
 echo "UEFI:"
-echo "  $EFI_OUT"
+echo "  $UEFI_EFI"
 echo
-echo "Kernel:"
-echo "  $KERNEL"
+echo "KERNEL:"
+echo "  $KERNEL_BIN"
 echo
-echo "ESP:"
-echo "  $BOOT_DIR"
+echo "Układ:"
 echo
-if [[ -f "$IMAGE" ]]; then
-    echo "Obraz:"
-    echo "  $IMAGE"
-    echo
-fi
-
-echo "Struktura UEFI:"
+echo "  build/"
+echo "  ├── EFI/"
+echo "  │   └── BOOT/"
+echo "  │       └── BOOTX64.EFI"
+echo "  │"
+echo "  ├── Blitrum/"
+echo "  │   └── kernel.bin"
+echo "  │"
+echo "  └── kernel.elf"
 echo
-echo "  EFI/"
-echo "  └── BOOT/"
-echo "      └── BOOTX64.EFI"
-echo
-echo "  Blitrum/"
-echo "  └── kernel.bin"
-echo
-echo "============================================================"
+echo "=============================================="
