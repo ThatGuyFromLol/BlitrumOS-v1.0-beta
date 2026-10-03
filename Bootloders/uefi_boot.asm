@@ -96,16 +96,16 @@ BS_EXIT_BOOT_SERVICES equ 0xE8
 ; GOP
 ; ==============================================================================
 
-GOP_MODE_OFFSET        equ 0x18
+GOP_MODE_OFFSET         equ 0x18
 
-GOP_MODE_INFO_OFFSET   equ 0x08
+GOP_MODE_INFO_OFFSET    equ 0x08
 GOP_MODE_FB_BASE_OFFSET equ 0x18
 GOP_MODE_FB_SIZE_OFFSET equ 0x20
 
-GOP_INFO_WIDTH_OFFSET  equ 0x04
-GOP_INFO_HEIGHT_OFFSET equ 0x08
-GOP_INFO_FORMAT_OFFSET equ 0x0C
-GOP_INFO_PPS_OFFSET    equ 0x10
+GOP_INFO_WIDTH_OFFSET   equ 0x04
+GOP_INFO_HEIGHT_OFFSET  equ 0x08
+GOP_INFO_FORMAT_OFFSET  equ 0x0C
+GOP_INFO_PPS_OFFSET     equ 0x10
 
 
 ; ==============================================================================
@@ -141,7 +141,13 @@ _start:
     mov [rel image_handle], rcx
     mov [rel sys_table], rdx
 
-    ; 32 bajty shadow space + 32 bajty na argumenty stosowe.
+    ; 32 bajty shadow space + miejsce na argumenty stosowe.
+    ;
+    ; Przy tym układzie:
+    ;   [rsp + 0x20] = pierwszy argument stosowy
+    ;   ...
+    ;   [rsp + 0x68] = piąty argument funkcji UEFI
+    ;
     sub rsp, 0x40
 
 
@@ -369,7 +375,7 @@ _start:
 ; RDX = NewHandle
 ; R8  = FileName
 ; R9  = OpenMode
-; [RSP+0x40] = Attributes
+; [RSP+0x68] = Attributes
 ;
 ; ==============================================================================
 
@@ -383,7 +389,8 @@ _start:
 
     xor rax, rax
 
-    mov [rsp + 0x40], rax
+    ; 5. argument = Attributes
+    mov [rsp + 0x68], rax
 
     call qword [rbx + EFI_FILE_OPEN_OFFSET]
 
@@ -577,10 +584,10 @@ _start:
 
     xor r9, r9
 
-    ; arg5 = DescriptorVersion*
+    ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
-    mov [rsp + 0x40], rax
+    mov [rsp + 0x68], rax
 
     call qword [r11 + BS_GET_MEMORY_MAP]
 
@@ -626,17 +633,10 @@ _start:
 
     lea r9, [rel mmap_desc_size]
 
-    ; ==========================================================================
-    ; POPRAWIONE:
-    ;
-    ; GetMemoryMap() arg5 = EFI_MEMORY_DESCRIPTOR_VERSION*
-    ;
-    ; Przekazujemy adres zmiennej, a nie wartość.
-    ; ==========================================================================
-
+    ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
-    mov [rsp + 0x40], rax
+    mov [rsp + 0x68], rax
 
     call qword [r11 + BS_GET_MEMORY_MAP]
 
@@ -726,14 +726,10 @@ _start:
 
     lea r9, [rel mmap_desc_size]
 
-    ; ==========================================================================
-    ; POPRAWIONE:
-    ; DescriptorVersion*
-    ; ==========================================================================
-
+    ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
-    mov [rsp + 0x40], rax
+    mov [rsp + 0x68], rax
 
     call qword [r11 + BS_GET_MEMORY_MAP]
 
@@ -794,11 +790,9 @@ _start:
     mov qword [rel boot_services], 0
 
     ; RCX = BootInfo
-
     lea rcx, [rel boot_info]
 
     ; RAX = Kernel
-
     mov rax, KERNEL_LOAD_ADDRESS
 
     jmp rax
