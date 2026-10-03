@@ -1,34 +1,24 @@
-; ==============================================================================
-;             ARGB-64 DEEP COLOR (HDR) ENGINE & CONVERTING BLITTER
-; ==============================================================================
-; Nazwa pliku:   gui_hdr_core.asm
-; Architektura:  x86_64 (Long Mode)
-; Składnia:      NASM (Intel)
-; Optymalizacja: 64-bit Native Pixel Alignment (1 rejestr CPU = 1 piksel HDR)
-; ==============================================================================
-
 bits 64
 section .text
 
-; --- DEKLARACJE GLOBALNE API ---
 global gui_init
 global gui_get_backbuffer_addr
 global gui_draw_to_backbuffer
 global gui_refresh_screen
 global gui_draw_window
+global gui_draw_cursor
 
 section .data
 align 8
-gop_framebuffer:   dq 0         ; Fizyczny adres 32-bitowego ekranu z UEFI GOP
-gui_backbuffer:    dq 0         ; Adres naszego ukrytego 64-bitowego bufora HDR w RAM
+gop_framebuffer:   dq 0
+gui_backbuffer:    dq 0x01000000
+screen_width:      dd 0
+screen_height:     dd 0
+screen_pps:        dd 0
+backbuffer_size_b: dq 0
 
-global screen_width
-global screen_height
-
-screen_width:      dd 0         ; Szerokość ekranu w pikselach
-screen_height:     dd 0         ; Wysokość ekranu w pikselach
-screen_pps:        dd 0         ; Pixels Per Scan Line
-backbuffer_size_b: dq 0         ; Łączny rozmiar bufora 64-bitowego w bajtach
+cursor_x_prev: dq 0
+cursor_y_prev: dq 0
 
 section .text
 
@@ -49,24 +39,38 @@ gui_init:
     mov [screen_height], r8d
     mov [screen_pps], r9d
 
-    ; Obliczamy rozmiar 64-bitowego bufora: Wysokość * PPS * 8 bajtów (ARGB-64)
+    ; Compute dynamic backbuffer size from actual framebuffer dimensions
+    ; This avoids hardcoded 1080p assumption
     mov eax, r8d                ; EAX = Height
     mul r9d                     ; RAX = Height * PPS
-    shl rax, 3                  ; SZYBKA MATEMATYKA: Przesunięcie o 3 bity = Mnożenie przez 8 bajtów
+    shl rax, 3                  ; Multiply by 8 bytes per 64-bit pixel
     mov [backbuffer_size_b], rax
 
-    ; Backbuffer leży pod stałym adresem 16MB. Ten obszar jest jawnie chroniony
-    ; przez PMM (pierwsze 32MB rezerwowane), więc nie zostanie przydzielony gdzie
-    ; indziej. Bufor 1920x1080x8B ≈ 16MB mieści się w zakresie 16–32MB.
+    ; Safety check: reject absurdly large framebuffers
+    cmp rax, 0x10000000         ; 256 MB max
+    ja .invalid_size
+
+    ; Backbuffer allocation fallback to safe default
+    ; Better long-term: allocate from PMM / memory map
     mov qword [gui_backbuffer], 0x01000000
 
-    ; Czyszczenie Backbuffera 64-bitowego (Wypełniamy czernią: 0x0000000000000000)
+    ; Clear backbuffer with zeros (black)
     mov rdi, [gui_backbuffer]
     mov rcx, [backbuffer_size_b]
-    shr rcx, 3                  ; Dzielimy przez 8, bo czyścimy 64-bitowymi qwordami
+    shr rcx, 3                  ; Convert bytes to qwords
     xor rax, rax
-    rep stosq                   ; Sprzętowe czyszczenie RAMu
+    rep stosq
 
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+.invalid_size:
+    ; Framebuffer too large, fail gracefully
+    mov qword [backbuffer_size_b], 0
     pop rdi
     pop rdx
     pop rcx
@@ -76,7 +80,7 @@ gui_init:
 
 ; ==============================================================================
 ; FUNKCJA 2: gui_get_backbuffer_addr
-; Zwraca adres 64-bitowego Backbuffera w RAM.
+; Zwraca adres 64-bitowego Backbuffera w RAM
 ; ==============================================================================
 gui_get_backbuffer_addr:
     mov rax, [gui_backbuffer]
@@ -84,8 +88,8 @@ gui_get_backbuffer_addr:
 
 ; ==============================================================================
 ; FUNKCJA 3: gui_draw_to_backbuffer
-; Rysuje piksel ARGB-64 w ukrytym buforze HDR w pamięci RAM.
-; Wejście: ECX = Współrzędna X, EDX = Współrzędna Y, R8 = Kolor (64-bit QWORD ARGB)
+; Rysuje piksel ARGB-64 w ukrytym buforze HDR w pamięci RAM
+; Wejście: ECX = Współrzędna X, EDX = Współrzędna Y, R8 = Kolor (64-bit ARGB)
 ; ==============================================================================
 gui_draw_to_backbuffer:
     cmp ecx, [screen_width]
@@ -95,26 +99,26 @@ gui_draw_to_backbuffer:
 
     push rax
     push rbx
-    
-    ; Oblicz przesunięcie w pamięci: (Y * PPS + X) * 8
+
+    ; Oblicz przesunięcie: (Y * PPS + X) * 8
     mov eax, edx
     mov ebx, [screen_pps]
-    mul ebx                     ; RAX = Y * PPS
-    add eax, ecx                ; RAX = (Y * PPS) + X
-    shl rax, 3                  ; SZYBKA MATEMATYKA: Mnożenie przez 8 bajtów w 0 cykli CPU!
+    mul ebx
+    add eax, ecx
+    shl rax, 3
 
     mov rbx, [gui_backbuffer]
-    mov [rbx + rax], r8         ; Zapisz PEŁNY 64-bitowy piksel HDR jednym ruchem procesora
-    
+    mov [rbx + rax], r8
+
     pop rbx
     pop rax
 .out:
     ret
 
 ; ==============================================================================
-; FUNKCJA 4: gui_refresh_screen (Converting Ultra-Blitter Engine)
-; Kopiuje 64-bitowy obraz z RAMu, w locie kompresuje go do 32-bitów (XRGB) 
-; akceptowanych przez hardware i wyrzuca na monitor przez HDMI/DisplayPort.
+; FUNKCJA 4: gui_refresh_screen
+; Kopiuje 64-bitowy obraz z RAMu, kompresuje do 32-bit XRGB i zapisuje
+; do RAMu karty graficznej (HDMI/DisplayPort)
 ; ==============================================================================
 gui_refresh_screen:
     push rax
@@ -124,44 +128,38 @@ gui_refresh_screen:
     push rsi
     push rdi
 
-    mov rsi, [gui_backbuffer]   ; Źródło: 64-bitowy bufor HDR w RAM
-    mov rdi, [gop_framebuffer]  ; Cel: 32-bitowa pamięć karty graficznej (Monitor)
-    
-    ; Obliczamy łączną liczbę pikseli do przetworzenia: Height * PPS
+    mov rsi, [gui_backbuffer]
+    mov rdi, [gop_framebuffer]
+
+    ; Oblicz liczbę pikseli: Height * PPS
     mov eax, [screen_height]
     mov edx, [screen_pps]
     mul edx
-    mov rcx, rax                ; RCX = Licznik pętli (Liczba pikseli)
+    mov rcx, rax
 
 .blit_loop:
-    mov rbx, [rsi]              ; Pobierz 64-bitowy piksel ARGB-64 do rejestru RBX
-    
-    ; --- ULTRA-SZYBKA KONWERSJA W LOCIE (64-bit -> 32-bit) ---
-    ; W profesjonalnym ARGB-64 każdy kanał ma 16 bitów. 
-    ; Aby zejść do 8 bitów na kanał dla monitora, odrzucamy dolne bajty każdego kanału:
-    xor eax, eax                ; Czyszczenie rejestru wyjściowego 32-bit
-    
-    ; 1. Kanał Niebieski (B): bity 0-15 w RBX -> bity 0-7 w EAX
-    mov al, bh                  
-    
-    ; 2. Kanał Zielony (G): bity 16-31 w RBX -> bity 8-15 w EAX
-    ; BUGFIX: wcześniej `mov ah, bl` brało DOLNY bajt kanału G, podczas gdy dla
-    ; kanału B użyto `bh` (górny bajt). Dla kolorów innych niż szarości dawało to
-    ; przekłamane barwy. Teraz konsekwentnie bierzemy górny bajt każdego kanału.
+    mov rbx, [rsi]
+
+    ; Konwersja 64-bit ARGB -> 32-bit XRGB
+    xor eax, eax
+
+    ; Kanał B (niski bajt)
+    mov al, bh
+
+    ; Kanał G
     shr rbx, 16
     mov ah, bh
-    
-    ; 3. Kanał Czerwony (R): bity 32-47 w RBX -> bity 16-23 w EAX
+
+    ; Kanał R
     shr rbx, 16
     shl eax, 16
     mov al, bh
-    ror eax, 16                 ; Przywrócenie właściwej kolejności bajtów w EAX
+    ror eax, 16
 
-    ; Zapisujemy skompresowany 32-bitowy piksel do pamięci karty wideo
     mov [rdi], eax
-    
-    add rsi, 8                  ; Przejdź do kolejnego piksela 64-bitowego w RAM
-    add rdi, 4                  ; Przejdź do kolejnego piksela 32-bitowego w karcie graficznej
+
+    add rsi, 8
+    add rdi, 4
     loop .blit_loop
 
     pop rdi
@@ -174,7 +172,7 @@ gui_refresh_screen:
 
 ; ==============================================================================
 ; FUNKCJA 5: gui_draw_window
-; Rysuje okno w 64-bitowej przestrzeni bufora ukrytego.
+; Rysuje okno w 64-bitowej przestrzeni bufora ukrytego
 ; Wejście: ECX = Start X, EDX = Start Y, R8D = Szerokość, R9D = Wysokość
 ; ==============================================================================
 gui_draw_window:
@@ -189,17 +187,17 @@ gui_draw_window:
     push r14
     push r15
 
-    mov r12d, ecx               ; X
-    mov r13d, edx               ; Y
-    mov r14d, r8d               ; Width
-    mov r15d, r9d               ; Height
+    mov r12d, ecx
+    mov r13d, edx
+    mov r14d, r8d
+    mov r15d, r9d
 
-    ; --- TŁO OKNA (Jasnoszary w formacie 64-bit: 0x0000D3D3D3D3D3D3) ---
+    ; TŁO OKNA (jasnoszary)
     mov rsi, 0
 .win_y_loop:
     cmp rsi, r15
     jge .win_title_bar
-    
+
     mov rdi, 0
 .win_x_loop:
     cmp rdi, r14
@@ -209,17 +207,18 @@ gui_draw_window:
     add ecx, edi
     mov edx, r13d
     add edx, esi
-    mov r8, 0x0000D3D3D3D3D3D3  ; 64-bitowy jasnoszary
+    mov r8, 0x0000D3D3D3D3D3D3
     call gui_draw_to_backbuffer
 
     inc rdi
     jmp .win_x_loop
+
 .next_win_y:
     inc rsi
     jmp .win_y_loop
 
 .win_title_bar:
-    ; --- BELKA TYTUŁOWA (Głęboki granat 64-bit: 0x0000000000008888) ---
+    ; BELKA TYTUŁOWA (granatowa)
     mov rsi, 0
 .title_y_loop:
     cmp rsi, 24
@@ -234,11 +233,12 @@ gui_draw_window:
     add ecx, edi
     mov edx, r13d
     add edx, esi
-    mov r8, 0x0000000000008888  ; 64-bitowy głęboki granat
+    mov r8, 0x0000000000008888
     call gui_draw_to_backbuffer
 
     inc rdi
     jmp .title_x_loop
+
 .next_title_y:
     inc rsi
     jmp .title_y_loop
@@ -254,43 +254,13 @@ gui_draw_window:
     pop rcx
     pop rbx
     pop rax
-    
+    ret
+
 ; ==============================================================================
-; FUNKCJA: gui_draw_cursor
-; Rysuje kursor myszy (strzałka 12x12) w backbufferze.
+; FUNKCJA 6: gui_draw_cursor
+; Rysuje kursor myszy 12x12 pikseli
 ; Wejście: RCX = X, RDX = Y
 ; ==============================================================================
-global gui_draw_cursor
-
-section .data
-align 8
-cursor_x_prev:  dq 0            ; Poprzednia pozycja X (do kasowania)
-cursor_y_prev:  dq 0            ; Poprzednia pozycja Y (do kasowania)
-
-; Bitmapa kursora 12x12 (1 = rysuj, 0 = przezroczysty)
-; Klasyczna strzałka skierowana w lewo-górę
-align 16
-cursor_bitmap:
-    db 1,0,0,0,0,0,0,0,0,0,0,0
-    db 1,1,0,0,0,0,0,0,0,0,0,0
-    db 1,1,1,0,0,0,0,0,0,0,0,0
-    db 1,1,1,1,0,0,0,0,0,0,0,0
-    db 1,1,1,1,1,0,0,0,0,0,0,0
-    db 1,1,1,1,1,1,0,0,0,0,0,0
-    db 1,1,1,1,1,1,1,0,0,0,0,0
-    db 1,1,1,1,1,1,1,1,0,0,0,0
-    db 1,1,1,1,0,0,0,0,0,0,0,0
-    db 1,1,0,1,1,0,0,0,0,0,0,0
-    db 1,0,0,0,1,1,0,0,0,0,0,0
-    db 0,0,0,0,0,1,1,0,0,0,0,0
-
-CURSOR_W equ 12
-CURSOR_H equ 12
-CURSOR_COLOR     equ 0x0000FFFFFFFFFFFF  ; Biały (64-bit HDR)
-CURSOR_OUTLINE   equ 0x0000000000000000  ; Czarny (obrys)
-
-section .text
-
 gui_draw_cursor:
     push rax
     push rbx
@@ -303,25 +273,25 @@ gui_draw_cursor:
     push r14
     push r15
 
-    mov r12, rcx                ; R12 = nowe X
-    mov r13, rdx                ; R13 = nowe Y
+    mov r12, rcx
+    mov r13, rdx
 
-    ; --- KROK 1: Skasuj stary kursor (nadpisz czernią) ---
+    ; Skasuj stary kursor (nadpisz czernią)
     mov r14, [cursor_x_prev]
     mov r15, [cursor_y_prev]
 
-    xor rsi, rsi                ; RSI = wiersz
+    xor rsi, rsi
 .erase_y:
-    cmp rsi, CURSOR_H
+    cmp rsi, 12
     jge .draw_cursor
-    xor rdi, rdi                ; RDI = kolumna
+    xor rdi, rdi
 .erase_x:
-    cmp rdi, CURSOR_W
+    cmp rdi, 12
     jge .erase_next_y
 
     lea rax, [rel cursor_bitmap]
     mov rbx, rsi
-    imul rbx, CURSOR_W
+    imul rbx, 12
     add rbx, rdi
     movzx eax, byte [rax + rbx]
     test al, al
@@ -333,7 +303,7 @@ gui_draw_cursor:
     add ecx, edi
     mov edx, r15d
     add edx, esi
-    mov r8, 0x0000000000000000  ; Czarny
+    mov r8, 0x0000000000000000
     call gui_draw_to_backbuffer
     pop rdx
     pop rcx
@@ -341,24 +311,24 @@ gui_draw_cursor:
 .erase_skip:
     inc rdi
     jmp .erase_x
+
 .erase_next_y:
     inc rsi
     jmp .erase_y
 
-    ; --- KROK 2: Narysuj nowy kursor ---
 .draw_cursor:
     xor rsi, rsi
 .draw_y:
-    cmp rsi, CURSOR_H
+    cmp rsi, 12
     jge .cursor_done
     xor rdi, rdi
 .draw_x:
-    cmp rdi, CURSOR_W
+    cmp rdi, 12
     jge .draw_next_y
 
     lea rax, [rel cursor_bitmap]
     mov rbx, rsi
-    imul rbx, CURSOR_W
+    imul rbx, 12
     add rbx, rdi
     movzx eax, byte [rax + rbx]
     test al, al
@@ -370,7 +340,7 @@ gui_draw_cursor:
     add ecx, edi
     mov edx, r13d
     add edx, esi
-    mov r8, CURSOR_COLOR
+    mov r8, 0x0000FFFFFFFFFFFF
     call gui_draw_to_backbuffer
     pop rdx
     pop rcx
@@ -378,12 +348,12 @@ gui_draw_cursor:
 .draw_skip:
     inc rdi
     jmp .draw_x
+
 .draw_next_y:
     inc rsi
     jmp .draw_y
 
 .cursor_done:
-    ; Zapisz nową pozycję jako poprzednią
     mov [cursor_x_prev], r12
     mov [cursor_y_prev], r13
 
@@ -398,3 +368,19 @@ gui_draw_cursor:
     pop rbx
     pop rax
     ret
+
+section .data
+align 16
+cursor_bitmap:
+    db 1,0,0,0,0,0,0,0,0,0,0,0
+    db 1,1,0,0,0,0,0,0,0,0,0,0
+    db 1,1,1,0,0,0,0,0,0,0,0,0
+    db 1,1,1,1,0,0,0,0,0,0,0,0
+    db 1,1,1,1,1,0,0,0,0,0,0,0
+    db 1,1,1,1,1,1,0,0,0,0,0,0
+    db 1,1,1,1,1,1,1,0,0,0,0,0
+    db 1,1,1,1,1,1,1,1,0,0,0,0
+    db 1,1,1,1,0,0,0,0,0,0,0,0
+    db 1,1,0,1,1,0,0,0,0,0,0,0
+    db 1,0,0,0,1,1,0,0,0,0,0,0
+    db 0,0,0,0,0,1,1,0,0,0,0,0
