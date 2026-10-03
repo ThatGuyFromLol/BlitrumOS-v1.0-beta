@@ -1,16 +1,18 @@
-   
 bits 64
 section .text
 
 global pmm_init
 global pmm_alloc_page
 global pmm_free_page
+global bitmap_base
+global bitmap_size
 
-; set by boot code from a safe aligned address
-extern bitmap_base
-extern bitmap_size
+section .data
+align 8
+bitmap_base: dq 0x00200000      ; runtime-safe default fallback
+bitmap_size: dq 0x00020000      ; 128KB bitmap => ~4GB RAM
 
-EFI_CONVENTIONAL_MEMORY equ 7
+section .text
 
 ; ==============================================================================
 ; FUNKCJA: pmm_init
@@ -28,15 +30,16 @@ pmm_init:
     push r11
     push r12
 
-    ; BUGFIX: Zachowujemy argumenty PRZED rep stosq (niszczy RCX)
+    ; Zachowujemy argumenty PRZED rep stosq (niszczy RCX)
     mov rsi, r9                 ; RSI = wskaźnik na pierwszy deskryptor
     mov r11, rcx                ; R11 = DescriptorSize
     mov r12, r8                 ; R12 = MemoryMapSize
     add r12, rsi                ; R12 = adres końca tablicy
 
     ; Oznaczamy CAŁĄ pamięć jako zajętą (1 = zajęte)
-    mov rdi, BITMAP_ADDRESS
-    mov rcx, 16384              ; 16384 * 8 bajtów = 128KB bitmapy
+    mov rdi, [rel bitmap_base]
+    mov rcx, [rel bitmap_size]
+    shr rcx, 3                  ; bytes -> qwords
     mov rax, 0xFFFFFFFFFFFFFFFF
     rep stosq
 
@@ -49,7 +52,7 @@ pmm_init:
     ; Offset 8  (8B): PhysicalStart
     ; Offset 24 (8B): NumberOfPages
     mov eax, [rsi]
-    cmp eax, EFI_CONVENTIONAL_MEMORY
+    cmp eax, 7                  ; EFI_CONVENTIONAL_MEMORY
     jne .next_descriptor
 
     mov rbx, [rsi + 8]          ; PhysicalStart
@@ -61,7 +64,7 @@ pmm_init:
     mov rax, rbx
     shr rax, 12                 ; Numer bitu = adres / 4096
 
-    mov rdi, BITMAP_ADDRESS
+    mov rdi, [rel bitmap_base]
     btr [rdi], rax              ; Bit = 0 (wolna strona)
 
     add rbx, 4096
@@ -73,14 +76,8 @@ pmm_init:
     jmp .map_loop
 
 .init_done:
-    ; Rezerwujemy pierwsze 32MB (8192 stron) dla struktur systemowych:
-    ;   1MB  — kernel
-    ;   2MB  — bitmapa PMM
-    ;   4MB  — bufory DMA AHCI
-    ;   8MB  — obszar ładowania TGFS
-    ;   10MB — stos wątku GUI
-    ;   16MB — backbuffer HDR (64-bit, ~16MB)
-    mov rdi, BITMAP_ADDRESS
+    ; Rezerwujemy pierwsze 32MB (8192 stron) dla struktur systemowych
+    mov rdi, [rel bitmap_base]
     mov rcx, 8192
 .protect_kernel:
     mov rax, rcx
@@ -99,7 +96,6 @@ pmm_init:
     pop rax
     ret
 
-
 ; ==============================================================================
 ; FUNKCJA: pmm_alloc_page
 ; Zwraca: RAX = Fizyczny adres przydzielonej strony (0 = brak RAM)
@@ -110,7 +106,7 @@ pmm_alloc_page:
     push rdx
     push rdi
 
-    mov rdi, BITMAP_ADDRESS
+    mov rdi, [rel bitmap_base]
     mov rcx, 0
 
 .search_byte:
@@ -128,16 +124,16 @@ pmm_alloc_page:
 .bit_found:
     not al
     movzx eax, al
-    bsf bx, ax                  ; BX = lokalny numer wolnego bitu
+    bsf bx, ax
 
     mov rdx, rcx
-    shl rdx, 3                  ; Indeks startowy bajtu * 8
-    add dx, bx                  ; Globalny numer bitu
+    shl rdx, 3
+    add dx, bx
 
-    bts [rdi], rdx              ; Zarezerwuj stronę (bit = 1)
+    bts [rdi], rdx
 
     mov rax, rdx
-    shl rax, 12                 ; Adres fizyczny = numer bitu * 4096
+    shl rax, 12
 
 .exit:
     pop rdi
@@ -145,7 +141,6 @@ pmm_alloc_page:
     pop rcx
     pop rbx
     ret
-
 
 ; ==============================================================================
 ; FUNKCJA: pmm_free_page
@@ -156,8 +151,8 @@ pmm_free_page:
     push rcx
 
     shr rcx, 12
-    mov rdi, BITMAP_ADDRESS
-    btr [rdi], rcx              ; Bit = 0 (wolna strona)
+    mov rdi, [rel bitmap_base]
+    btr [rdi], rcx
 
     pop rcx
     pop rdi
