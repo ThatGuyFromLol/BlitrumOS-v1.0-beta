@@ -12,9 +12,9 @@ section .text
 
 global _start
 
-; ==============================================================================
-; INDEKS STEROWNIKÓW I SYSTEMU
-; ==============================================================================
+extern __bss_start
+extern __bss_end
+
 extern pit_init
 extern bsod_init
 extern serial_init
@@ -45,30 +45,15 @@ extern update_check
 extern update_apply
 extern update_is_pending
 
-; Definicje stałych indeksów wektorów dla dynamicznej tabeli aktualizacji AHS-TUS
+extern bitmap_base
+extern bitmap_size
+
 VECTOR_AUDIO    equ 0
 VECTOR_USB      equ 1
 VECTOR_STORAGE  equ 2
 VECTOR_GRAPHICS equ 3
 
-; ==============================================================================
-; PUNKT WEJŚCIA BLITRUM OS - UEFI ONLY
-;
-; Wejście:
-;   RCX = adres struktury BootInfo przekazanej przez uefi_boot.asm
-;
-; BootInfo:
-;   +0x00 = framebuffer
-;   +0x08 = framebuffer_size
-;   +0x10 = width
-;   +0x14 = height
-;   +0x18 = pixels_per_scanline
-;   +0x1C = pixel_format
-;   +0x20 = memory_map
-;   +0x28 = memory_map_size
-;   +0x30 = descriptor_size
-;   +0x38 = RSDP
-; ==============================================================================
+section .text
 
 _start:
     cli
@@ -81,9 +66,26 @@ _start:
     mov rbx, rcx
 
     ; --------------------------------------------------------------------------
-    ; FRAMEBUFFER
+    ; WŁASNY STOS KERNELA
     ; --------------------------------------------------------------------------
 
+    mov rsp, stack_top
+    and rsp, -16
+
+    ; --------------------------------------------------------------------------
+    ; ZERO .BSS
+    ; --------------------------------------------------------------------------
+    ; To jest ważne: raw kernel.bin nie zawiera .bss, więc trzeba wyczyścić
+    ; obszar BSS przed pierwszym użyciem jakichkolwiek globalnych zmiennych.
+    mov rdi, __bss_start
+    mov rcx, __bss_end
+    sub rcx, rdi
+    xor rax, rax
+    rep stosb
+
+    ; --------------------------------------------------------------------------
+    ; FRAMEBUFFER
+    ; --------------------------------------------------------------------------
     mov r14, [rbx + 0x00]
 
     mov eax, [rbx + 0x10]
@@ -98,7 +100,6 @@ _start:
     ; --------------------------------------------------------------------------
     ; MEMORY MAP UEFI
     ; --------------------------------------------------------------------------
-
     mov rax, [rbx + 0x20]
     mov [mmap_ptr], rax
 
@@ -109,11 +110,13 @@ _start:
     mov [mmap_descsz], rax
 
     ; --------------------------------------------------------------------------
-    ; WŁASNY STOS KERNELA
+    ; DYNAMIC PMM BITMAP CONFIG
+    ; Minimal safe default values.
+    ; Better design: compute from EFI memory map later; this avoids the
+    ; hardcoded 0x00200000 assumption.
     ; --------------------------------------------------------------------------
-
-    mov rsp, stack_top
-    and rsp, -16
+    mov qword [rel bitmap_base], 0x00200000
+    mov qword [rel bitmap_size], 0x00020000   ; 128 KB for ~4GB RAM
 
     jmp boot_common
 
@@ -125,8 +128,7 @@ boot_common:
     call update_system_init
 
     ; --- 5. INICJALIZACJA DYNAMICZNEGO MENEDŻERA RAM (PMM) ---
-    ; PMM oczekuje (Microsoft x64 ABI): RCX=DescriptorSize, R8=MemoryMapSize,
-    ; R9=wskaźnik na mapę.
+    ; Minimal runtime-safe PMM config
     mov rcx, [mmap_descsz]
     mov r8,  [mmap_size]
     mov r9,  [mmap_ptr]
@@ -149,7 +151,7 @@ boot_common:
 
     ; --- 8. SKANOWANIE SPRZĘTU I REJESTRACJA DYNAMICZNA (PCI MATRIX) ---
 
-    ; A. Karta Dźwiękowa Intel HD Audio
+    ; A. Karta Dźwiękowa Intel HD Audio (Plik: audio_hca.asm)
     call find_hda_controller
     jc .skip_audio
     call init_hda_controller
@@ -158,7 +160,7 @@ boot_common:
     call update_register_vector
 .skip_audio:
 
-    ; B. Porty i Kontroler USB 3.0 (xHCI)
+    ; B. Porty i Kontroler USB 3.0 (xHCI - Plik: usb_controller.asm)
     call find_usb_controllers
     jc .skip_usb
     mov [xhci_base_mmio], rax
@@ -204,8 +206,7 @@ boot_common:
     call serial_init
     call pit_init
 
-    ; FIX: string must be defined before the call
-    ; otherwise the CPU will execute the bytes as instructions.
+    ; string must be defined before the call
     lea rsi, [rel msg_boot]
     call serial_log
 
@@ -236,24 +237,18 @@ fallback_render:
     call gui_refresh_screen
 
 system_execute:
-    ; --- 11. ROZPOCZĘCIE ASYNCHRONICZNEJ PRACY EKOSYSTEMU ---
     sti
 
 kernel_idle_loop:
     call scheduler_event_loop
     jmp kernel_idle_loop
 
-; Przechwytywanie awarii krytycznej (Kernel Panic)
 kernel_panic:
     cli
 panic_loop:
     hlt
     jmp panic_loop
 
-
-; ==============================================================================
-; DATA
-; ==============================================================================
 section .data
 align 8
 xhci_base_mmio:   dq 0
@@ -265,7 +260,6 @@ fb_height:        dd 0
 fb_pps:           dd 0
 tgfs_active:      db 0
 
-; FIX: place the string before the call site
 msg_boot:
     db "Kernel uruchomiony!", 0
 
