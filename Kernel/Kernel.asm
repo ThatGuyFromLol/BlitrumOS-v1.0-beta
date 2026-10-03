@@ -120,7 +120,9 @@ _start:
     jmp boot_common
 
 boot_common:
-    mov rsp, stack_top
+
+    ; Stos został ustawiony w _start.
+    ; Od tego miejsca działamy już wyłącznie jako UEFI kernel.
 
     ; --- 4. AKTYWACJA UNIKALNEJ TABELI AKTUALIZACJI (AHS-TUS) ---
     call update_system_init     ; Przygotowuje tabelę w locie na dynamiczne wektory w RAM
