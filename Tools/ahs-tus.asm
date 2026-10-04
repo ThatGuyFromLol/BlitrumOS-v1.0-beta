@@ -1,96 +1,176 @@
 ; ==============================================================================
-;          ATOMIC HOT-SWAPPING TAGGED UPDATE SYSTEM (AHS-TUS)
+;          BLITRUM OS - ATOMIC HOT-SWAPPING TAGGED UPDATE SYSTEM (AHS-TUS)
+;          x86-64 / NASM
 ; ==============================================================================
-; Nazwa pliku:   sys_update.asm
-; Architektura:  x86_64 (Long Mode)
-; Składnia:      NASM (Intel)
-; Optymalizacja: Lock-Free Atomic Pointer Swapping (Bezrestartowa Aktualizacja)
+;
+; Public API:
+;   update_system_init
+;   update_register_vector
+;   update_get_vector_address
+;   update_call_vector
+;   update_hot_swap_driver
+;
 ; ==============================================================================
 
 bits 64
+
 section .text
 
-; --- DEKLARACJE GLOBALNE API ---
+; ==============================================================================
+; PUBLIC API
+; ==============================================================================
+
 global update_system_init
 global update_register_vector
+global update_get_vector_address
 global update_call_vector
 global update_hot_swap_driver
 
-; Importujemy funkcje przydziału RAM i ładowania dla poprawek systemowych
-extern pmm_alloc_page           ; z pmm.asm
-extern tgfs_load_and_map_file   ; z tgfs_vfs.asm
+extern pmm_alloc_page
+extern tgfs_load_and_map_file
 
-; Maksymalna liczba dynamicznych modułów/sterowników systemowych
 MAX_VECTORS equ 32
 
+; ==============================================================================
+; SYSTEM VECTOR TABLE
+; ==============================================================================
+
 section .data
+
 align 8
-; Centralna Tabela Wektorów Systemowych (Wskaźniki do działających sterowników)
-; Kernel i aplikacje nie wywołują sterowników bezpośrednio przez "call funkcja".
-; Wywołują je przez tę tabelę, co pozwala na natychmiastowe podmienienie adresu.
-system_vector_table: times MAX_VECTORS dq 0
+
+global system_vector_table
+
+system_vector_table:
+    times MAX_VECTORS dq 0
+
+; ==============================================================================
+; CODE
+; ==============================================================================
 
 section .text
 
 ; ==============================================================================
-; FUNKCJA 1: update_system_init
-; Inicjalizuje tabelę dynamicznych wektorów poprawek.
+; update_system_init
+;
+; Zeruje wszystkie wektory AHS-TUS.
 ; ==============================================================================
+
 update_system_init:
+
     push rcx
     push rdi
     push rax
 
-    mov rdi, system_vector_table
+    lea rdi, [rel system_vector_table]
+
     mov rcx, MAX_VECTORS
-    xor rax, rax
-    rep stosq                   ; Wyczyszczenie tabeli wskaźników sterowników
+
+    xor eax, eax
+
+    rep stosq
 
     pop rax
     pop rdi
     pop rcx
+
     ret
 
+
 ; ==============================================================================
-; FUNKCJA 2: update_register_vector
-; Przypisuje adres startowy sterownika do wybranego slotu wektora.
-; Wejście: RCX = ID Wektora (0..31), RDX = Aktualny adres funkcji w RAM
+; update_register_vector
+;
+; RCX = Vector ID
+; RDX = nowy adres funkcji
+;
+; RAX = 0
+;
 ; ==============================================================================
 update_register_vector:
+
     cmp rcx, MAX_VECTORS
-    jae .out
-    mov [system_vector_table + rcx * 8], rdx
-.out:
+    jae .invalid
+
+    mov [rel system_vector_table + rcx * 8], rdx
+
+    xor eax, eax
+
     ret
 
+.invalid:
+
+    mov rax, -1
+
+    ret
+
+
 ; ==============================================================================
-; FUNKCJA 3: update_call_vector (Szybki skok przez wektor)
-; Przekierowuje wykonanie do aktualnej wersji sterownika.
-; Wejście: RAX = ID Wektora, pozostałe rejestry przekazywane są do sterownika.
+; update_get_vector_address
+;
+; RCX = Vector ID
+;
+; RAX = aktualny adres
+; RAX = 0 jeżeli ID nieprawidłowe
+;
 ; ==============================================================================
+update_get_vector_address:
+
+    cmp rcx, MAX_VECTORS
+    jae .invalid
+
+    mov rax, [rel system_vector_table + rcx * 8]
+
+    ret
+
+.invalid:
+
+    xor eax, eax
+
+    ret
+
+
+; ==============================================================================
+; update_call_vector
+;
+; RAX = Vector ID
+;
+; Pozostałe rejestry są przekazywane do sterownika.
+;
+; ==============================================================================
+
 update_call_vector:
+
     cmp rax, MAX_VECTORS
     jae .error
-    
-    ; Pobieramy aktualny wskaźnik i skaczemy. Brak narzutu — zwykły pośredni jmp.
-    mov rax, [system_vector_table + rax * 8]
+
+    mov rax, [rel system_vector_table + rax * 8]
+
     test rax, rax
     jz .error
-    jmp rax                     ; Skok do sterownika (funkcja ret sterownika wróci do wywołującego)
+
+    jmp rax
 
 .error:
+
+    xor eax, eax
+
     ret
 
+
 ; ==============================================================================
-; FUNKCJA 4: update_hot_swap_driver (Serce AHS-TUS - Atomowa aktualizacja w locie)
-; Pobiera nową wersję sterownika z systemu plików TGFS, ładuje do RAM-u 
-; i bezrestartowo podmienia działający kod w ułamku mikrosekundy.
-; Wejście: 
-;   RCX = Port SATA, RDX = File ID nowej wersji sterownika w TGFS, R8 = ID Wektora (0..31)
-; Zwraca:  
-;   RAX = 0 (Sukces podmiany), -1 (Błąd)
+; update_hot_swap_driver
+;
+; RCX = SATA port
+; RDX = TGFS File ID
+; R8  = Vector ID
+;
+; RAX = 0  sukces
+; RAX = -1 błąd
+;
 ; ==============================================================================
+
 update_hot_swap_driver:
+
     push rbx
     push rcx
     push rdx
@@ -100,46 +180,78 @@ update_hot_swap_driver:
     push rdi
     push r12
 
-    mov r12, r8                 ; R12 = ID Wektora, który aktualizujemy
+    mov r12, r8
 
-    ; 1. Rezerwujemy nową, czystą przestrzeń w pamięci RAM na zaktualizowany sterownik
+    ; --------------------------------------------------------------------------
+    ; Sprawdź Vector ID
+    ; --------------------------------------------------------------------------
+
+    cmp r12, MAX_VECTORS
+    jae .err_out
+
+    ; --------------------------------------------------------------------------
+    ; Alokuj stronę na nowy moduł
+    ; --------------------------------------------------------------------------
+
     push rcx
     push rdx
-    call pmm_alloc_page         
-    mov rbx, rax                ; RBX = Nowy fizyczny adres w RAM dla sterownika
+
+    call pmm_alloc_page
+
+    mov rbx, rax
+
     pop rdx
     pop rcx
-    
-    test rbx, rbx
-    jz .err_out                 ; Brak wolnego RAMu na aktualizację
 
-    ; 2. Wywołujemy JMP-Loader i pobieramy nowy plik kodu z systemu TGFS prosto do nowego RAMu
-    mov r8, rbx                 ; Adres docelowy w RAM
+    test rbx, rbx
+    jz .err_out
+
+    ; --------------------------------------------------------------------------
+    ; Załaduj moduł z TGFS
+    ;
+    ; RCX = SATA port
+    ; RDX = File ID
+    ; R8  = destination
+    ; --------------------------------------------------------------------------
+
+    mov r8, rbx
+
     call tgfs_load_and_map_file
-    cmp rax, -1                 ; Czy JMP-Loader zgłosił błąd pliku?
+
+    cmp rax, -1
     je .err_out
 
-    ; RAX zawiera punkt startowy (Entry Point) nowego, zaktualizowanego kodu sterownika.
+    test rax, rax
+    jz .err_out
 
-    ; 3. --- ATOMOWA PODMIANA (LOCKLESS HOT-SWAP) ---
-    ; Wykorzystujemy instrukcję XCHG z prefiksem LOCK.
-    ; Ta operacja jest w 100% atomowa na poziomie procesora. Żaden inny rdzeń (AP) 
-    ; nie przeczyta adresu w pół kroku. Wektor w jednej miliardowej sekundy 
-    ; zaczyna wskazywać na nową wersję sterownika.
-    lea rdi, [system_vector_table + r12 * 8]
-    
-    xchg [rdi], rax        ; RAX dostaje STARY adres sterownika, a w tabeli ląduje NOWY!
+    ; --------------------------------------------------------------------------
+    ; RAX = entry point nowego modułu
+    ;
+    ; Atomowa podmiana:
+    ;
+    ; XCHG r/m64, r64
+    ;
+    ; dla pamięci jest implicit LOCK.
+    ; --------------------------------------------------------------------------
 
-    ; Stary adres sterownika (zwrócony w RAX) można teraz bezpiecznie zwolnić 
-    ; lub zachować w celu wykonania automatycznego ROLLBACKU w przypadku awarii.
+    lea rdi, [rel system_vector_table + r12 * 8]
 
-    xor rax, rax                ; Zwróć 0 (Sukces bezrestartowej aktualizacji)
+    xchg [rdi], rax
+
+    ; --------------------------------------------------------------------------
+    ; Sukces
+    ; --------------------------------------------------------------------------
+
+    xor eax, eax
+
     jmp .exit
 
 .err_out:
-    mov rax, -1                 ; Zwróć -1 (Błąd aktualizacji)
+
+    mov rax, -1
 
 .exit:
+
     pop r12
     pop rdi
     pop rsi
@@ -148,4 +260,5 @@ update_hot_swap_driver:
     pop rdx
     pop rcx
     pop rbx
+
     ret
