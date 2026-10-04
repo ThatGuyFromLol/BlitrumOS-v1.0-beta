@@ -339,4 +339,237 @@ scheduler_dispatch:
 
     and ecx, 63
 
-   
+    xor edx, edx
+
+
+.find_next:
+
+    mov esi, ecx
+
+    add esi, edx
+
+    and esi, 63
+
+    ; Sprawdź bit zadania.
+
+    bt rax, rsi
+
+    jc .task_selected
+
+    inc edx
+
+    cmp edx, MAX_TASKS
+
+    jb .find_next
+
+    ; Nie powinno się wydarzyć, bo task 0 jest zawsze gotowy.
+
+    xor esi, esi
+
+
+.task_selected:
+
+    mov dword [rel current_task_id], esi
+
+    ; --------------------------------------------------------------------------
+    ; Załaduj RSP wybranego zadania.
+    ; --------------------------------------------------------------------------
+
+    mov rsp, [rel task_rsp_table + rsi * 8]
+
+    test rsp, rsp
+
+    jnz .restore_context
+
+    ; --------------------------------------------------------------------------
+    ; Brak poprawnego kontekstu.
+    ; Wracamy do task 0.
+    ; --------------------------------------------------------------------------
+
+    xor esi, esi
+
+    mov dword [rel current_task_id], 0
+
+    mov rsp, [rel task_rsp_table]
+
+    test rsp, rsp
+
+    jz .fatal_scheduler
+
+
+.restore_context:
+
+    ; --------------------------------------------------------------------------
+    ; Odtwórz GPR.
+    ; --------------------------------------------------------------------------
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    ; --------------------------------------------------------------------------
+    ; Przywróć:
+    ;
+    ; RIP
+    ; CS
+    ; RFLAGS
+    ;
+    ; i przejdź do zadania.
+    ; --------------------------------------------------------------------------
+
+    iretq
+
+
+; ==============================================================================
+; Błąd krytyczny schedulera
+; ==============================================================================
+
+.fatal_scheduler:
+
+    cli
+
+
+.fatal_loop:
+
+    hlt
+    jmp .fatal_loop
+
+
+; ==============================================================================
+; scheduler_event_loop
+; ==============================================================================
+;
+; Główna pętla obsługi zdarzeń systemowych.
+;
+; USB -> HID -> GUI / Shell
+;
+; ==============================================================================
+
+scheduler_event_loop:
+
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+
+.event_loop:
+
+    ; --------------------------------------------------------------------------
+    ; Pobierz zdarzenie USB.
+    ;
+    ; RAX = event
+    ; RAX = 0 -> brak zdarzenia
+    ; --------------------------------------------------------------------------
+
+    call usb_pop_event
+
+    test rax, rax
+
+    jz .idle
+
+    movzx ebx, al
+
+    ; --------------------------------------------------------------------------
+    ; Event 1 = keyboard
+    ; --------------------------------------------------------------------------
+
+    cmp ebx, 1
+
+    je .handle_keyboard
+
+    ; --------------------------------------------------------------------------
+    ; Event 2 = mouse
+    ; --------------------------------------------------------------------------
+
+    cmp ebx, 2
+
+    je .handle_mouse
+
+    ; Nieznane zdarzenie.
+
+    jmp .event_loop
+
+
+; ==============================================================================
+; Keyboard
+; ==============================================================================
+
+.handle_keyboard:
+
+    mov [rel hid_report_buf], rax
+
+    lea rcx, [rel hid_report_buf]
+
+    call hid_parse_keyboard
+
+    ; Pozwól shellowi obsłużyć wejście klawiatury.
+
+    call shell_run
+
+    jmp .event_loop
+
+
+; ==============================================================================
+; Mouse
+; ==============================================================================
+
+.handle_mouse:
+
+    mov [rel hid_report_buf], rax
+
+    lea rcx, [rel hid_report_buf]
+
+    call hid_parse_mouse
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź przycisk myszy.
+    ; --------------------------------------------------------------------------
+
+    movzx ebx, byte [rel hid_report_buf]
+
+    test ebx, 1
+
+    jz .no_click
+
+    ; --------------------------------------------------------------------------
+    ; Przekaż pozycję myszy do GUI.
+    ; --------------------------------------------------------------------------
+
+    mov rcx, [rel mouse_x]
+
+    mov rdx, [rel mouse_y]
+
+    call gui_process_mouse_click
+
+
+.no_click:
+
+    ; Odśwież ekran po obsłudze myszy.
+
+    call gui_refresh_screen
+
+    jmp .event_loop
+
+
+; ==============================================================================
+; Brak zdarzenia
+; ==============================================================================
+
+.idle:
+
+    hlt
+
+    jmp .event_loop
