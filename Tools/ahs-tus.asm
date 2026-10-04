@@ -23,34 +23,6 @@
 ;   update_get_generation
 ;   update_reset_status
 ;
-; ------------------------------------------------------------------------------
-; STATUS:
-;
-;   0 = IDLE
-;   1 = LOADING
-;   2 = INIT
-;   3 = SUCCESS
-;   4 = FAILED
-;
-; ------------------------------------------------------------------------------
-; ERROR:
-;
-;   0 = NONE
-;   1 = INVALID_ID
-;   2 = INVALID_ADDRESS
-;   3 = INIT_FAILED
-;   4 = TIMEOUT
-;   5 = MALWARE
-;   6 = VECTOR_ERROR
-;   7 = BAD_STATE
-;
-; ------------------------------------------------------------------------------
-; Calling convention:
-;
-;   RCX = Vector ID
-;   RDX = argument 2
-;   R8  = argument 3
-;
 ; ==============================================================================
 
 bits 64
@@ -58,7 +30,7 @@ bits 64
 %define MAX_VECTORS 32
 
 ; ==============================================================================
-; AHS-TUS STATUS CONSTANTS
+; STATUS
 ; ==============================================================================
 
 %define UPDATE_STATUS_IDLE       0
@@ -68,7 +40,7 @@ bits 64
 %define UPDATE_STATUS_FAILED     4
 
 ; ==============================================================================
-; AHS-TUS ERROR CONSTANTS
+; ERRORS
 ; ==============================================================================
 
 %define UPDATE_ERROR_NONE            0
@@ -86,6 +58,8 @@ bits 64
 
 extern pmm_alloc_page
 extern tgfs_load_and_map_file
+extern tgfs_last_file_size
+extern malicious_check_static
 
 ; ==============================================================================
 ; PUBLIC FUNCTIONS
@@ -119,15 +93,7 @@ global update_error_table
 global update_generation_table
 
 ; ==============================================================================
-; SYSTEM VECTOR TABLE
-;
-; Każdy Vector ID posiada jeden 64-bitowy adres.
-;
-; Vector 0  -> system_vector_table + 0
-; Vector 1  -> system_vector_table + 8
-; ...
-; Vector 31 -> system_vector_table + 248
-;
+; DATA
 ; ==============================================================================
 
 section .data
@@ -137,38 +103,15 @@ align 8
 system_vector_table:
     times MAX_VECTORS dq 0
 
-; ==============================================================================
-; STATUS TABLE
-;
-; DWORD na każdy Vector ID.
-;
-; ==============================================================================
-
 align 4
 
 update_status_table:
     times MAX_VECTORS dd UPDATE_STATUS_IDLE
 
-; ==============================================================================
-; ERROR TABLE
-;
-; DWORD na każdy Vector ID.
-;
-; ==============================================================================
-
 align 4
 
 update_error_table:
     times MAX_VECTORS dd UPDATE_ERROR_NONE
-
-; ==============================================================================
-; GENERATION TABLE
-;
-; Każda aktualizacja danego Vector ID zwiększa generację.
-;
-; Dzięki temu stary moduł nie może zgłosić SUCCESS dla nowej aktualizacji.
-;
-; ==============================================================================
 
 align 8
 
@@ -183,14 +126,6 @@ section .text
 
 ; ==============================================================================
 ; update_system_init
-;
-; Zeruje:
-;
-;   system_vector_table
-;   update_status_table
-;   update_error_table
-;   update_generation_table
-;
 ; ==============================================================================
 
 update_system_init:
@@ -254,36 +189,19 @@ update_system_init:
 ; update_register_vector
 ;
 ; RCX = Vector ID
-; RDX = nowy adres funkcji
+; RDX = nowy adres
 ;
 ; RAX = 0  sukces
 ; RAX = -1 błąd
-;
-; Atomowa wymiana adresu.
-;
 ; ==============================================================================
 
 update_register_vector:
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdzenie Vector ID
-    ; --------------------------------------------------------------------------
-
     cmp rcx, MAX_VECTORS
     jae .invalid_id
 
-    ; --------------------------------------------------------------------------
-    ; Adres 0 nie jest poprawnym adresem sterownika.
-    ; --------------------------------------------------------------------------
-
     test rdx, rdx
     jz .invalid_address
-
-    ; --------------------------------------------------------------------------
-    ; Atomowa podmiana adresu.
-    ;
-    ; XCHG z pamięcią posiada implicit LOCK na x86.
-    ; --------------------------------------------------------------------------
 
     lea rdi, [rel system_vector_table + rcx * 8]
 
@@ -313,9 +231,7 @@ update_register_vector:
 ;
 ; RCX = Vector ID
 ;
-; RAX = aktualny adres
-; RAX = 0 jeżeli ID nieprawidłowe
-;
+; RAX = adres
 ; ==============================================================================
 
 update_get_vector_address:
@@ -338,8 +254,6 @@ update_get_vector_address:
 ; update_call_vector
 ;
 ; RAX = Vector ID
-;
-; Pozostałe rejestry są przekazywane do sterownika.
 ;
 ; ==============================================================================
 
@@ -365,39 +279,20 @@ update_call_vector:
 ; ==============================================================================
 ; update_begin
 ;
-; Rozpoczyna nową aktualizację Vector ID.
-;
 ; RCX = Vector ID
 ;
-; RAX = nowa generacja
+; RAX = generation
 ; RAX = -1 błąd
-;
-; Nowy stan:
-;
-;       IDLE    -> LOADING
-;       SUCCESS -> LOADING
-;       FAILED  -> LOADING
-;
-; LOADING/INIT -> błąd BAD_STATE
-;
 ; ==============================================================================
 
 update_begin:
 
     push rbx
 
-    ; --------------------------------------------------------------------------
-    ; Validate ID
-    ; --------------------------------------------------------------------------
-
     cmp rcx, MAX_VECTORS
     jae .invalid_id
 
     mov rbx, rcx
-
-    ; --------------------------------------------------------------------------
-    ; Sprawdź obecny status
-    ; --------------------------------------------------------------------------
 
     mov eax, [rel update_status_table + rbx * 4]
 
@@ -407,26 +302,12 @@ update_begin:
     cmp eax, UPDATE_STATUS_INIT
     je .bad_state
 
-    ; --------------------------------------------------------------------------
-    ; Zwiększ generację.
-    ;
-    ; LOCK zapewnia bezpieczne zwiększenie wartości również przy SMP.
-    ; --------------------------------------------------------------------------
-
     lock inc qword [rel update_generation_table + rbx * 8]
 
     mov rax, [rel update_generation_table + rbx * 8]
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść poprzedni błąd.
-    ; --------------------------------------------------------------------------
-
     mov dword [rel update_error_table + rbx * 4], \
                 UPDATE_ERROR_NONE
-
-    ; --------------------------------------------------------------------------
-    ; LOADING
-    ; --------------------------------------------------------------------------
 
     mov dword [rel update_status_table + rbx * 4], \
                 UPDATE_STATUS_LOADING
@@ -456,13 +337,7 @@ update_begin:
 ; update_mark_init
 ;
 ; RCX = Vector ID
-; RDX = oczekiwana generacja
-;
-; LOADING -> INIT
-;
-; RAX = 0 sukces
-; RAX = -1 błąd
-;
+; RDX = generation
 ; ==============================================================================
 
 update_mark_init:
@@ -474,25 +349,13 @@ update_mark_init:
 
     mov rbx, rcx
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź generację.
-    ; --------------------------------------------------------------------------
-
     cmp rdx, [rel update_generation_table + rbx * 8]
     jne .invalid
-
-    ; --------------------------------------------------------------------------
-    ; Musimy być w stanie LOADING.
-    ; --------------------------------------------------------------------------
 
     cmp dword [rel update_status_table + rbx * 4], \
          UPDATE_STATUS_LOADING
 
     jne .invalid
-
-    ; --------------------------------------------------------------------------
-    ; INIT
-    ; --------------------------------------------------------------------------
 
     mov dword [rel update_status_table + rbx * 4], \
                 UPDATE_STATUS_INIT
@@ -516,13 +379,7 @@ update_mark_init:
 ; update_mark_success
 ;
 ; RCX = Vector ID
-; RDX = oczekiwana generacja
-;
-; INIT -> SUCCESS
-;
-; RAX = 0 sukces
-; RAX = -1 błąd
-;
+; RDX = generation
 ; ==============================================================================
 
 update_mark_success:
@@ -534,32 +391,16 @@ update_mark_success:
 
     mov rbx, rcx
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź generację.
-    ; --------------------------------------------------------------------------
-
     cmp rdx, [rel update_generation_table + rbx * 8]
     jne .invalid
-
-    ; --------------------------------------------------------------------------
-    ; SUCCESS może zostać zgłoszony tylko z INIT.
-    ; --------------------------------------------------------------------------
 
     cmp dword [rel update_status_table + rbx * 4], \
          UPDATE_STATUS_INIT
 
     jne .invalid
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść poprzedni błąd.
-    ; --------------------------------------------------------------------------
-
     mov dword [rel update_error_table + rbx * 4], \
                 UPDATE_ERROR_NONE
-
-    ; --------------------------------------------------------------------------
-    ; SUCCESS
-    ; --------------------------------------------------------------------------
 
     mov dword [rel update_status_table + rbx * 4], \
                 UPDATE_STATUS_SUCCESS
@@ -583,15 +424,8 @@ update_mark_success:
 ; update_mark_failed
 ;
 ; RCX = Vector ID
-; RDX = oczekiwana generacja
-; R8D = kod błędu
-;
-; LOADING -> FAILED
-; INIT    -> FAILED
-;
-; RAX = 0 sukces
-; RAX = -1 błąd
-;
+; RDX = generation
+; R8D = error
 ; ==============================================================================
 
 update_mark_failed:
@@ -603,16 +437,8 @@ update_mark_failed:
 
     mov rbx, rcx
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź generację.
-    ; --------------------------------------------------------------------------
-
     cmp rdx, [rel update_generation_table + rbx * 8]
     jne .invalid
-
-    ; --------------------------------------------------------------------------
-    ; FAILED można ustawić tylko podczas aktywnej aktualizacji.
-    ; --------------------------------------------------------------------------
 
     mov eax, [rel update_status_table + rbx * 4]
 
@@ -626,15 +452,7 @@ update_mark_failed:
 
 .set_failed:
 
-    ; --------------------------------------------------------------------------
-    ; Zapisz kod błędu.
-    ; --------------------------------------------------------------------------
-
     mov [rel update_error_table + rbx * 4], r8d
-
-    ; --------------------------------------------------------------------------
-    ; FAILED
-    ; --------------------------------------------------------------------------
 
     mov dword [rel update_status_table + rbx * 4], \
                 UPDATE_STATUS_FAILED
@@ -656,12 +474,6 @@ update_mark_failed:
 
 ; ==============================================================================
 ; update_get_status
-;
-; RCX = Vector ID
-;
-; RAX = status
-; RAX = -1 jeżeli ID nieprawidłowe
-;
 ; ==============================================================================
 
 update_get_status:
@@ -682,12 +494,6 @@ update_get_status:
 
 ; ==============================================================================
 ; update_get_error
-;
-; RCX = Vector ID
-;
-; RAX = kod błędu
-; RAX = -1 jeżeli ID nieprawidłowe
-;
 ; ==============================================================================
 
 update_get_error:
@@ -708,12 +514,6 @@ update_get_error:
 
 ; ==============================================================================
 ; update_get_generation
-;
-; RCX = Vector ID
-;
-; RAX = aktualna generacja
-; RAX = -1 jeżeli ID nieprawidłowe
-;
 ; ==============================================================================
 
 update_get_generation:
@@ -734,19 +534,6 @@ update_get_generation:
 
 ; ==============================================================================
 ; update_reset_status
-;
-; RCX = Vector ID
-;
-; Ustawia:
-;
-;   status = IDLE
-;   error  = NONE
-;
-; Generacja NIE jest zerowana.
-;
-; RAX = 0 sukces
-; RAX = -1 błąd
-;
 ; ==============================================================================
 
 update_reset_status:
@@ -781,14 +568,10 @@ update_reset_status:
 ; RAX = 0  sukces
 ; RAX = -1 błąd
 ;
-; Przebieg:
+; Ważne:
 ;
-;   1. LOADING
-;   2. załaduj moduł
-;   3. atomowo podmień Vector
-;   4. INIT
-;
-; Następnie moduł musi zgłosić SUCCESS albo FAILED.
+;   Moduł NIE jest aktywowany zanim malicious_check_static()
+;   nie zakończy się sukcesem.
 ;
 ; ==============================================================================
 
@@ -805,24 +588,16 @@ update_hot_swap_driver:
     push r13
 
     ; --------------------------------------------------------------------------
-    ; Zachowaj Vector ID.
+    ; Zachowaj Vector ID
     ; --------------------------------------------------------------------------
 
     mov r12, r8
-
-    ; --------------------------------------------------------------------------
-    ; Sprawdź Vector ID.
-    ; --------------------------------------------------------------------------
 
     cmp r12, MAX_VECTORS
     jae .err_out
 
     ; --------------------------------------------------------------------------
-    ; Rozpocznij aktualizację.
-    ;
-    ; RCX = Vector ID
-    ;
-    ; RAX = generation
+    ; Rozpocznij aktualizację
     ; --------------------------------------------------------------------------
 
     mov rcx, r12
@@ -835,7 +610,7 @@ update_hot_swap_driver:
     mov r13, rax
 
     ; --------------------------------------------------------------------------
-    ; Alokuj stronę na nowy moduł.
+    ; Alokacja pamięci
     ; --------------------------------------------------------------------------
 
     push rcx
@@ -852,7 +627,7 @@ update_hot_swap_driver:
     jz .alloc_failed
 
     ; --------------------------------------------------------------------------
-    ; Załaduj moduł z TGFS.
+    ; Załaduj moduł z TGFS
     ;
     ; RCX = SATA port
     ; RDX = File ID
@@ -870,13 +645,109 @@ update_hot_swap_driver:
     jz .load_failed
 
     ; --------------------------------------------------------------------------
-    ; RAX = entry point nowego modułu.
+    ; Zachowaj entry point
     ; --------------------------------------------------------------------------
 
     mov r9, rax
 
     ; --------------------------------------------------------------------------
-    ; Atomowa podmiana Vector.
+    ; Pobierz rzeczywisty rozmiar modułu
+    ; --------------------------------------------------------------------------
+
+    mov rsi, [rel tgfs_last_file_size]
+
+    test rsi, rsi
+    jz .malware_failed
+
+    ; --------------------------------------------------------------------------
+    ; Oblicz checksum XOR modułu.
+    ;
+    ; malicious_check_static wymaga:
+    ;
+    ; RDI = adres
+    ; RSI = rozmiar
+    ; RDX = checksum
+    ;
+    ; --------------------------------------------------------------------------
+
+    xor rdx, rdx
+
+    mov rcx, rsi
+    mov rdi, rbx
+
+.checksum_qwords:
+
+    cmp rcx, 8
+    jb .checksum_tail
+
+    xor rdx, [rdi]
+
+    add rdi, 8
+    sub rcx, 8
+
+    jmp .checksum_qwords
+
+
+; ------------------------------------------------------------------------------
+; Pozostałe bajty
+; ------------------------------------------------------------------------------
+
+.checksum_tail:
+
+    test rcx, rcx
+    jz .checksum_done
+
+    xor rax, rax
+
+    mov r10, rcx
+
+.checksum_tail_loop:
+
+    movzx r11, byte [rdi]
+
+    mov rcx, r10
+
+    dec rcx
+
+    shl rcx, 3
+
+    shl r11, cl
+
+    xor rax, r11
+
+    add rdi, 1
+
+    dec r10
+
+    jnz .checksum_tail_loop
+
+    xor rdx, rax
+
+
+; ------------------------------------------------------------------------------
+; Koniec checksum
+; ------------------------------------------------------------------------------
+
+.checksum_done:
+
+    ; --------------------------------------------------------------------------
+    ; Static security check
+    ;
+    ; NIE podmieniamy jeszcze Vector.
+    ; --------------------------------------------------------------------------
+
+    mov rdi, rbx
+    mov rsi, [rel tgfs_last_file_size]
+
+    call malicious_check_static
+
+    test rax, rax
+    jnz .malware_failed
+
+    ; --------------------------------------------------------------------------
+    ; Dopiero po pozytywnym skanie:
+    ;
+    ; atomowa podmiana Vector.
     ; --------------------------------------------------------------------------
 
     lea rdi, [rel system_vector_table + r12 * 8]
@@ -886,12 +757,7 @@ update_hot_swap_driver:
     xchg [rdi], rax
 
     ; --------------------------------------------------------------------------
-    ; Moduł został podłączony.
-    ;
     ; LOADING -> INIT
-    ;
-    ; Nie ustawiamy jeszcze SUCCESS.
-    ; SUCCESS musi zostać zgłoszony po poprawnej inicjalizacji modułu.
     ; --------------------------------------------------------------------------
 
     mov rcx, r12
@@ -903,16 +769,7 @@ update_hot_swap_driver:
     je .init_failed
 
     ; --------------------------------------------------------------------------
-    ; Sama podmiana Vector zakończyła się poprawnie.
-    ;
-    ; Moduł musi teraz zgłosić:
-    ;
-    ;   update_mark_success
-    ;
-    ; albo:
-    ;
-    ;   update_mark_failed
-    ;
+    ; Moduł musi później zgłosić SUCCESS albo FAILED.
     ; --------------------------------------------------------------------------
 
     xor eax, eax
@@ -946,6 +803,23 @@ update_hot_swap_driver:
     mov rcx, r12
     mov rdx, r13
     mov r8d, UPDATE_ERROR_VECTOR
+
+    call update_mark_failed
+
+    mov rax, -1
+
+    jmp .exit
+
+
+; ==============================================================================
+; BŁĄD KONTROLI BEZPIECZEŃSTWA
+; ==============================================================================
+
+.malware_failed:
+
+    mov rcx, r12
+    mov rdx, r13
+    mov r8d, UPDATE_ERROR_MALWARE
 
     call update_mark_failed
 
