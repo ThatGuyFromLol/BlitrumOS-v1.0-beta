@@ -17,12 +17,19 @@
 ;   CS
 ;   RFLAGS
 ;
-; Przełączanie:
+; Wejście schedulera:
 ;
-;   PIT IRQ0
-;   INT 0x80
+;   PIT IRQ0 -> vector 0x20
+;   INT 0x80 -> scheduler
 ;
-; Scheduler kończy przełączenie przez IRETQ.
+; scheduler_dispatch kończy ścieżkę przez IRETQ.
+;
+; Ważne:
+;   - zakończony task nie jest ponownie zapisywany jako READY
+;   - jego slot RSP jest czyszczony
+;   - slot może zostać ponownie wykorzystany
+;   - scheduler nigdy nie ładuje RSP = 0
+;   - task 0 pozostaje zawsze bazowym taskiem kernela
 ; ==============================================================================
 
 bits 64
@@ -75,7 +82,7 @@ align 8
 ;
 ; task_rsp_table[task_id] = zapisany RSP
 ;
-; 0 = brak utworzonego taska
+; 0 = brak aktywnego kontekstu taska.
 ; ==============================================================================
 
 task_rsp_table:
@@ -84,7 +91,7 @@ task_rsp_table:
 
 
 ; ==============================================================================
-; MASKA GOTOWYCH TASKÓW
+; MASKA READY
 ;
 ; bit 0 = kernel
 ; bit 1..63 = taski
@@ -101,7 +108,7 @@ system_ready_mask:
 
 current_task_id:
 
-    dd 0
+    dd KERNEL_TASK_ID
 
 
 ; ==============================================================================
@@ -119,8 +126,8 @@ section .text
 ; Task 0 = kernel.
 ;
 ; UWAGA:
-; scheduler_init NIE włącza tutaj przerwań.
-; Kernel zrobi STI dopiero po zakończeniu całej inicjalizacji.
+; scheduler_init pozostawia IF=0.
+; Kernel może wykonać STI po zakończeniu całej inicjalizacji.
 ; ==============================================================================
 
 scheduler_init:
@@ -164,7 +171,7 @@ scheduler_init:
 ; WYJŚCIE:
 ;
 ;   RAX = ID taska
-;   RAX = -1 -> brak wolnego slotu
+;   RAX = -1 -> błąd / brak slotu
 ;
 ; ==============================================================================
 
@@ -175,6 +182,17 @@ scheduler_create_task:
     push rdx
     push rdi
     push rsi
+
+
+    ; ==========================================================================
+    ; WALIDACJA PARAMETRÓW
+    ; ==========================================================================
+
+    test rcx, rcx
+    jz .invalid_task
+
+    test rdx, rdx
+    jz .invalid_task
 
 
     ; ==========================================================================
@@ -215,6 +233,17 @@ scheduler_create_task:
 
 
 ; ==============================================================================
+; NIEPOPRAWNE PARAMETRY
+; ==============================================================================
+
+.invalid_task:
+
+    mov rax, -1
+
+    jmp .create_done
+
+
+; ==============================================================================
 ; ZNALEZIONO SLOT
 ; ==============================================================================
 
@@ -224,88 +253,49 @@ scheduler_create_task:
 
 
     ; ==========================================================================
-    ; Wyrównaj początek stosu.
+    ; WYRÓWNANIE STOSU
     ;
-    ; Po wejściu do funkcji taska RSP będzie miał:
+    ; Po wejściu do funkcji taska:
     ;
-    ;     RSP % 16 = 8
+    ;   RSP % 16 = 8
     ;
-    ; czyli poprawne wyrównanie dla normalnego CALL.
+    ; czyli stan zgodny z normalnym CALL ABI.
     ; ==========================================================================
 
     and rdx, -16
 
 
     ; ==========================================================================
-    ; ADRES POWROTU TASKA
+    ; Minimalny bezpieczny obszar na ramkę taska.
     ;
-    ; Jeżeli funkcja taska wykona RET, trafi do scheduler_task_exit.
-    ; ==========================================================================
-
-    sub rdx, 8
-
-    lea rdi, [rel scheduler_task_exit]
-
-    mov [rdx], rdi
-
-
-    ; ==========================================================================
-    ; RFLAGS
-    ; ==========================================================================
-
-    sub rdx, 8
-
-    mov qword [rdx], INITIAL_RFLAGS
-
-
-    ; ==========================================================================
-    ; CS
-    ; ==========================================================================
-
-    sub rdx, 8
-
-    mov qword [rdx], KERNEL_CODE_SELECTOR
-
-
-    ; ==========================================================================
-    ; RIP
-    ; ==========================================================================
-
-    sub rdx, 8
-
-    mov [rdx], rcx
-
-
-    ; ==========================================================================
-    ; REZERWUJ 15 GPR
+    ; Potrzebujemy:
     ;
-    ; scheduler_dispatch przywraca:
+    ;   return address = 8
+    ;   RFLAGS         = 8
+    ;   CS             = 8
+    ;   RIP            = 8
+    ;   GPR            = 120
     ;
-    ; R15
-    ; R14
-    ; R13
-    ; R12
-    ; R11
-    ; R10
-    ; R9
-    ; R8
-    ; RBP
-    ; RDI
-    ; RSI
-    ; RDX
-    ; RCX
-    ; RBX
-    ; RAX
+    ; Razem > 152 bajty.
     ;
-    ; Dlatego tutaj wystarczy wyzerować 15 QWORD.
+    ; Zostawiamy dodatkowy margines.
     ; ==========================================================================
 
-    sub rdx, 120
+    sub rdx, 256
+
+    test rdx, rdx
+    jz .invalid_stack
 
 
     ; ==========================================================================
-    ; WYZERUJ GPR
+    ; RSP będzie ustawiony na początek naszego obszaru kontekstu.
     ; ==========================================================================
+
+    ; --------------------------------------------------------------------------
+    ; RSP + 0 ... 119
+    ;
+    ; 15 x QWORD dla GPR.
+    ; --------------------------------------------------------------------------
 
     mov rdi, rdx
 
@@ -317,6 +307,48 @@ scheduler_create_task:
 
 
     ; ==========================================================================
+    ; Po 15 QWORD RSP wskazuje na:
+    ;
+    ;   RIP
+    ;   CS
+    ;   RFLAGS
+    ;   RETURN ADDRESS
+    ;
+    ; ==========================================================================
+
+    ; --------------------------------------------------------------------------
+    ; RIP
+    ; --------------------------------------------------------------------------
+
+    mov [rdx + 120], rcx
+
+
+    ; --------------------------------------------------------------------------
+    ; CS
+    ; --------------------------------------------------------------------------
+
+    mov qword [rdx + 128], KERNEL_CODE_SELECTOR
+
+
+    ; --------------------------------------------------------------------------
+    ; RFLAGS
+    ; --------------------------------------------------------------------------
+
+    mov qword [rdx + 136], INITIAL_RFLAGS
+
+
+    ; --------------------------------------------------------------------------
+    ; RETURN ADDRESS
+    ;
+    ; Jeżeli funkcja taska wykona RET, trafi do scheduler_task_exit.
+    ; --------------------------------------------------------------------------
+
+    lea rsi, [rel scheduler_task_exit]
+
+    mov [rdx + 144], rsi
+
+
+    ; ==========================================================================
     ; ZAPISZ RSP TASKA
     ; ==========================================================================
 
@@ -324,17 +356,30 @@ scheduler_create_task:
 
 
     ; ==========================================================================
-    ; OZNACZ TASK JAKO GOTOWY
+    ; OZNACZ TASK JAKO READY
     ; ==========================================================================
 
     lock bts [rel system_ready_mask], rbx
 
 
     ; ==========================================================================
-    ; ZWRÓĆ ID TASKA
+    ; ZWRÓĆ ID
     ; ==========================================================================
 
     mov rax, rbx
+
+    jmp .create_done
+
+
+; ==============================================================================
+; NIEPOPRAWNY STACK
+; ==============================================================================
+
+.invalid_stack:
+
+    mov rax, -1
+
+    jmp .create_done
 
 
 ; ==============================================================================
@@ -361,7 +406,7 @@ scheduler_create_task:
 ;
 ; Działanie:
 ;
-;   Ustawia task jako READY.
+;   ustawia task jako READY.
 ;
 ; ==============================================================================
 
@@ -370,6 +415,15 @@ scheduler_trigger_event:
     cmp rcx, MAX_TASKS
 
     jae .event_done
+
+
+    ; --------------------------------------------------------------------------
+    ; Task musi posiadać zapisany kontekst.
+    ; --------------------------------------------------------------------------
+
+    cmp qword [rel task_rsp_table + rcx * 8], 0
+
+    je .event_done
 
 
     lock bts [rel system_ready_mask], rcx
@@ -384,7 +438,6 @@ scheduler_trigger_event:
 ; scheduler_yield
 ;
 ; Dobrowolne oddanie CPU.
-;
 ; ==============================================================================
 
 scheduler_yield:
@@ -401,7 +454,7 @@ scheduler_yield:
 ;
 ; Wejście:
 ;
-;   CPU posiada już ramkę:
+;   CPU posiada ramkę:
 ;
 ;       RIP
 ;       CS
@@ -409,12 +462,14 @@ scheduler_yield:
 ;
 ; Funkcja:
 ;
-;   1. zapisuje wszystkie GPR,
-;   2. zapisuje RSP aktualnego taska,
-;   3. wybiera następny READY task,
-;   4. ładuje jego RSP,
-;   5. odtwarza GPR,
-;   6. wykonuje IRETQ.
+;   1. zapisuje GPR,
+;   2. sprawdza, czy aktualny task nadal jest READY,
+;   3. zapisuje jego RSP tylko jeżeli nadal żyje,
+;   4. usuwa RSP zakończonego taska,
+;   5. wybiera następny READY task,
+;   6. ładuje jego RSP,
+;   7. odtwarza GPR,
+;   8. wykonuje IRETQ.
 ;
 ; ==============================================================================
 
@@ -423,8 +478,6 @@ scheduler_dispatch:
 
     ; ==========================================================================
     ; ZAPISZ PEŁNY KONTEKST
-    ;
-    ; Kolejność musi odpowiadać kolejności POP poniżej.
     ; ==========================================================================
 
     push rax
@@ -446,27 +499,66 @@ scheduler_dispatch:
 
 
     ; ==========================================================================
-    ; ZAPISZ RSP AKTUALNEGO TASKA
+    ; POBIERZ AKTUALNY TASK
     ; ==========================================================================
 
     mov eax, [rel current_task_id]
 
+
+    ; ==========================================================================
+    ; SPRAWDŹ, CZY AKTUALNY TASK NADAL JEST READY
+    ;
+    ; Jeżeli nie:
+    ;
+    ;   - task zakończył pracę,
+    ;   - jego RSP nie może zostać zapisany ponownie,
+    ;   - slot zostaje zwolniony.
+    ; ==========================================================================
+
+    bt [rel system_ready_mask], rax
+
+    jc .current_task_alive
+
+
+    ; --------------------------------------------------------------------------
+    ; Aktualny task NIE jest READY.
+    ;
+    ; Nie zapisujemy jego kontekstu.
+    ; --------------------------------------------------------------------------
+
+    mov qword [rel task_rsp_table + rax * 8], 0
+
+    jmp .select_next_task
+
+
+; ==============================================================================
+; AKTUALNY TASK ŻYJE
+; ==============================================================================
+
+.current_task_alive:
+
     mov [rel task_rsp_table + rax * 8], rsp
 
 
+; ==============================================================================
+; WYBIERANIE NASTĘPNEGO TASKA
+; ==============================================================================
+
+.select_next_task:
+
     ; ==========================================================================
-    ; POBIERZ MASKĘ READY
+    ; Pobierz aktualną maskę.
     ; ==========================================================================
 
     mov rdx, [rel system_ready_mask]
 
     test rdx, rdx
 
-    jz .no_switch
+    jz .no_ready_task
 
 
     ; ==========================================================================
-    ; START SZUKANIA OD NASTĘPNEGO TASKA
+    ; START OD NASTĘPNEGO TASKA
     ; ==========================================================================
 
     mov eax, [rel current_task_id]
@@ -486,6 +578,10 @@ scheduler_dispatch:
 
 .find_next:
 
+    ; --------------------------------------------------------------------------
+    ; Czy bit taska jest ustawiony?
+    ; --------------------------------------------------------------------------
+
     bt rdx, rcx
 
     jc .found_task
@@ -495,7 +591,6 @@ scheduler_dispatch:
 
     and ecx, MAX_TASKS - 1
 
-
     inc r8d
 
     cmp r8d, MAX_TASKS
@@ -504,12 +599,10 @@ scheduler_dispatch:
 
 
     ; --------------------------------------------------------------------------
-    ; Nie znaleziono niczego.
-    ;
-    ; Task 0 powinien być zawsze READY.
+    ; Nie znaleziono taska.
     ; --------------------------------------------------------------------------
 
-    jmp .no_switch
+    jmp .no_ready_task
 
 
 ; ==============================================================================
@@ -518,14 +611,30 @@ scheduler_dispatch:
 
 .found_task:
 
+    ; --------------------------------------------------------------------------
+    ; Bezpieczeństwo:
+    ; READY task musi mieć zapisany RSP.
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rel task_rsp_table + rcx * 8]
+
+    test rax, rax
+
+    jz .invalid_ready_task
+
+
+    ; --------------------------------------------------------------------------
+    ; Ustaw aktualny task.
+    ; --------------------------------------------------------------------------
+
     mov [rel current_task_id], ecx
 
 
-    ; ==========================================================================
-    ; ZAŁADUJ RSP NOWEGO TASKA
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Załaduj jego RSP.
+    ; --------------------------------------------------------------------------
 
-    mov rsp, [rel task_rsp_table + rcx * 8]
+    mov rsp, rax
 
 
     ; ==========================================================================
@@ -558,10 +667,89 @@ scheduler_dispatch:
 
 
 ; ==============================================================================
-; BRAK PRZEŁĄCZENIA
+; NIEPOPRAWNY READY TASK
+;
+; Bit READY istnieje, ale RSP == 0.
+;
+; Usuwamy uszkodzony wpis i szukamy ponownie.
 ; ==============================================================================
 
-.no_switch:
+.invalid_ready_task:
+
+    lock btr [rel system_ready_mask], rcx
+
+    mov qword [rel task_rsp_table + rcx * 8], 0
+
+    ; --------------------------------------------------------------------------
+    ; Spróbuj znaleźć następny task.
+    ; --------------------------------------------------------------------------
+
+    mov rdx, [rel system_ready_mask]
+
+    test rdx, rdx
+
+    jz .no_ready_task
+
+    mov eax, ecx
+
+    inc eax
+
+    and eax, MAX_TASKS - 1
+
+    mov ecx, eax
+
+    xor r8d, r8d
+
+    jmp .find_next
+
+
+; ==============================================================================
+; BRAK READY TASKA
+;
+; Jeżeli aktualny task nadal żyje, wracamy do niego.
+;
+; Jeżeli aktualny task zakończył się i nie ma żadnego READY taska,
+; system nie ma bezpiecznego kontekstu do wykonania.
+; ==============================================================================
+
+.no_ready_task:
+
+    mov eax, [rel current_task_id]
+
+    bt [rel system_ready_mask], rax
+
+    jc .return_current
+
+
+    ; --------------------------------------------------------------------------
+    ; Brak jakiegokolwiek poprawnego taska.
+    ;
+    ; Nie wolno wykonywać IRETQ z losowym RSP.
+    ; --------------------------------------------------------------------------
+
+    jmp scheduler_fatal
+
+
+; ==============================================================================
+; POWRÓT DO AKTUALNEGO TASKA
+; ==============================================================================
+
+.return_current:
+
+    ; --------------------------------------------------------------------------
+    ; Przywróć kontekst zapisany na aktualnym RSP.
+    ;
+    ; Aktualny task był żywy, więc scheduler wcześniej zapisał jego RSP.
+    ; --------------------------------------------------------------------------
+
+    mov eax, [rel current_task_id]
+
+    mov rsp, [rel task_rsp_table + rax * 8]
+
+    test rsp, rsp
+
+    jz scheduler_fatal
+
 
     pop r15
     pop r14
@@ -580,11 +768,6 @@ scheduler_dispatch:
     pop rbx
     pop rax
 
-
-    ; ==========================================================================
-    ; WRÓĆ DO AKTUALNEGO KODU
-    ; ==========================================================================
-
     iretq
 
 
@@ -593,10 +776,10 @@ scheduler_dispatch:
 ;
 ; Wywoływany przez RET zakończonego taska.
 ;
-; Task zostaje usunięty z maski READY.
+; Task zostaje usunięty z READY.
 ;
-; Następnie INT 0x80 uruchamia scheduler.
-;
+; scheduler_dispatch zobaczy, że current task nie jest już READY
+; i NIE zapisze ponownie jego kontekstu.
 ; ==============================================================================
 
 scheduler_task_exit:
@@ -605,21 +788,34 @@ scheduler_task_exit:
 
 
     ; ==========================================================================
-    ; POBIERZ ID AKTUALNEGO TASKA
+    ; ID AKTUALNEGO TASKA
     ; ==========================================================================
 
     mov eax, [rel current_task_id]
 
 
     ; ==========================================================================
-    ; USUŃ TASK Z READY
+    ; TASK 0 NIE MOŻE ZOSTAĆ USUNIĘTY
+    ;
+    ; Kernel jest specjalnym taskiem bazowym.
+    ; ==========================================================================
+
+    test eax, eax
+
+    jz .kernel_exit_protection
+
+
+    ; ==========================================================================
+    ; USUŃ Z READY
     ; ==========================================================================
 
     lock btr [rel system_ready_mask], rax
 
 
     ; ==========================================================================
-    ; ZWOLNIJ SLOT
+    ; NIE POZOSTAWIAJ STAREGO RSP
+    ;
+    ; scheduler_dispatch nie będzie go już zapisywał.
     ; ==========================================================================
 
     mov qword [rel task_rsp_table + rax * 8], 0
@@ -627,41 +823,34 @@ scheduler_task_exit:
 
     ; ==========================================================================
     ; URUCHOM SCHEDULER
-    ;
-    ; CPU jest nadal w ring 0.
-    ; INT 0x80 tworzy prawidłową ramkę IRETQ.
     ; ==========================================================================
 
     int 0x80
 
 
+    ; ==========================================================================
+    ; Jeżeli scheduler z jakiegoś powodu wróci tutaj,
+    ; task jest już zakończony.
+    ; ==========================================================================
+
+    jmp scheduler_fatal
+
+
 ; ==============================================================================
-; NIE POWINNO SIĘ WYKONAĆ
+; OCHRONA TASK 0
 ; ==============================================================================
 
-.task_exit_halt:
+.kernel_exit_protection:
 
-    cli
+    sti
 
-
-.halt_loop:
-
-    hlt
-
-    jmp .halt_loop
+    ret
 
 
 ; ==============================================================================
 ; scheduler_event_loop
 ;
-; Pętla obsługi zadań systemowych.
-;
-; Obecnie:
-;
-;   - obsługa shell_run,
-;   - HLT do następnego przerwania.
-;
-; PIT / USB / inne IRQ mogą obudzić CPU.
+; Pętla obsługi zdarzeń.
 ;
 ; ==============================================================================
 
@@ -689,3 +878,21 @@ scheduler_event_loop:
     hlt
 
     ret
+
+
+; ==============================================================================
+; SCHEDULER FATAL
+;
+; Nie istnieje żaden bezpieczny READY context.
+; ==============================================================================
+
+scheduler_fatal:
+
+    cli
+
+
+.scheduler_fatal_loop:
+
+    hlt
+
+    jmp .scheduler_fatal_loop
