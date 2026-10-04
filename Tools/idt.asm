@@ -1,20 +1,6 @@
 ; ==============================================================================
-;              BLITRUM OS - INTERRUPT DESCRIPTOR TABLE
+;              BLITRUM OS - INTERRUPT DESCRIPTOR TABLE + PIC
 ;              x86-64 / NASM
-; ==============================================================================
-;
-; GDT:
-;
-;   0x10 = KERNEL DATA
-;   0x18 = KERNEL CODE
-;
-; IDT:
-;
-;   0x00 - 0x1F = CPU exceptions
-;   0x20         = PIT / IRQ0
-;   0x28         = xHCI / USB
-;   0x80         = scheduler software interrupt
-;
 ; ==============================================================================
 
 bits 64
@@ -52,7 +38,37 @@ SCHEDULER_VECTOR     equ 0x80
 
 
 ; ==============================================================================
+; PIC 8259
+; ==============================================================================
+
+PIC_MASTER_CMD        equ 0x20
+PIC_MASTER_DATA       equ 0x21
+
+PIC_SLAVE_CMD         equ 0xA0
+PIC_SLAVE_DATA        equ 0xA1
+
+PIC_ICW1_INIT         equ 0x11
+PIC_ICW4_8086         equ 0x01
+
+PIC_MASTER_VECTOR     equ 0x20
+PIC_SLAVE_VECTOR      equ 0x28
+
+
+; ==============================================================================
 ; idt_init
+;
+; Kolejność:
+;
+;   1. Remap PIC
+;   2. Zarejestruj wyjątki CPU
+;   3. Zarejestruj domyślne handlery IRQ
+;   4. PIT -> 0x20
+;   5. USB -> 0x28
+;   6. Scheduler -> 0x80
+;   7. Załaduj IDTR
+;
+; IRQ pozostają zamaskowane.
+; PIT odblokuje IRQ0 w pit_init.
 ; ==============================================================================
 
 idt_init:
@@ -64,9 +80,18 @@ idt_init:
     push rsi
     push rdx
 
+    cli
+
 
     ; ==========================================================================
-    ; 1. ZAREJESTRUJ WYJĄTKI CPU 0..31
+    ; 1. REMAP PIC
+    ; ==========================================================================
+
+    call pic_remap
+
+
+    ; ==========================================================================
+    ; 2. CPU EXCEPTIONS 0..31
     ; ==========================================================================
 
     xor ecx, ecx
@@ -88,7 +113,7 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 2. DEFAULT HANDLER 32..255
+    ; 3. DEFAULT HANDLERS 32..255
     ; ==========================================================================
 
     mov rcx, 32
@@ -108,9 +133,11 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 3. PIT / IRQ0
+    ; 4. PIT / IRQ0
     ;
-    ; 0x20
+    ; PIC MASTER IRQ0
+    ;      |
+    ;      +--> VECTOR 0x20
     ; ==========================================================================
 
     mov rcx, PIT_VECTOR
@@ -121,9 +148,13 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 4. USB / xHCI
+    ; 5. USB / xHCI
     ;
-    ; 0x28
+    ; PIC SLAVE IRQ0
+    ;      |
+    ;      +--> VECTOR 0x28
+    ;
+    ; Na obecnym etapie IRQ pozostaje zamaskowane.
     ; ==========================================================================
 
     mov rcx, USB_INTERRUPT_VECTOR
@@ -134,9 +165,7 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 5. SCHEDULER / INT 0x80
-    ;
-    ; 0x80
+    ; 6. SCHEDULER / INT 0x80
     ; ==========================================================================
 
     mov rcx, SCHEDULER_VECTOR
@@ -147,7 +176,7 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 6. ZAŁADUJ IDTR
+    ; 7. LOAD IDTR
     ; ==========================================================================
 
     lea rax, [rel idt_pointer]
@@ -166,13 +195,155 @@ idt_init:
 
 
 ; ==============================================================================
-; idt_set_gate
+; PIC REMAP
+;
+; Domyślne mapowanie BIOS:
+;
+;   Master IRQ0..7 -> 0x08..0x0F
+;   Slave  IRQ8..15 -> 0x70..0x77
+;
+; Blitrum OS:
+;
+;   Master IRQ0..7 -> 0x20..0x27
+;   Slave  IRQ8..15 -> 0x28..0x2F
+;
+; Po remapowaniu wszystkie IRQ są MASKOWANE.
+;
+; pit_init później odblokuje IRQ0.
+; ==============================================================================
+
+pic_remap:
+
+    push rax
+
+
+    ; ==========================================================================
+    ; ICW1 - rozpoczęcie inicjalizacji
+    ; ==========================================================================
+
+    mov al, PIC_ICW1_INIT
+
+    out PIC_MASTER_CMD, al
+
+    call pic_io_wait
+
+    mov al, PIC_ICW1_INIT
+
+    out PIC_SLAVE_CMD, al
+
+    call pic_io_wait
+
+
+    ; ==========================================================================
+    ; ICW2 - NUMERY WEKTORÓW
+    ; ==========================================================================
+
+    mov al, PIC_MASTER_VECTOR
+
+    out PIC_MASTER_DATA, al
+
+    call pic_io_wait
+
+    mov al, PIC_SLAVE_VECTOR
+
+    out PIC_SLAVE_DATA, al
+
+    call pic_io_wait
+
+
+    ; ==========================================================================
+    ; ICW3 - CASCADE
+    ;
+    ; Master:
+    ;   IRQ2 -> Slave PIC
+    ;
+    ; Slave:
+    ;   ID = 2
+    ; ==========================================================================
+
+    mov al, 0x04
+
+    out PIC_MASTER_DATA, al
+
+    call pic_io_wait
+
+    mov al, 0x02
+
+    out PIC_SLAVE_DATA, al
+
+    call pic_io_wait
+
+
+    ; ==========================================================================
+    ; ICW4 - 8086 MODE
+    ; ==========================================================================
+
+    mov al, PIC_ICW4_8086
+
+    out PIC_MASTER_DATA, al
+
+    call pic_io_wait
+
+    mov al, PIC_ICW4_8086
+
+    out PIC_SLAVE_DATA, al
+
+    call pic_io_wait
+
+
+    ; ==========================================================================
+    ; MASKUJ WSZYSTKIE IRQ
+    ;
+    ; PIT później odblokuje IRQ0.
+    ;
+    ; Slave również pozostaje całkowicie zamaskowany.
+    ; ==========================================================================
+
+    mov al, 0xFF
+
+    out PIC_MASTER_DATA, al
+
+    call pic_io_wait
+
+    mov al, 0xFF
+
+    out PIC_SLAVE_DATA, al
+
+    call pic_io_wait
+
+
+    pop rax
+
+    ret
+
+
+; ==============================================================================
+; PIC I/O WAIT
+;
+; Stary, bezpieczny sposób wymuszenia krótkiego opóźnienia między operacjami
+; PIC.
+; ==============================================================================
+
+pic_io_wait:
+
+    push rax
+
+    xor eax, eax
+
+    out 0x80, al
+
+    pop rax
+
+    ret
+
+
+; ==============================================================================
+; IDT SET GATE
 ;
 ; WEJŚCIE:
 ;
 ;   RCX = numer wektora
 ;   RDX = adres handlera
-;
 ; ==============================================================================
 
 idt_set_gate:
@@ -183,9 +354,9 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Oblicz adres wpisu IDT.
+    ; Adres wpisu:
     ;
-    ; Jeden wpis = 16 bajtów.
+    ; vector * 16
     ; ==========================================================================
 
     mov rax, rcx
@@ -260,17 +431,11 @@ idt_set_gate:
 ; SCHEDULER SOFTWARE INTERRUPT
 ;
 ; INT 0x80
-;
 ; ==============================================================================
 
 isr_int80_handler:
 
-    ; ==========================================================================
-    ; NIE używamy CALL.
-    ;
     ; scheduler_dispatch kończy się przez IRETQ.
-    ; ==========================================================================
-
     jmp scheduler_dispatch
 
 
@@ -282,15 +447,12 @@ isr_int80_handler:
 
 isr_stub_%1:
 
-    ; ==========================================================================
     ; CPU nie dostarczył error code.
-    ;
-    ; Tworzymy sztuczny error code.
-    ; ==========================================================================
 
     push qword 0
 
     ; Numer wyjątku.
+
     push qword %1
 
     jmp common_exception_handler
@@ -302,10 +464,8 @@ isr_stub_%1:
 
 isr_stub_%1:
 
-    ; ==========================================================================
-    ; CPU sam odłożył error code.
-    ; Dokładamy numer wyjątku.
-    ; ==========================================================================
+    ; CPU sam dostarczył error code.
+    ; Dokładamy tylko numer wyjątku.
 
     push qword %1
 
@@ -368,15 +528,15 @@ ISR_NOERR 31
 
 default_isr_stub:
 
-    ; Default IRQ/interrupt nie ma sprzętowego error code.
-    ; Tworzymy identyczny układ jak dla wyjątków:
+    ; Układ stosu:
     ;
-    ;   [RSP+0]  = vector
-    ;   [RSP+8]  = error code
-    ;   [RSP+16] = RIP
-    ;   [RSP+24] = CS
-    ;   [RSP+32] = RFLAGS
-    ; ==========================================================================
+    ; [RSP+0]  = vector
+    ; [RSP+8]  = error code
+    ; [RSP+16] = RIP
+    ; [RSP+24] = CS
+    ; [RSP+32] = RFLAGS
+    ; [RSP+40] = RSP
+    ; [RSP+48] = SS
 
     push qword 0
     push qword 0
@@ -388,25 +548,17 @@ default_isr_stub:
 ; COMMON EXCEPTION HANDLER
 ; ==============================================================================
 ;
-; WAŻNE:
+; NIE używamy CALL.
 ;
-; NIE używamy:
+; BSOD otrzymuje bezpośrednio ramkę:
 ;
-;     call bsod_handler
-;
-; ponieważ CALL odkłada dodatkowy adres powrotu na stos.
-;
-; BSOD oczekuje:
-;
-;   [rsp+0]  = vector
-;   [rsp+8]  = error code
-;   [rsp+16] = RIP
-;   [rsp+24] = CS
-;   [rsp+32] = RFLAGS
-;   [rsp+40] = RSP
-;   [rsp+48] = SS
-;
-; Dlatego używamy JMP.
+;   [RSP+0]  = vector
+;   [RSP+8]  = error code
+;   [RSP+16] = RIP
+;   [RSP+24] = CS
+;   [RSP+32] = RFLAGS
+;   [RSP+40] = RSP
+;   [RSP+48] = SS
 ;
 ; ==============================================================================
 
