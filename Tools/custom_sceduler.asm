@@ -2,8 +2,25 @@
 ; BLITRUM OS - BME-QD CUSTOM SCHEDULER
 ; x86-64 / NASM
 ; ==============================================================================
+;
+; Scheduler:
+;
+;   - task 0 = kernel / idle
+;   - maksymalnie 64 zadania
+;   - przełączanie kontekstu przez PIT IRQ0 / int 0x80
+;   - pełny kontekst: 15 rejestrów GPR
+;   - powrót do zadania przez IRETQ
+;
+; WAŻNE:
+;
+; PIT używa obecnie klasycznego 8259 PIC.
+; EOI dla PIT jest wykonywane w isr_pit_handler.
+;
+; Scheduler NIE wysyła EOI do Local APIC.
+; ==============================================================================
 
 bits 64
+
 
 ; ==============================================================================
 ; GLOBALS
@@ -49,32 +66,38 @@ section .data
 
 align 8
 
-; ------------------------------------------------------------------------------
-; Tablica adresów stosów zadań.
+
+; ==============================================================================
+; TASK RSP TABLE
 ;
-; task_rsp_table[task_id] = RSP zapisanego kontekstu zadania
-; ------------------------------------------------------------------------------
+; task_rsp_table[task_id] = RSP zapisanego kontekstu
+; ==============================================================================
 
 task_rsp_table:
+
     times MAX_TASKS dq 0
 
 
-; ------------------------------------------------------------------------------
-; BME-QD ready/event mask
+; ==============================================================================
+; READY MASK
 ;
-; bit = 1 -> zadanie gotowe / posiada zdarzenie
-; bit = 0 -> zadanie śpi / czeka
-; ------------------------------------------------------------------------------
+; bit = 1 -> zadanie gotowe
+; bit = 0 -> zadanie śpi / nie jest gotowe
+;
+; bit 0 = kernel / idle
+; ==============================================================================
 
 system_ready_mask:
+
     dq 0
 
 
-; ------------------------------------------------------------------------------
-; Aktualnie wykonywane zadanie
-; ------------------------------------------------------------------------------
+; ==============================================================================
+; CURRENT TASK
+; ==============================================================================
 
 current_task_id:
+
     dd 0
 
 
@@ -85,6 +108,7 @@ current_task_id:
 align 8
 
 hid_report_buf:
+
     times 8 db 0
 
 
@@ -100,12 +124,20 @@ section .text
 ;
 ; Inicjalizuje scheduler.
 ;
-; Zadanie 0 = kernel / idle task.
-; ------------------------------------------------------------------------------
+; Task 0 = kernel / idle.
+; ==============================================================================
 
 scheduler_init:
 
+    ; ==========================================================================
+    ; Task 0 jest gotowy.
+    ; ==========================================================================
+
     mov qword [rel system_ready_mask], 1
+
+    ; ==========================================================================
+    ; Aktualne zadanie = kernel.
+    ; ==========================================================================
 
     mov dword [rel current_task_id], 0
 
@@ -127,10 +159,23 @@ scheduler_init:
 ;   RAX = ID zadania
 ;   RAX = -1 -> brak wolnego slotu
 ;
-; UWAGA:
 ;
-; Funkcja przygotowuje stos tak, aby dispatcher mógł odtworzyć
-; podstawowy kontekst zadania.
+; Układ stosu nowego zadania:
+;
+;   [RSP + 0x00] = RAX
+;   [RSP + 0x08] = RBX
+;   [RSP + 0x10] = RCX
+;   ...
+;   [RSP + 0x70] = R15
+;
+; następnie:
+;
+;   RIP
+;   CS
+;   RFLAGS
+;   RSP
+;   SS
+;
 ; ==============================================================================
 
 scheduler_create_task:
@@ -155,6 +200,7 @@ scheduler_create_task:
 
 
     cmp qword [rel task_rsp_table + rdi * 8], 0
+
     je .found_slot
 
 
@@ -163,6 +209,10 @@ scheduler_create_task:
     jmp .find_slot
 
 
+; ==============================================================================
+; BRAK SLOTU
+; ==============================================================================
+
 .no_slot:
 
     mov rax, -1
@@ -170,13 +220,16 @@ scheduler_create_task:
     jmp .create_done
 
 
+; ==============================================================================
+; ZNALEZIONO SLOT
+; ==============================================================================
+
 .found_slot:
 
     ; ==========================================================================
     ; Zachowaj ID zadania.
     ;
-    ; RDI będzie później używane przez REP STOSQ,
-    ; więc nie wolno opierać się na jego wartości po REP STOSQ.
+    ; RDI będzie używane przez REP STOSQ.
     ; ==========================================================================
 
     mov rbx, rdi
@@ -185,81 +238,82 @@ scheduler_create_task:
     ; ==========================================================================
     ; 2. UTWÓRZ IRETQ FRAME
     ;
-    ; Układ:
+    ; Tworzymy go od końca stosu w dół.
     ;
+    ; Finalny układ od adresu RSP:
+    ;
+    ;   rejestry
     ;   RIP
     ;   CS
     ;   RFLAGS
     ;   RSP
     ;   SS
-    ;
     ; ==========================================================================
 
+
+    ; ==========================================================================
     ; SS
+    ; ==========================================================================
+
     sub rdx, 8
+
     mov qword [rdx], 0x10
 
 
+    ; ==========================================================================
     ; RSP
+    ;
+    ; Zadanie po iretq dostanie stos znajdujący się
+    ; powyżej ramki startowej.
+    ; ==========================================================================
+
     sub rdx, 8
+
     lea rax, [rdx + 16]
+
     mov [rdx], rax
 
 
+    ; ==========================================================================
     ; RFLAGS
+    ;
+    ; IF = 1
+    ; ==========================================================================
+
     sub rdx, 8
+
     mov qword [rdx], 0x202
 
 
+    ; ==========================================================================
     ; CS
+    ; ==========================================================================
+
     sub rdx, 8
+
     mov qword [rdx], 0x18
 
 
+    ; ==========================================================================
     ; RIP
+    ; ==========================================================================
+
     sub rdx, 8
+
     mov [rdx], rcx
 
 
     ; ==========================================================================
-    ; 3. MIEJSCE NA 14 REJESTRÓW
+    ; 3. ZAREZERWUJ 15 REJESTRÓW
     ;
-    ; scheduler_dispatch zapisuje:
-    ;
-    ; RAX
-    ; RBX
-    ; RCX
-    ; RDX
-    ; RSI
-    ; RDI
-    ; RBP
-    ; R8
-    ; R9
-    ; R10
-    ; R11
-    ; R12
-    ; R13
-    ; R14
-    ; R15
-    ;
-    ; = 15 rejestrów
-    ;
-    ; Uwaga:
-    ; obecny dispatcher zapisuje 15 rejestrów, więc rezerwujemy 120 bajtów.
+    ; 15 * 8 = 120 bajtów
     ; ==========================================================================
 
     sub rdx, 120
 
 
     ; ==========================================================================
-    ; 4. WYZEROJ OBSZAR REJESTRÓW
-    ;
-    ; NAJWAŻNIEJSZA POPRAWKA:
-    ;
-    ; Zachowujemy ID zadania w RBX.
-    ;
-    ; REP STOSQ zmienia RDI, dlatego RDI NIE może być użyte
-    ; po REP STOSQ jako task ID.
+    ; 4. WYZERUJ KONTEKST REJESTRÓW
     ; ==========================================================================
 
     mov rcx, 15
@@ -272,21 +326,29 @@ scheduler_create_task:
 
 
     ; ==========================================================================
-    ; 5. ZAREJESTRUJ STOS ZADANIA
+    ; 5. ZAPISZ RSP ZADANIA
     ; ==========================================================================
 
     mov [rel task_rsp_table + rbx * 8], rdx
 
 
     ; ==========================================================================
-    ; 6. ZADANIE GOTOWE
+    ; 6. USTAW TASK JAKO GOTOWY
+    ; ==========================================================================
+
+    lock bts [rel system_ready_mask], rbx
+
+
+    ; ==========================================================================
+    ; ZWRÓĆ ID
     ; ==========================================================================
 
     mov rax, rbx
 
-    ; Ustaw odpowiedni bit w ready mask.
-    lock bts [rel system_ready_mask], rbx
 
+; ==============================================================================
+; KONIEC scheduler_create_task
+; ==============================================================================
 
 .create_done:
 
@@ -311,7 +373,9 @@ scheduler_create_task:
 scheduler_trigger_event:
 
     cmp rcx, MAX_TASKS
+
     jae .trigger_done
+
 
     lock bts [rel system_ready_mask], rcx
 
@@ -324,16 +388,41 @@ scheduler_trigger_event:
 ; ==============================================================================
 ; scheduler_yield
 ;
-; Aktualne zadanie oddaje procesor.
+; Aktualne zadanie dobrowolnie oddaje CPU.
+;
+; WEJŚCIE:
+;   brak
+;
 ; ==============================================================================
 
 scheduler_yield:
 
+    ; ==========================================================================
+    ; Pobierz ID aktualnego zadania.
+    ; ==========================================================================
+
     mov ecx, [rel current_task_id]
+
+
+    ; ==========================================================================
+    ; Usuń aktualne zadanie z ready mask.
+    ; ==========================================================================
 
     lock btr [rel system_ready_mask], rcx
 
+
+    ; ==========================================================================
+    ; Wywołaj scheduler przez INT 0x80.
+    ;
+    ; IDT powinno mieć vector 0x80 -> isr_int80_handler.
+    ; ==========================================================================
+
     int 0x80
+
+
+    ; ==========================================================================
+    ; Po powrocie zadanie może być kontynuowane.
+    ; ==========================================================================
 
     ret
 
@@ -341,325 +430,35 @@ scheduler_yield:
 ; ==============================================================================
 ; scheduler_dispatch
 ;
-; Dispatcher kontekstu.
+; Pełne przełączenie kontekstu.
 ;
-; Wywoływany z ISR.
-; ==============================================================================
-
-scheduler_dispatch:
-
-    ; ==========================================================================
-    ; 1. ZAPISZ KONTEKST AKTUALNEGO ZADANIA
-    ; ==========================================================================
-
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-
-
-    ; ==========================================================================
-    ; ZAPISZ RSP AKTUALNEGO ZADANIA
-    ; ==========================================================================
-
-    mov ecx, [rel current_task_id]
-
-    mov [rel task_rsp_table + rcx * 8], rsp
-
-
-    ; ==========================================================================
-    ; 2. WYBIERZ NASTĘPNE ZADANIE
-    ; ==========================================================================
-
-    mov rax, [rel system_ready_mask]
-
-    test rax, rax
-
-    jz .no_ready_tasks
-
-
-    ; ==========================================================================
-    ; Znajdź pierwszy aktywny bit.
-    ; ==========================================================================
-
-    bsf rsi, rax
-
-    jmp .task_selected
-
-
-.no_ready_tasks:
-
-    ; Kernel / idle = task 0
-    xor esi, esi
-
-
-.task_selected:
-
-    ; ==========================================================================
-    ; Zapisz ID nowego zadania.
-    ; ==========================================================================
-
-    mov [rel current_task_id], esi
-
-
-    ; ==========================================================================
-    ; Sprawdź, czy zadanie posiada zapisany kontekst.
-    ; ==========================================================================
-
-    mov rsp, [rel task_rsp_table + rsi * 8]
-
-    test rsp, rsp
-
-    jz .fallback_kernel
-
-
-    ; ==========================================================================
-    ; 3. ODTWÓRZ REJESTRY
-    ; ==========================================================================
-
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-
-    ; ==========================================================================
-    ; EOI LOCAL APIC
-    ; ==========================================================================
-
-    mov r11, 0xFEE00000
-
-    mov dword [r11 + 0xB0], 0
-
-
-    ; ==========================================================================
-    ; Powrót z ISR
-    ; ==========================================================================
-
-    iretq
-
-
-.fallback_kernel:
-
-    ; ==========================================================================
-    ; Jeżeli wybrane zadanie nie ma kontekstu,
-    ; wróć do task 0.
-    ; ==========================================================================
-
-    xor esi, esi
-
-    mov [rel current_task_id], esi
-
-    mov rsp, [rel task_rsp_table]
-
-    test rsp, rsp
-
-    jz .fatal_scheduler
-
-
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-    mov r11, 0xFEE00000
-
-    mov dword [r11 + 0xB0], 0
-
-    iretq
-
-
-.fatal_scheduler:
-
-    cli
-
-.fatal_loop:
-
-    hlt
-
-    jmp .fatal_loop
-
-
-; ==============================================================================
-; scheduler_event_loop
+; Wywoływany z:
 ;
-; Główna pętla zdarzeń.
+;   1. PIT IRQ0
+;   2. INT 0x80
 ;
-; Odbiera zdarzenia z USB i przekazuje je do HID.
-; ==============================================================================
-
-scheduler_event_loop:
-
-    push rax
-    push rbx
-    push rcx
-    push rdx
-
-
-.event_loop:
-
-    ; ==========================================================================
-    ; Pobierz zdarzenie z USB ring buffer.
-    ; ==========================================================================
-
-    call usb_pop_event
-
-    test rax, rax
-
-    jz .idle
-
-
-    ; ==========================================================================
-    ; RAX:
-    ;
-    ; byte 0 = typ
-    ; byte 1 = dane
-    ; byte 2-3 = delta X
-    ; byte 4-5 = delta Y
-    ; ==========================================================================
-
-    movzx ebx, al
-
-
-    ; ==========================================================================
-    ; KEYBOARD
-    ; ==========================================================================
-
-    cmp ebx, 1
-
-    je .handle_keyboard
-
-
-    ; ==========================================================================
-    ; MOUSE
-    ; ==========================================================================
-
-    cmp ebx, 2
-
-    je .handle_mouse
-
-
-    ; Nieznany typ.
-    jmp .event_loop
-
-
-; ==============================================================================
-; KEYBOARD EVENT
-; ==============================================================================
-
-.handle_keyboard:
-
-    mov [rel hid_report_buf], rax
-
-    lea rcx, [rel hid_report_buf]
-
-    call hid_parse_keyboard
-
-    call shell_run
-
-    jmp .event_loop
-
-
-; ==============================================================================
-; MOUSE EVENT
-; ==============================================================================
-
-.handle_mouse:
-
-    mov [rel hid_report_buf], rax
-
-    lea rcx, [rel hid_report_buf]
-
-    call hid_parse_mouse
-
-
-    ; ==========================================================================
-    ; Sprawdź lewy przycisk.
-    ; ==========================================================================
-
-    movzx ebx, byte [rel hid_report_buf]
-
-    test ebx, 1
-
-    jz .no_click
-
-
-    ; ==========================================================================
-    ; Przekaż pozycję do GUI.
-    ; ==========================================================================
-
-    mov rcx, [rel mouse_x]
-
-    mov rdx, [rel mouse_y]
-
-    call gui_process_mouse_click
-
-
-.no_click:
-
-    ; ==========================================================================
-    ; Odśwież GUI.
-    ; ==========================================================================
-
-    call gui_refresh_screen
-
-    jmp .event_loop
-
-
-; ==============================================================================
-; IDLE
-; ==============================================================================
-
-.idle:
-
-    hlt
-
-    jmp .event_loop
-
-
-; ==============================================================================
-; UWAGA:
+; Na wejściu CPU ma już na stosie:
 ;
-; Kod poniżej jest nieosiągalny przez nieskończoną pętlę event_loop.
-; Pozostawiamy go jako zabezpieczenie struktury funkcji.
-; ==============================================================================
-
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-    ret
+;   RIP
+;   CS
+;   RFLAGS
+;
+; Dispatcher dodaje:
+;
+;   RAX
+;   RBX
+;   RCX
+;   RDX
+;   RSI
+;   RDI
+;   RBP
+;   R8
+;   R9
+;   R10
+;   R11
+;   R12
+;   R13
+;   R14
+;   R15
+;
+; Następnie zapisuje R
