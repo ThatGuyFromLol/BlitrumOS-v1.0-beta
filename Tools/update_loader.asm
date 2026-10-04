@@ -50,6 +50,7 @@ global update_rollback
 global update_is_pending
 
 extern tgfs_load_and_map_file
+extern tgfs_last_file_size
 
 extern update_register_vector
 extern update_get_vector_address
@@ -83,6 +84,8 @@ MODULE_SLOT_MASK    equ MODULE_SLOT_SIZE - 1
 
 MAX_MODULES         equ 16
 MAX_VECTOR_ID       equ 31
+
+INVALID_VECTOR_ID   equ 0xFFFFFFFF
 
 SATA_PORT           equ 0
 
@@ -137,7 +140,7 @@ update_pending:
 align 8
 
 crash_vector_id:
-    dd 0xFFFFFFFF
+    dd INVALID_VECTOR_ID
 
 updated_count:
     dd 0
@@ -148,9 +151,9 @@ current_generation:
     dq 0
 
 current_vector_id:
-    dd 0
+    dd INVALID_VECTOR_ID
 
-align 4
+align 8
 
 current_module_address:
     dq 0
@@ -174,7 +177,7 @@ backup_vectors:
 align 4
 
 updated_vector_ids:
-    times MAX_MODULES dd 0
+    times MAX_MODULES dd INVALID_VECTOR_ID
 
 align 8
 
@@ -261,11 +264,15 @@ update_check:
 ; +0C DWORD reserved
 ; +10 QWORD checksum
 ;
-; module headers begin at +18
-; each module header = 64 bytes
+; module headers:
 ;
-; Checksum:
-;   XOR wszystkich QWORD tabeli module headers.
+; +18 ...
+;
+; each module header = 64 bytes.
+;
+; Package checksum:
+;
+; XOR wszystkich QWORD tabeli module headers.
 ;
 ; =============================================================================
 
@@ -282,8 +289,9 @@ update_verify:
 
     mov rsi, PKG_LOAD_ADDR
 
+
     ; -------------------------------------------------------------------------
-    ; Minimalny nagłówek pakietu.
+    ; Minimalny nagłówek.
     ; -------------------------------------------------------------------------
 
     mov rdx, [rel tgfs_last_file_size]
@@ -318,8 +326,6 @@ update_verify:
 
 
     ; -------------------------------------------------------------------------
-    ; TABLE SIZE
-    ;
     ; module_count * 64
     ; -------------------------------------------------------------------------
 
@@ -328,14 +334,12 @@ update_verify:
 
     jc .bad
 
-
-    ; -------------------------------------------------------------------------
-    ; Cała tabela musi mieścić się w pliku.
-    ;
-    ; 24-byte package header + module table.
-    ; -------------------------------------------------------------------------
-
     mov r8, rax
+
+
+    ; -------------------------------------------------------------------------
+    ; 24 + module table
+    ; -------------------------------------------------------------------------
 
     add r8, 24
 
@@ -350,12 +354,7 @@ update_verify:
     ; -------------------------------------------------------------------------
     ; CHECKSUM
     ;
-    ; WAŻNE:
-    ;
-    ; Nie liczymy już checksumu od początku pakietu.
-    ; Liczymy wyłącznie tabelę module headers.
-    ;
-    ; Każdy header = 64 bytes = 8 QWORD.
+    ; Tylko tabela nagłówków.
     ; -------------------------------------------------------------------------
 
     mov rbx, [rsi + 16]
@@ -366,11 +365,6 @@ update_verify:
 
     test rcx, rcx
     jz .bad
-
-
-    ; -------------------------------------------------------------------------
-    ; Początek tabeli modułów.
-    ; -------------------------------------------------------------------------
 
     mov rdi, PKG_LOAD_ADDR + 24
 
@@ -387,10 +381,6 @@ update_verify:
 
     jnz .checksum_loop
 
-
-    ; -------------------------------------------------------------------------
-    ; Porównanie.
-    ; -------------------------------------------------------------------------
 
     cmp rax, rbx
     jne .bad
@@ -457,19 +447,59 @@ update_apply:
 
 
     ; -------------------------------------------------------------------------
-    ; Reset aktywnych aktualizacji.
+    ; Reset stanu rollback.
     ; -------------------------------------------------------------------------
 
     mov dword [rel updated_count], 0
 
     mov qword [rel current_generation], 0
 
-    mov dword [rel current_vector_id], 0
+    mov dword [rel current_vector_id], INVALID_VECTOR_ID
 
 
     ; -------------------------------------------------------------------------
-    ; Pierwszy module header.
+    ; Wyzerowanie tabel.
     ; -------------------------------------------------------------------------
+
+    xor eax, eax
+    xor ecx, ecx
+
+
+.clear_backup:
+
+    cmp ecx, MAX_MODULES
+    jae .clear_ids
+
+    mov qword [rel backup_vectors + rcx * 8], 0
+    mov qword [rel updated_generations + rcx * 8], 0
+
+    inc ecx
+
+    jmp .clear_backup
+
+
+.clear_ids:
+
+    xor ecx, ecx
+
+
+.clear_id_loop:
+
+    cmp ecx, MAX_MODULES
+    jae .begin_modules
+
+    mov dword [rel updated_vector_ids + rcx * 4], INVALID_VECTOR_ID
+
+    inc ecx
+
+    jmp .clear_id_loop
+
+
+; =============================================================================
+; MODULE LOOP
+; =============================================================================
+
+.begin_modules:
 
     mov rsi, PKG_LOAD_ADDR + 24
 
@@ -477,10 +507,6 @@ update_apply:
 
     mov r15d, [rel pkg_module_count]
 
-
-; =============================================================================
-; MODULE LOOP
-; =============================================================================
 
 .module_loop:
 
@@ -494,8 +520,10 @@ update_apply:
     ; +00 DWORD Vector ID
     ; +04 DWORD Size
     ; +08 QWORD Destination
-    ; +20 QWORD Checksum
-    ; +28 QWORD Data offset
+    ; +10 QWORD reserved
+    ; +18 QWORD checksum
+    ; +20 QWORD data offset
+    ;
     ; -------------------------------------------------------------------------
 
     mov r12d, [rsi + 0]
@@ -506,7 +534,6 @@ update_apply:
     mov rbx, [rsi + 32]
 
     mov r10, [rsi + 40]
-
 
     mov [rel current_vector_id], r12d
 
@@ -638,7 +665,7 @@ update_apply:
 
 
     ; -------------------------------------------------------------------------
-    ; Zapamiętaj aktualny moduł.
+    ; Zapamiętaj moduł.
     ; -------------------------------------------------------------------------
 
     mov [rel current_module_address], rdi
@@ -657,22 +684,24 @@ update_apply:
     cmp rax, -1
     je .module_failed_state
 
-
-    ; -------------------------------------------------------------------------
-    ; Generation musi zostać zapisany w pamięci.
-    ; Nie wolno trzymać jej tylko w rejestrze.
-    ; -------------------------------------------------------------------------
-
     mov [rel current_generation], rax
 
 
     ; =========================================================================
     ; STATIC MALWARE CHECK - SOURCE
+    ;
+    ; malicious_check_static:
+    ;
+    ; RDI = address
+    ; RSI = size
+    ; RDX = checksum
     ; =========================================================================
 
-    mov rcx, r11
-    mov rdx, r13
-    mov r8, rbx
+    mov rdi, r11
+
+    mov rsi, r13
+
+    mov rdx, rbx
 
     call malicious_check_static
 
@@ -685,6 +714,7 @@ update_apply:
     ; =========================================================================
 
     mov r8, r11
+
     mov r9, rdi
 
     mov ecx, r13d
@@ -747,9 +777,13 @@ update_apply:
 
     call update_get_vector_address
 
+    ; -1 = brak prawidłowego Vectora.
+    cmp rax, -1
+    je .module_failed_vector
+
 
     ; -------------------------------------------------------------------------
-    ; Index aktualnej aktualizacji.
+    ; Index rollback.
     ; -------------------------------------------------------------------------
 
     mov edx, [rel updated_count]
@@ -786,7 +820,7 @@ update_apply:
 
 
     ; -------------------------------------------------------------------------
-    ; Od tego momentu moduł jest częścią aktywnej listy rollback.
+    ; Od tego momentu wpis jest rollbackowalny.
     ; -------------------------------------------------------------------------
 
     inc dword [rel updated_count]
@@ -808,13 +842,17 @@ update_apply:
 
     ; =========================================================================
     ; POST ACTIVATION MALWARE CHECK
+    ;
+    ; RDI = address
+    ; RSI = size
+    ; RDX = checksum
     ; =========================================================================
 
-    mov rcx, [rel current_module_address]
+    mov rdi, [rel current_module_address]
 
-    mov rdx, [rel current_module_size]
+    mov rsi, [rel current_module_size]
 
-    mov r8, [rel current_module_checksum]
+    mov rdx, [rel current_module_checksum]
 
     call malicious_check_static
 
@@ -873,6 +911,23 @@ update_apply:
 
 
 ; =============================================================================
+; VECTOR BACKUP FAILURE
+; =============================================================================
+
+.module_failed_vector:
+
+    mov rcx, r12
+
+    mov rdx, [rel current_generation]
+
+    mov r8d, UPDATE_ERROR_VECTOR
+
+    call update_mark_failed
+
+    jmp .next_module
+
+
+; =============================================================================
 ; STATE FAILURE
 ; =============================================================================
 
@@ -911,9 +966,6 @@ update_apply:
     mov r8d, UPDATE_ERROR_VECTOR
 
     call update_mark_failed
-
-    ; Vector nie został aktywowany.
-    ; Nie wykonujemy rollbacku.
 
     jmp .next_module
 
@@ -1046,11 +1098,16 @@ update_apply:
 ; RCX = -1       -> rollback all
 ; RCX = VectorID -> rollback specific
 ;
-; RAX = number of successful rollbacks
+; RAX = liczba udanych rollbacków
 ;
-; WAŻNE:
-; Jeżeli update_register_vector() nie powiedzie się,
-; wpis NIE jest usuwany z tabeli.
+; Bardzo ważne:
+;
+; Jeżeli update_register_vector() zwróci błąd:
+;
+;   - Vector pozostaje aktywny,
+;   - wpis pozostaje w tabeli,
+;   - rollback można ponowić.
+;
 ; =============================================================================
 
 update_rollback:
@@ -1096,14 +1153,17 @@ update_rollback:
 
 
     ; -------------------------------------------------------------------------
-    ; Vector ID
+    ; Vector ID.
     ; -------------------------------------------------------------------------
 
     mov edx, [rel updated_vector_ids + rcx * 4]
 
+    cmp edx, INVALID_VECTOR_ID
+    je .rollback_all_next
+
 
     ; -------------------------------------------------------------------------
-    ; Backup address
+    ; Backup.
     ; -------------------------------------------------------------------------
 
     mov rax, rcx
@@ -1112,19 +1172,12 @@ update_rollback:
 
     mov rsi, [rel backup_vectors + rax]
 
-
-    ; -------------------------------------------------------------------------
-    ; Backup = 0 oznacza brak bezpiecznego rollbacku.
-    ;
-    ; W takim przypadku NIE usuwamy wpisu.
-    ; -------------------------------------------------------------------------
-
     test rsi, rsi
     jz .rollback_all_next
 
 
     ; -------------------------------------------------------------------------
-    ; Przywrócenie Vectora.
+    ; Restore.
     ; -------------------------------------------------------------------------
 
     push rcx
@@ -1139,7 +1192,7 @@ update_rollback:
 
 
     ; -------------------------------------------------------------------------
-    ; Jeśli restore się nie udał:
+    ; Restore FAILED:
     ;
     ; wpis zostaje.
     ; -------------------------------------------------------------------------
@@ -1149,18 +1202,13 @@ update_rollback:
 
 
     ; -------------------------------------------------------------------------
-    ; Restore成功.
-    ; Teraz można bezpiecznie usunąć wpis.
+    ; Restore SUCCESS.
     ; -------------------------------------------------------------------------
 
     inc r13d
 
-    ; Uwaga:
-    ; po usunięciu wpisów nie kompaktujemy tutaj w miejscu,
-    ; ponieważ indeksacja kolejnych wpisów zmieniłaby się.
-    ;
-    ; Zamiast tego oznaczamy wpis jako pusty.
-    ; Po zakończeniu wykonujemy kompaktowanie.
+    ; -------------------------------------------------------------------------
+    ; Oznacz wpis jako pusty.
     ; -------------------------------------------------------------------------
 
     mov rax, rcx
@@ -1171,7 +1219,7 @@ update_rollback:
 
     mov qword [rel updated_generations + rax], 0
 
-    mov dword [rel updated_vector_ids + rcx * 4], 0
+    mov dword [rel updated_vector_ids + rcx * 4], INVALID_VECTOR_ID
 
 
 .rollback_all_next:
@@ -1181,9 +1229,9 @@ update_rollback:
     jmp .rollback_all_loop
 
 
-; ============================================================================
-; COMPACT TABLE AFTER ROLLBACK ALL
-; ============================================================================
+; =============================================================================
+; COMPACT TABLE
+; =============================================================================
 
 .rollback_all_done:
 
@@ -1197,30 +1245,31 @@ update_rollback:
     jae .compact_done
 
 
-    ; -------------------------------------------------------------------------
-    ; Vector ID.
-    ; -------------------------------------------------------------------------
-
     mov r8d, [rel updated_vector_ids + rcx * 4]
 
-    test r8d, r8d
-    jz .compact_skip
+    cmp r8d, INVALID_VECTOR_ID
+    je .compact_skip
 
 
     ; -------------------------------------------------------------------------
-    ; Jeżeli źródłowy indeks != docelowy:
-    ; przenieś wpis.
+    ; Wpis aktywny.
     ; -------------------------------------------------------------------------
 
     cmp ecx, edx
     je .compact_same
 
 
-    ; Vector ID
+    ; -------------------------------------------------------------------------
+    ; Vector ID.
+    ; -------------------------------------------------------------------------
+
     mov [rel updated_vector_ids + rdx * 4], r8d
 
 
-    ; Backup
+    ; -------------------------------------------------------------------------
+    ; Backup.
+    ; -------------------------------------------------------------------------
+
     mov r9, rcx
 
     shl r9, 3
@@ -1234,7 +1283,10 @@ update_rollback:
     mov [rel backup_vectors + r10], r11
 
 
-    ; Generation
+    ; -------------------------------------------------------------------------
+    ; Generation.
+    ; -------------------------------------------------------------------------
+
     mov r11, [rel updated_generations + r9]
 
     mov [rel updated_generations + r10], r11
@@ -1252,11 +1304,11 @@ update_rollback:
     jmp .compact_loop
 
 
-.compact_done:
+; =============================================================================
+; CLEAR TABLE TAIL
+; =============================================================================
 
-    ; -------------------------------------------------------------------------
-    ; Wyzeruj końcówkę tabeli.
-    ; -------------------------------------------------------------------------
+.compact_done:
 
     mov ecx, edx
 
@@ -1267,7 +1319,7 @@ update_rollback:
     jae .set_new_count
 
 
-    mov dword [rel updated_vector_ids + rcx * 4], 0
+    mov dword [rel updated_vector_ids + rcx * 4], INVALID_VECTOR_ID
 
     mov rax, rcx
 
@@ -1331,17 +1383,12 @@ update_rollback:
 
     mov rsi, [rel backup_vectors + rax]
 
-
-    ; -------------------------------------------------------------------------
-    ; Brak backupu -> NIE usuwaj wpisu.
-    ; -------------------------------------------------------------------------
-
     test rsi, rsi
     jz .rollback_return
 
 
     ; -------------------------------------------------------------------------
-    ; Przywrócenie.
+    ; Restore.
     ; -------------------------------------------------------------------------
 
     push rcx
@@ -1356,7 +1403,7 @@ update_rollback:
 
 
     ; -------------------------------------------------------------------------
-    ; Jeśli restore się nie udał:
+    ; Restore FAILED:
     ; wpis pozostaje.
     ; -------------------------------------------------------------------------
 
@@ -1365,23 +1412,18 @@ update_rollback:
 
 
     ; -------------------------------------------------------------------------
-    ; Restore udany.
+    ; Restore SUCCESS.
     ; -------------------------------------------------------------------------
 
     inc r13d
 
-
-    ; =========================================================================
-    ; USUNIĘCIE WPISU
-    ; =========================================================================
+    ; -------------------------------------------------------------------------
+    ; Ostatni wpis.
+    ; -------------------------------------------------------------------------
 
     mov eax, ebx
 
     dec eax
-
-    ; -------------------------------------------------------------------------
-    ; Jeżeli to ostatni wpis, nie trzeba przesuwać.
-    ; -------------------------------------------------------------------------
 
     cmp ecx, eax
     je .remove_last
@@ -1396,6 +1438,7 @@ update_rollback:
     mov [rel updated_vector_ids + rcx * 4], edx
 
 
+    ; -------------------------------------------------------------------------
     ; Backup ostatniego wpisu.
     ; -------------------------------------------------------------------------
 
@@ -1405,7 +1448,6 @@ update_rollback:
 
     mov r9, [rel backup_vectors + r8]
 
-
     mov r10, rcx
 
     shl r10, 3
@@ -1413,6 +1455,7 @@ update_rollback:
     mov [rel backup_vectors + r10], r9
 
 
+    ; -------------------------------------------------------------------------
     ; Generation ostatniego wpisu.
     ; -------------------------------------------------------------------------
 
@@ -1424,12 +1467,12 @@ update_rollback:
 .remove_last:
 
     ; -------------------------------------------------------------------------
-    ; Wyczyść ostatni wpis.
+    ; Usuń ostatni wpis.
     ; -------------------------------------------------------------------------
 
-    mov rax, [rel updated_count]
+    mov eax, [rel updated_count]
 
-    dec rax
+    dec eax
 
     mov r8, rax
 
@@ -1439,14 +1482,9 @@ update_rollback:
 
     mov qword [rel updated_generations + r8], 0
 
-    mov dword [rel updated_vector_ids + rax * 4], 0
+    mov dword [rel updated_vector_ids + rax * 4], INVALID_VECTOR_ID
 
-
-    ; -------------------------------------------------------------------------
-    ; Zmniejsz count.
-    ; -------------------------------------------------------------------------
-
-    dec dword [rel updated_count]
+    mov [rel updated_count], eax
 
 
 ; =============================================================================
