@@ -14,13 +14,13 @@
 ;   0x20         = PIT / IRQ0
 ;   0x28         = xHCI / USB
 ;   0x80         = scheduler software interrupt
-;   0x20-0xFF    = safe default handler
 ;
 ; ==============================================================================
 
 bits 64
 
 section .text
+
 
 ; ==============================================================================
 ; EXTERNALS
@@ -62,10 +62,11 @@ idt_init:
     push rcx
     push rdi
     push rsi
+    push rdx
 
 
     ; ==========================================================================
-    ; 1. ZAREJESTRUJ WSZYSTKIE WYJĄTKI CPU
+    ; 1. ZAREJESTRUJ WYJĄTKI CPU 0..31
     ; ==========================================================================
 
     xor ecx, ecx
@@ -87,7 +88,7 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 2. WYPEŁNIJ POZOSTAŁE WEKTORY DEFAULT HANDLEREM
+    ; 2. DEFAULT HANDLER 32..255
     ; ==========================================================================
 
     mov rcx, 32
@@ -109,7 +110,7 @@ idt_init:
     ; ==========================================================================
     ; 3. PIT / IRQ0
     ;
-    ; IRQ0 -> vector 0x20
+    ; 0x20
     ; ==========================================================================
 
     mov rcx, PIT_VECTOR
@@ -122,7 +123,7 @@ idt_init:
     ; ==========================================================================
     ; 4. USB / xHCI
     ;
-    ; IRQ -> vector 0x28
+    ; 0x28
     ; ==========================================================================
 
     mov rcx, USB_INTERRUPT_VECTOR
@@ -133,15 +134,9 @@ idt_init:
 
 
     ; ==========================================================================
-    ; 5. SCHEDULER / SOFTWARE INTERRUPT
+    ; 5. SCHEDULER / INT 0x80
     ;
-    ; int 0x80
-    ;
-    ; scheduler_yield:
-    ;
-    ;     int 0x80
-    ;
-    ; Wektor 0x80 musi prowadzić do prawdziwego handlera.
+    ; 0x80
     ; ==========================================================================
 
     mov rcx, SCHEDULER_VECTOR
@@ -160,6 +155,7 @@ idt_init:
     lidt [rax]
 
 
+    pop rdx
     pop rsi
     pop rdi
     pop rcx
@@ -178,6 +174,7 @@ idt_init:
 ;   RDX = adres handlera
 ;
 ; ==============================================================================
+
 idt_set_gate:
 
     push rax
@@ -186,9 +183,9 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Oblicz adres wpisu:
+    ; Oblicz adres wpisu IDT.
     ;
-    ; każdy wpis IDT = 16 bajtów
+    ; Jeden wpis = 16 bajtów.
     ; ==========================================================================
 
     mov rax, rcx
@@ -201,28 +198,26 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Offset 0..15 ISR
+    ; OFFSET 0..15
     ; ==========================================================================
 
     mov [rdi], dx
 
 
     ; ==========================================================================
-    ; Segment selector
-    ;
-    ; CS = 0x18
+    ; CODE SEGMENT
     ; ==========================================================================
 
     mov word [rdi + 2], KERNEL_CODE_SELECTOR
 
 
     ; ==========================================================================
-    ; Type / Attributes
+    ; ATTRIBUTES
     ;
     ; 0x8E:
     ;
-    ; Present = 1
-    ; DPL     = 0
+    ; P = 1
+    ; DPL = 0
     ; Interrupt Gate
     ; ==========================================================================
 
@@ -230,7 +225,7 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Offset 16..31
+    ; OFFSET 16..31
     ; ==========================================================================
 
     shr rdx, 16
@@ -239,7 +234,7 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Offset 32..63
+    ; OFFSET 32..63
     ; ==========================================================================
 
     shr rdx, 16
@@ -248,7 +243,7 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Reserved
+    ; RESERVED
     ; ==========================================================================
 
     mov dword [rdi + 12], 0
@@ -264,38 +259,28 @@ idt_set_gate:
 ; ==============================================================================
 ; SCHEDULER SOFTWARE INTERRUPT
 ;
-; Wywoływane przez:
+; INT 0x80
 ;
-;     int 0x80
-;
-; WAŻNE:
-;
-; CPU automatycznie odkłada na stos:
-;
-;     RIP
-;     CS
-;     RFLAGS
-;     RSP
-;     SS
-;
-; scheduler_dispatch kończy się iretq,
-; więc handler NIE może tutaj wykonywać iretq drugi raz.
 ; ==============================================================================
 
 isr_int80_handler:
 
-    call scheduler_dispatch
+    ; ==========================================================================
+    ; BARDZO WAŻNE:
+    ;
+    ; NIE używamy:
+    ;
+    ;     call scheduler_dispatch
+    ;
+    ; ponieważ CALL dodałby adres powrotu na stos.
+    ;
+    ; Scheduler wykonuje IRETQ, więc musi dostać bezpośrednio
+    ; CPU interrupt frame.
+    ;
+    ; Dlatego używamy JMP.
+    ; ==========================================================================
 
-    ; scheduler_dispatch wykonuje iretq.
-    ; Ten kod jest więc tylko zabezpieczeniem struktury.
-
-    cli
-
-.int80_fatal:
-
-    hlt
-
-    jmp .int80_fatal
+    jmp scheduler_dispatch
 
 
 ; ==============================================================================
@@ -306,10 +291,15 @@ isr_int80_handler:
 
 isr_stub_%1:
 
-    ; Sztuczny error code
+    ; ==========================================================================
+    ; CPU nie dostarczył error code.
+    ;
+    ; Tworzymy sztuczny error code.
+    ; ==========================================================================
+
     push qword 0
 
-    ; Numer wyjątku
+    ; Numer wyjątku.
     push qword %1
 
     jmp common_exception_handler
@@ -321,8 +311,10 @@ isr_stub_%1:
 
 isr_stub_%1:
 
+    ; ==========================================================================
     ; CPU sam odłożył error code.
-    ; Dokładamy tylko numer wyjątku.
+    ; Dokładamy numer wyjątku.
+    ; ==========================================================================
 
     push qword %1
 
@@ -332,7 +324,7 @@ isr_stub_%1:
 
 
 ; ==============================================================================
-; CPU EXCEPTIONS 0..31
+; CPU EXCEPTIONS
 ; ==============================================================================
 
 ISR_NOERR 0
@@ -381,8 +373,6 @@ ISR_NOERR 31
 
 ; ==============================================================================
 ; DEFAULT ISR
-;
-; Obsługuje nieużywane IRQ/wektory.
 ; ==============================================================================
 
 default_isr_stub:
@@ -395,17 +385,6 @@ default_isr_stub:
 
 ; ==============================================================================
 ; COMMON EXCEPTION HANDLER
-;
-; Stack:
-;
-;   [RSP + 0]  = exception vector
-;   [RSP + 8]  = error code
-;   [RSP +16]  = RIP
-;   [RSP +24]  = CS
-;   [RSP +32]  = RFLAGS
-;
-; Dla wyjątków z CPU error code znajduje się już pod naszym numerem
-; wyjątku.
 ; ==============================================================================
 
 common_exception_handler:
