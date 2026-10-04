@@ -266,18 +266,9 @@ idt_set_gate:
 isr_int80_handler:
 
     ; ==========================================================================
-    ; BARDZO WAŻNE:
+    ; NIE używamy CALL.
     ;
-    ; NIE używamy:
-    ;
-    ;     call scheduler_dispatch
-    ;
-    ; ponieważ CALL dodałby adres powrotu na stos.
-    ;
-    ; Scheduler wykonuje IRETQ, więc musi dostać bezpośrednio
-    ; CPU interrupt frame.
-    ;
-    ; Dlatego używamy JMP.
+    ; scheduler_dispatch kończy się przez IRETQ.
     ; ==========================================================================
 
     jmp scheduler_dispatch
@@ -377,6 +368,16 @@ ISR_NOERR 31
 
 default_isr_stub:
 
+    ; Default IRQ/interrupt nie ma sprzętowego error code.
+    ; Tworzymy identyczny układ jak dla wyjątków:
+    ;
+    ;   [RSP+0]  = vector
+    ;   [RSP+8]  = error code
+    ;   [RSP+16] = RIP
+    ;   [RSP+24] = CS
+    ;   [RSP+32] = RFLAGS
+    ; ==========================================================================
+
     push qword 0
     push qword 0
 
@@ -386,19 +387,34 @@ default_isr_stub:
 ; ==============================================================================
 ; COMMON EXCEPTION HANDLER
 ; ==============================================================================
+;
+; WAŻNE:
+;
+; NIE używamy:
+;
+;     call bsod_handler
+;
+; ponieważ CALL odkłada dodatkowy adres powrotu na stos.
+;
+; BSOD oczekuje:
+;
+;   [rsp+0]  = vector
+;   [rsp+8]  = error code
+;   [rsp+16] = RIP
+;   [rsp+24] = CS
+;   [rsp+32] = RFLAGS
+;   [rsp+40] = RSP
+;   [rsp+48] = SS
+;
+; Dlatego używamy JMP.
+;
+; ==============================================================================
 
 common_exception_handler:
 
-    call bsod_handler
-
     cli
 
-
-.exception_halt:
-
-    hlt
-
-    jmp .exception_halt
+    jmp bsod_handler
 
 
 ; ==============================================================================
