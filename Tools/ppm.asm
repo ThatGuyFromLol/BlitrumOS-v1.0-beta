@@ -20,9 +20,13 @@
 ;   1 bit = 1 fizyczna strona 4096 B
 ;
 ; Bitmapa:
-;   fizyczny adres = 0x00200000
+;   NIE posiada już stałego adresu.
 ;
-; Pierwsze 32 MiB są zawsze zarezerwowane.
+; PMM:
+;   - chroni pierwsze 32 MiB,
+;   - znajduje bitmapę w EfiConventionalMemory,
+;   - bitmapa znajduje się powyżej 32 MiB,
+;   - bitmapa jest automatycznie rezerwowana.
 ; ==============================================================================
 
 bits 64
@@ -47,38 +51,73 @@ global bitmap_size
 
 align 8
 
-; ------------------------------------------------------------------------------
-; Początek bitmapy PMM.
-; 0x00200000 = 2 MiB
-; ------------------------------------------------------------------------------
+
+; ==============================================================================
+; BITMAPA PMM
+;
+; Adres jest wybierany dynamicznie przez pmm_init.
+; ==============================================================================
 
 bitmap_base:
-    dq 0x00200000
+    dq 0
 
 
-; ------------------------------------------------------------------------------
-; Rozmiar bitmapy w bajtach.
-; Ustawiany dynamicznie przez pmm_init.
-; ------------------------------------------------------------------------------
+; ==============================================================================
+; ROZMIAR BITMAPY W BAJTACH
+; ==============================================================================
 
 bitmap_size:
     dq 0
 
 
-; ------------------------------------------------------------------------------
-; Maksymalna liczba obsługiwanych stron fizycznych.
-; ------------------------------------------------------------------------------
+; ==============================================================================
+; LICZBA STRON FIZYCZNYCH
+; ==============================================================================
 
 max_page_count:
     dq 0
 
 
-; ------------------------------------------------------------------------------
-; Najwyższy adres fizyczny + 1 znaleziony w mapie EFI.
-; ------------------------------------------------------------------------------
+; ==============================================================================
+; NAJWYŻSZY ADRES FIZYCZNY + 1
+; ==============================================================================
 
 max_physical_address:
     dq 0
+
+
+; ==============================================================================
+; LICZBA STRON ZAJĘTYCH PRZEZ BITMAPĘ
+; ==============================================================================
+
+bitmap_page_count:
+    dq 0
+
+
+; ==============================================================================
+; PMM READY
+;
+; 0 = PMM nie został poprawnie zainicjalizowany
+; 1 = PMM gotowy
+; ==============================================================================
+
+pmm_ready:
+    db 0
+
+
+; ==============================================================================
+; STAŁE
+; ==============================================================================
+
+PAGE_SIZE           equ 4096
+PAGE_SHIFT          equ 12
+
+FIRST_RESERVED_MB   equ 32
+FIRST_RESERVED_PAGES equ (FIRST_RESERVED_MB * 1024 * 1024) / PAGE_SIZE
+
+EFI_CONVENTIONAL_MEMORY equ 7
+
+MIN_DESCRIPTOR_SIZE equ 48
 
 
 ; ==============================================================================
@@ -86,17 +125,21 @@ max_physical_address:
 ;
 ; Wejście:
 ;   RCX = EFI descriptor size
-;   R8  = EFI memory map size
-;   R9  = EFI memory map address
+;   R8  = memory map size
+;   R9  = memory map address
 ;
 ; Działanie:
-;   1. Znajduje najwyższy adres fizyczny.
-;   2. Oblicza liczbę stron.
-;   3. Oblicza rozmiar bitmapy.
-;   4. Ustawia całą bitmapę jako zajętą.
-;   5. Zwalnia tylko EFI Conventional Memory (Type 7).
-;   6. Rezerwuje pierwsze 32 MiB.
-;   7. Rezerwuje pamięć zajętą przez samą bitmapę.
+;
+;   1. Waliduje mapę pamięci.
+;   2. Znajduje najwyższy adres fizyczny.
+;   3. Oblicza liczbę stron.
+;   4. Oblicza rozmiar bitmapy.
+;   5. Szuka miejsca na bitmapę powyżej 32 MiB.
+;   6. Inicjalizuje bitmapę jako zajętą.
+;   7. Zwalnia EfiConventionalMemory.
+;   8. Ponownie rezerwuje pierwsze 32 MiB.
+;   9. Rezerwuje obszar bitmapy.
+;
 ; ==============================================================================
 
 pmm_init:
@@ -109,6 +152,7 @@ pmm_init:
     push rdi
     push r8
     push r9
+    push r10
     push r11
     push r12
     push r13
@@ -116,48 +160,108 @@ pmm_init:
     push r15
 
 
-    ; --------------------------------------------------------------------------
-    ; Zachowaj parametry.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; PMM NA POCZĄTKU NIE JEST GOTOWY
+    ; ==========================================================================
 
-    mov r11, rcx                ; descriptor size
-    mov r12, r8                 ; mmap size
-    mov r14, r9                 ; mmap address
+    mov byte [rel pmm_ready], 0
+
+    mov qword [rel bitmap_base], 0
+    mov qword [rel bitmap_size], 0
+    mov qword [rel bitmap_page_count], 0
+    mov qword [rel max_page_count], 0
+    mov qword [rel max_physical_address], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Koniec mapy:
+    ; ==========================================================================
+    ; ZACHOWAJ PARAMETRY
+    ; ==========================================================================
+
+    mov r11, rcx                    ; descriptor size
+    mov r12, r8                     ; mmap size
+    mov r14, r9                     ; mmap address
+
+
+    ; ==========================================================================
+    ; WALIDACJA DESCRIPTOR SIZE
+    ; ==========================================================================
+
+    cmp r11, MIN_DESCRIPTOR_SIZE
+    jb .init_done
+
+
+    ; ==========================================================================
+    ; WALIDACJA ADRESU MAPY
+    ; ==========================================================================
+
+    test r14, r14
+    jz .init_done
+
+
+    ; ==========================================================================
+    ; WALIDACJA ROZMIARU MAPY
+    ; ==========================================================================
+
+    test r12, r12
+    jz .init_done
+
+
+    ; ==========================================================================
+    ; MAP SIZE MUSI BYĆ PODZIELNE PRZEZ DESCRIPTOR SIZE
     ;
-    ; R12 = adres końca mapy
-    ; --------------------------------------------------------------------------
+    ; Nie wymagamy idealnej zgodności do samego końca,
+    ; ale przynajmniej musi istnieć jeden pełny descriptor.
+    ; ==========================================================================
 
-    add r12, r14
+    cmp r12, r11
+    jb .init_done
+
+
+    ; ==========================================================================
+    ; KONIEC MAPY
+    ;
+    ; R13 = map_end
+    ; ==========================================================================
+
+    mov r13, r14
+
+    add r13, r12
+
+    jc .init_done
 
 
     ; ==========================================================================
     ; 1. ZNAJDŹ NAJWYŻSZY ADRES FIZYCZNY
     ; ==========================================================================
 
-    xor r15, r15                ; max physical address
+    xor r15, r15                    ; max physical address
 
 
 .find_max_descriptor:
 
-    cmp r14, r12
+    cmp r14, r13
     jae .max_found
 
 
     ; --------------------------------------------------------------------------
+    ; Type
+    ; --------------------------------------------------------------------------
+
+    mov eax, [r14]
+
+
+    ; --------------------------------------------------------------------------
     ; PhysicalStart
-    ; EFI_MEMORY_DESCRIPTOR:
+    ;
+    ; EFI descriptor:
     ;
     ; +0x08 = PhysicalStart
     ; +0x18 = NumberOfPages
     ; --------------------------------------------------------------------------
 
     mov rax, [r14 + 8]
-    mov rcx, [r14 + 24]
 
+    mov rcx, [r14 + 24]
 
     test rcx, rcx
     jz .next_max_descriptor
@@ -168,15 +272,18 @@ pmm_init:
     ; --------------------------------------------------------------------------
 
     mov rdx, rcx
-    shl rdx, 12
+
+    shl rdx, PAGE_SHIFT
+
+    jc .next_max_descriptor
 
     add rdx, rax
 
-    ; Overflow?
     jc .next_max_descriptor
 
 
     cmp rdx, r15
+
     jbe .next_max_descriptor
 
     mov r15, rdx
@@ -185,16 +292,20 @@ pmm_init:
 .next_max_descriptor:
 
     add r14, r11
+
+    jc .init_done
+
     jmp .find_max_descriptor
 
 
 .max_found:
 
     ; --------------------------------------------------------------------------
-    ; Brak pamięci -> zakończ PMM.
+    ; Brak pamięci fizycznej.
     ; --------------------------------------------------------------------------
 
     test r15, r15
+
     jz .init_done
 
 
@@ -202,14 +313,17 @@ pmm_init:
     ; 2. OBLICZ LICZBĘ STRON
     ; ==========================================================================
 
-    ; ceil(max_physical_address / 4096)
-
     mov rax, r15
 
-    add rax, 4095
+    add rax, PAGE_SIZE - 1
+
     jc .init_done
 
-    shr rax, 12
+    shr rax, PAGE_SHIFT
+
+    test rax, rax
+
+    jz .init_done
 
     mov [rel max_page_count], rax
 
@@ -217,41 +331,209 @@ pmm_init:
     ; ==========================================================================
     ; 3. OBLICZ ROZMIAR BITMAPY
     ;
-    ; 8 stron = 1 bajt
+    ; 8 stron = 1 bajt.
     ; ==========================================================================
 
     mov rdx, rax
 
     add rdx, 7
+
+    jc .init_done
+
     shr rdx, 3
+
+    test rdx, rdx
+
+    jz .init_done
 
     mov [rel bitmap_size], rdx
 
 
     ; ==========================================================================
-    ; 4. ZAPAMIĘTAJ KONIEC OBSZARU BITMAPY
+    ; 4. OBLICZ LICZBĘ STRON BITMAPY
     ; ==========================================================================
 
-    mov rdi, [rel bitmap_base]
+    mov rax, rdx
 
-    mov rax, rdi
-    add rax, rdx
+    add rax, PAGE_SIZE - 1
+
     jc .init_done
 
-    mov [rel max_physical_address], rax
+    shr rax, PAGE_SHIFT
+
+    test rax, rax
+
+    jz .init_done
+
+    mov [rel bitmap_page_count], rax
 
 
     ; ==========================================================================
-    ; 5. USTAW CAŁĄ BITMAPĘ JAKO ZAJĘTĄ
+    ; 5. ZNAJDŹ MIEJSCE DLA BITMAPY
+    ;
+    ; Bitmapa:
+    ;
+    ;   - musi znajdować się powyżej 32 MiB,
+    ;   - musi leżeć w EfiConventionalMemory,
+    ;   - musi mieścić się w jednym ciągłym regionie.
+    ; ==========================================================================
+
+    mov r14, r9
+
+
+.find_bitmap_region:
+
+    cmp r14, r13
+
+    jae .init_done
+
+
+    ; --------------------------------------------------------------------------
+    ; Type == EfiConventionalMemory?
+    ; --------------------------------------------------------------------------
+
+    mov eax, [r14]
+
+    cmp eax, EFI_CONVENTIONAL_MEMORY
+
+    jne .next_bitmap_region
+
+
+    ; --------------------------------------------------------------------------
+    ; PhysicalStart
+    ; --------------------------------------------------------------------------
+
+    mov rax, [r14 + 8]
+
+
+    ; --------------------------------------------------------------------------
+    ; NumberOfPages
+    ; --------------------------------------------------------------------------
+
+    mov rcx, [r14 + 24]
+
+    test rcx, rcx
+
+    jz .next_bitmap_region
+
+
+    ; ==========================================================================
+    ; USTAL POCZĄTEK KANDYDATA
+    ; ==========================================================================
+
+    mov rbx, rax
+
+    ; --------------------------------------------------------------------------
+    ; Wyrównaj do strony.
+    ; --------------------------------------------------------------------------
+
+    add rbx, PAGE_SIZE - 1
+
+    jc .next_bitmap_region
+
+    and rbx, -(PAGE_SIZE)
+
+
+    ; ==========================================================================
+    ; NIE UŻYWAJ PIERWSZYCH 32 MiB
+    ; ==========================================================================
+
+    mov rdx, FIRST_RESERVED_PAGES
+
+    shl rdx, PAGE_SHIFT
+
+    cmp rbx, rdx
+
+    jae .bitmap_start_ready
+
+    mov rbx, rdx
+
+
+.bitmap_start_ready:
+
+    ; ==========================================================================
+    ; OBLICZ KONIEC REGIONU
+    ; ==========================================================================
+
+    mov rdx, rcx
+
+    shl rdx, PAGE_SHIFT
+
+    jc .next_bitmap_region
+
+    add rdx, rax
+
+    jc .next_bitmap_region
+
+
+    ; ==========================================================================
+    ; KANDYDAT MUSI LEŻEĆ WEWNĄTRZ REGIONU
+    ; ==========================================================================
+
+    cmp rbx, rdx
+
+    jae .next_bitmap_region
+
+
+    ; ==========================================================================
+    ; SPRAWDŹ, CZY CAŁA BITMAPA SIĘ ZMIEŚCI
+    ; ==========================================================================
+
+    mov rax, [rel bitmap_page_count]
+
+    shl rax, PAGE_SHIFT
+
+    jc .next_bitmap_region
+
+    add rax, rbx
+
+    jc .next_bitmap_region
+
+
+    cmp rax, rdx
+
+    ja .next_bitmap_region
+
+
+    ; ==========================================================================
+    ; ZNALEZIONO BEZPIECZNE MIEJSCE
+    ; ==========================================================================
+
+    mov [rel bitmap_base], rbx
+
+    jmp .bitmap_region_found
+
+
+.next_bitmap_region:
+
+    add r14, r11
+
+    jc .init_done
+
+    jmp .find_bitmap_region
+
+
+.bitmap_region_found:
+
+
+    ; ==========================================================================
+    ; 6. USTAW CAŁĄ BITMAPĘ JAKO ZAJĘTĄ
     ;
     ; 1 = zajęte
     ; 0 = wolne
     ; ==========================================================================
 
-    mov rcx, rdx
+    mov rdi, [rel bitmap_base]
 
-    ; Liczba pełnych qwordów.
+    mov rcx, [rel bitmap_size]
+
+
+    ; --------------------------------------------------------------------------
+    ; Pełne QWORDY.
+    ; --------------------------------------------------------------------------
+
     mov rax, rcx
+
     shr rax, 3
 
     mov rcx, rax
@@ -262,13 +544,15 @@ pmm_init:
 
 
     ; --------------------------------------------------------------------------
-    ; Pozostałe bajty bitmapy.
+    ; Pozostałe bajty.
     ; --------------------------------------------------------------------------
 
     mov rcx, [rel bitmap_size]
+
     and rcx, 7
 
     test rcx, rcx
+
     jz .bitmap_initialized
 
 
@@ -277,6 +561,7 @@ pmm_init:
     mov byte [rdi], 0xFF
 
     inc rdi
+
     dec rcx
 
     jnz .bitmap_tail
@@ -286,9 +571,7 @@ pmm_init:
 
 
     ; ==========================================================================
-    ; 6. ZWOLNIJ EFI CONVENTIONAL MEMORY
-    ;
-    ; EFI type 7 = EfiConventionalMemory
+    ; 7. ZWOLNIJ EfiConventionalMemory
     ; ==========================================================================
 
     mov r14, r9
@@ -296,7 +579,8 @@ pmm_init:
 
 .map_loop:
 
-    cmp r14, r12
+    cmp r14, r13
+
     jae .map_done
 
 
@@ -306,7 +590,8 @@ pmm_init:
 
     mov eax, [r14]
 
-    cmp eax, 7
+    cmp eax, EFI_CONVENTIONAL_MEMORY
+
     jne .next_descriptor
 
 
@@ -324,12 +609,14 @@ pmm_init:
     mov rcx, [r14 + 24]
 
     test rcx, rcx
+
     jz .next_descriptor
 
 
 .free_pages_loop:
 
     test rcx, rcx
+
     jz .next_descriptor
 
 
@@ -338,7 +625,8 @@ pmm_init:
     ; --------------------------------------------------------------------------
 
     mov rax, rbx
-    shr rax, 12
+
+    shr rax, PAGE_SHIFT
 
 
     ; --------------------------------------------------------------------------
@@ -346,6 +634,7 @@ pmm_init:
     ; --------------------------------------------------------------------------
 
     cmp rax, [rel max_page_count]
+
     jae .skip_free_page
 
 
@@ -360,7 +649,7 @@ pmm_init:
 
 .skip_free_page:
 
-    add rbx, 4096
+    add rbx, PAGE_SIZE
 
     dec rcx
 
@@ -371,6 +660,8 @@ pmm_init:
 
     add r14, r11
 
+    jc .init_done
+
     jmp .map_loop
 
 
@@ -378,18 +669,16 @@ pmm_init:
 
 
     ; ==========================================================================
-    ; 7. ZAREZERWUJ PIERWSZE 32 MiB
-    ;
-    ; 32 MiB / 4096 = 8192 stron
+    ; 8. ZAREZERWUJ PIERWSZE 32 MiB
     ;
     ; Chroni:
-    ;   0x00000000 - 0x01FFFFFF
     ;
-    ; W tym zakresie znajdują się m.in.:
-    ;   kernel
-    ;   BootInfo
-    ;   obszary startowe
-    ;   bitmapa PMM
+    ;   - bootloader,
+    ;   - BootInfo,
+    ;   - kernel,
+    ;   - page tables,
+    ;   - inne wczesne obszary,
+    ;   - stare obszary startowe.
     ; ==========================================================================
 
     mov rdi, [rel bitmap_base]
@@ -399,11 +688,15 @@ pmm_init:
 
 .protect_first_32mb:
 
-    cmp rcx, 8192
+    cmp rcx, FIRST_RESERVED_PAGES
+
     jae .protect_first_done
 
+
     cmp rcx, [rel max_page_count]
+
     jae .protect_first_done
+
 
     bts [rdi], rcx
 
@@ -416,45 +709,47 @@ pmm_init:
 
 
     ; ==========================================================================
-    ; 8. ZAREZERWUJ OBSZAR BITMAPY
+    ; 9. ZAREZERWUJ BITMAPĘ
     ; ==========================================================================
 
     mov rax, [rel bitmap_base]
 
-    shr rax, 12
+    shr rax, PAGE_SHIFT
 
-
-    ; --------------------------------------------------------------------------
-    ; Liczba stron zajętych przez bitmapę:
-    ;
-    ; ceil(bitmap_size / 4096)
-    ; --------------------------------------------------------------------------
-
-    mov rdx, [rel bitmap_size]
-
-    add rdx, 4095
-    shr rdx, 12
-
-    test rdx, rdx
-    jz .bitmap_protected_done
+    mov rdx, [rel bitmap_page_count]
 
 
 .protect_bitmap:
 
+    test rdx, rdx
+
+    jz .bitmap_protected_done
+
+
     cmp rax, [rel max_page_count]
+
     jae .bitmap_protected_done
+
 
     mov rdi, [rel bitmap_base]
 
     bts [rdi], rax
 
     inc rax
+
     dec rdx
 
-    jnz .protect_bitmap
+    jmp .protect_bitmap
 
 
 .bitmap_protected_done:
+
+
+    ; ==========================================================================
+    ; 10. PMM GOTOWY
+    ; ==========================================================================
+
+    mov byte [rel pmm_ready], 1
 
 
 .init_done:
@@ -464,6 +759,7 @@ pmm_init:
     pop r13
     pop r12
     pop r11
+    pop r10
     pop r9
     pop r8
     pop rdi
@@ -482,7 +778,7 @@ pmm_init:
 ; Wyjście:
 ;   RAX = fizyczny adres strony 4 KiB
 ;
-;   RAX = 0 -> brak pamięci
+;   RAX = 0 -> brak pamięci / PMM niegotowy
 ; ==============================================================================
 
 pmm_alloc_page:
@@ -494,7 +790,25 @@ pmm_alloc_page:
     push r8
 
 
+    ; ==========================================================================
+    ; PMM GOTOWY?
+    ; ==========================================================================
+
+    cmp byte [rel pmm_ready], 1
+
+    jne .alloc_failed
+
+
+    ; ==========================================================================
+    ; BITMAPA MUSI ISTNIEĆ
+    ; ==========================================================================
+
     mov rdi, [rel bitmap_base]
+
+    test rdi, rdi
+
+    jz .alloc_failed
+
 
     xor rcx, rcx
 
@@ -506,12 +820,14 @@ pmm_alloc_page:
     ; --------------------------------------------------------------------------
 
     cmp rcx, [rel bitmap_size]
+
     jae .alloc_failed
 
 
     mov al, [rdi + rcx]
 
     cmp al, 0xFF
+
     jne .bit_found
 
 
@@ -523,12 +839,10 @@ pmm_alloc_page:
 .bit_found:
 
     ; --------------------------------------------------------------------------
-    ; Wolne bity:
-    ;
     ; 0 = zajęte
     ; 1 = wolne
     ;
-    ; Po NOT:
+    ; NOT daje:
     ; 1 = wolne
     ; --------------------------------------------------------------------------
 
@@ -539,18 +853,14 @@ pmm_alloc_page:
 
     ; --------------------------------------------------------------------------
     ; Znajdź pierwszy wolny bit.
-    ;
-    ; WAŻNE:
-    ; Używamy EDX, a nie BX, żeby nie pozostawić śmieci
-    ; w górnych bitach RBX.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     bsf edx, eax
 
 
     ; --------------------------------------------------------------------------
     ; page_index = byte_index * 8 + bit_index
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov r8, rcx
 
@@ -560,27 +870,28 @@ pmm_alloc_page:
 
 
     ; --------------------------------------------------------------------------
-    ; Sprawdź jeszcze raz granicę.
-    ; --------------------------------------------------------------------------
+    ; Sprawdź zakres.
+    ; ==========================================================================
 
     cmp r8, [rel max_page_count]
+
     jae .alloc_failed
 
 
     ; --------------------------------------------------------------------------
     ; Zarezerwuj stronę.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     bts [rdi], r8
 
 
     ; --------------------------------------------------------------------------
     ; physical address = page_index * 4096
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov rax, r8
 
-    shl rax, 12
+    shl rax, PAGE_SHIFT
 
     jmp .alloc_done
 
@@ -610,11 +921,6 @@ pmm_alloc_page:
 ; Wyjście:
 ;   RAX = fizyczny adres pierwszej strony
 ;   RAX = 0 -> brak odpowiedniego zakresu
-;
-; Używane przez:
-;   GUI backbuffer
-;   przyszłe bufory sprzętowe
-;   inne większe struktury
 ; ==============================================================================
 
 pmm_alloc_contiguous:
@@ -630,31 +936,43 @@ pmm_alloc_contiguous:
     push r11
 
 
+    ; ==========================================================================
+    ; PMM GOTOWY?
+    ; ==========================================================================
+
+    cmp byte [rel pmm_ready], 1
+
+    jne .contig_fail
+
+
     test rcx, rcx
+
     jz .contig_fail
 
 
-    ; --------------------------------------------------------------------------
-    ; bitmap
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; BITMAPA
+    ; ==========================================================================
 
     mov rdi, [rel bitmap_base]
 
+    test rdi, rdi
 
-    ; --------------------------------------------------------------------------
-    ; Maksymalna liczba stron.
-    ; --------------------------------------------------------------------------
+    jz .contig_fail
+
+
+    ; ==========================================================================
+    ; MAKSYMALNA LICZBA STRON
+    ; ==========================================================================
 
     mov r8, [rel max_page_count]
 
 
-    ; --------------------------------------------------------------------------
-    ; Nie przydzielaj pierwszych 32 MiB.
-    ;
-    ; 32 MiB / 4096 = 8192 stron.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; NIE PRZYDZIELAJ PIERWSZYCH 32 MiB
+    ; ==========================================================================
 
-    mov rsi, 8192
+    mov rsi, FIRST_RESERVED_PAGES
 
 
 .find_candidate:
@@ -675,6 +993,7 @@ pmm_alloc_contiguous:
     ; --------------------------------------------------------------------------
 
     cmp r10, r8
+
     ja .contig_fail
 
 
@@ -695,9 +1014,11 @@ pmm_alloc_contiguous:
 
 
     inc r11
+
     inc r10
 
     cmp r11, rcx
+
     jb .check_pages
 
 
@@ -715,19 +1036,21 @@ pmm_alloc_contiguous:
     bts [rdi], rdx
 
     inc rdx
+
     inc r11
 
     cmp r11, rcx
+
     jb .mark_pages
 
 
-    ; --------------------------------------------------------------------------
-    ; physical address = page_index * 4096
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; FIZYCZNY ADRES
+    ; ==========================================================================
 
     mov rax, rsi
 
-    shl rax, 12
+    shl rax, PAGE_SHIFT
 
     jmp .contig_done
 
@@ -765,45 +1088,94 @@ pmm_alloc_contiguous:
 ; Wejście:
 ;   RCX = fizyczny adres strony
 ;
-; Uwaga:
-;   Nie zwalniamy automatycznie pierwszych 32 MiB.
-;   Dzięki temu kernel/startup memory pozostaje chroniona.
+; Nie można zwolnić:
+;   - pierwszych 32 MiB,
+;   - stron bitmapy,
+;   - strony spoza zakresu PMM.
 ; ==============================================================================
 
 pmm_free_page:
 
     push rax
+    push rdx
     push rdi
 
 
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; PMM GOTOWY?
+    ; ==========================================================================
+
+    cmp byte [rel pmm_ready], 1
+
+    jne .free_done
+
+
+    ; ==========================================================================
     ; physical address -> page index
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov rax, rcx
 
-    shr rax, 12
+    shr rax, PAGE_SHIFT
 
 
-    ; --------------------------------------------------------------------------
-    ; Nie pozwól zwolnić strony poza zakresem PMM.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; POZA ZAKRESEM?
+    ; ==========================================================================
 
     cmp rax, [rel max_page_count]
+
     jae .free_done
 
 
-    ; --------------------------------------------------------------------------
-    ; Nigdy nie zwalniaj pierwszych 32 MiB.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; PIERWSZE 32 MiB SĄ ZAWSZE CHRONIONE
+    ; ==========================================================================
 
-    cmp rax, 8192
+    cmp rax, FIRST_RESERVED_PAGES
+
     jb .free_done
 
 
+    ; ==========================================================================
+    ; NIE ZWALNIAJ BITMAPY
+    ;
+    ; bitmap_start_page = bitmap_base >> 12
+    ; bitmap_end_page   = start + bitmap_page_count
+    ; ==========================================================================
+
+    mov rdx, [rel bitmap_base]
+
+    shr rdx, PAGE_SHIFT
+
+
     ; --------------------------------------------------------------------------
+    ; Czy page < bitmap_start?
+    ; --------------------------------------------------------------------------
+
+    cmp rax, rdx
+
+    jb .free_real_page
+
+
+    ; --------------------------------------------------------------------------
+    ; Czy page >= bitmap_end?
+    ; --------------------------------------------------------------------------
+
+    mov rdi, rdx
+
+    add rdi, [rel bitmap_page_count]
+
+    cmp rax, rdi
+
+    jb .free_done
+
+
+.free_real_page:
+
+    ; ==========================================================================
     ; page = free
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov rdi, [rel bitmap_base]
 
@@ -813,6 +1185,7 @@ pmm_free_page:
 .free_done:
 
     pop rdi
+    pop rdx
     pop rax
 
     ret
