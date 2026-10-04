@@ -3,28 +3,26 @@
 ; x86-64 / NASM
 ; ==============================================================================
 ;
+; Task 0 = kernel / idle
+; Maksymalnie 64 zadania
+;
+; Kontekst zadania:
+;   RAX RBX RCX RDX RSI RDI RBP
+;   R8  R9  R10 R11 R12 R13 R14 R15
+;   RIP CS RFLAGS
+;
 ; Scheduler:
+;   - round-robin
+;   - pełny kontekst GPR
+;   - IRETQ do przełączania zadań
+;   - task 0 jako bezpieczny fallback
 ;
-;   - task 0 = kernel / idle
-;   - maksymalnie 64 zadania
-;   - przełączanie kontekstu przez PIT IRQ0 / int 0x80
-;   - pełny kontekst: 15 rejestrów GPR
-;   - powrót do zadania przez IRETQ
-;
-; WAŻNE:
-;
-; PIT używa obecnie klasycznego 8259 PIC.
-; EOI dla PIT jest wykonywane w isr_pit_handler.
-;
+; PIT IRQ0 oraz INT 0x80 przekazują sterowanie przez JMP.
+; EOI dla PIT wykonuje pit_timer.asm.
 ; Scheduler NIE wysyła EOI do Local APIC.
 ; ==============================================================================
 
 bits 64
-
-
-; ==============================================================================
-; GLOBALS
-; ==============================================================================
 
 global scheduler_init
 global scheduler_create_task
@@ -33,112 +31,68 @@ global scheduler_yield
 global scheduler_dispatch
 global scheduler_event_loop
 
-
-; ==============================================================================
-; EXTERNALS
-; ==============================================================================
-
 extern shell_run
-
 extern usb_pop_event
 extern hid_parse_keyboard
 extern hid_parse_mouse
-
 extern gui_process_mouse_click
 extern gui_refresh_screen
-
 extern mouse_x
 extern mouse_y
 
-
-; ==============================================================================
-; CONSTANTS
-; ==============================================================================
-
 MAX_TASKS equ 64
-
-
-; ==============================================================================
-; DATA
-; ==============================================================================
 
 section .data
 
 align 8
 
-
-; ==============================================================================
-; TASK RSP TABLE
-;
-; task_rsp_table[task_id] = RSP zapisanego kontekstu
-; ==============================================================================
+; ------------------------------------------------------------------------------
+; Tablica RSP dla każdego zadania
+; ------------------------------------------------------------------------------
 
 task_rsp_table:
-
     times MAX_TASKS dq 0
 
-
-; ==============================================================================
-; READY MASK
+; ------------------------------------------------------------------------------
+; Maska aktywnych/gotowych zadań
 ;
-; bit = 1 -> zadanie gotowe
-; bit = 0 -> zadanie śpi / nie jest gotowe
-;
-; bit 0 = kernel / idle
-; ==============================================================================
+; bit 0 = task 0 / kernel idle
+; ------------------------------------------------------------------------------
 
 system_ready_mask:
-
     dq 0
 
-
-; ==============================================================================
-; CURRENT TASK
-; ==============================================================================
+; ------------------------------------------------------------------------------
+; ID aktualnie wykonywanego zadania
+; ------------------------------------------------------------------------------
 
 current_task_id:
-
     dd 0
-
-
-; ==============================================================================
-; HID EVENT BUFFER
-; ==============================================================================
 
 align 8
 
-hid_report_buf:
+; ------------------------------------------------------------------------------
+; Bufor HID
+; ------------------------------------------------------------------------------
 
+hid_report_buf:
     times 8 db 0
 
 
-; ==============================================================================
-; CODE
-; ==============================================================================
-
 section .text
-
 
 ; ==============================================================================
 ; scheduler_init
+; ==============================================================================
 ;
-; Inicjalizuje scheduler.
+; Inicjalizacja schedulera.
+; Task 0 jest zawsze gotowy jako fallback.
 ;
-; Task 0 = kernel / idle.
 ; ==============================================================================
 
 scheduler_init:
 
-    ; ==========================================================================
-    ; Task 0 jest gotowy.
-    ; ==========================================================================
-
     mov qword [rel system_ready_mask], 1
-
-    ; ==========================================================================
-    ; Aktualne zadanie = kernel.
-    ; ==========================================================================
-
     mov dword [rel current_task_id], 0
 
     ret
@@ -146,35 +100,25 @@ scheduler_init:
 
 ; ==============================================================================
 ; scheduler_create_task
-;
-; Tworzy nowe zadanie.
+; ==============================================================================
 ;
 ; WEJŚCIE:
-;
 ;   RCX = adres funkcji startowej
-;   RDX = koniec przydzielonego stosu
+;   RDX = adres końca stosu / początkowy RSP
 ;
 ; WYJŚCIE:
-;
 ;   RAX = ID zadania
-;   RAX = -1 -> brak wolnego slotu
+;   RAX = -1 jeżeli brak wolnego slotu
 ;
+; Tworzony jest początkowy kontekst:
 ;
-; Układ stosu nowego zadania:
-;
-;   [RSP + 0x00] = RAX
-;   [RSP + 0x08] = RBX
-;   [RSP + 0x10] = RCX
-;   ...
-;   [RSP + 0x70] = R15
-;
-; następnie:
-;
+;   15 x GPR
 ;   RIP
 ;   CS
 ;   RFLAGS
-;   RSP
-;   SS
+;
+; Ponieważ zadania działają w CPL0, IRETQ nie potrzebuje
+; pól RSP/SS w swoim frame.
 ;
 ; ==============================================================================
 
@@ -185,11 +129,6 @@ scheduler_create_task:
     push rdx
     push rdi
 
-
-    ; ==========================================================================
-    ; 1. ZNAJDŹ WOLNY SLOT
-    ; ==========================================================================
-
     xor edi, edi
 
 
@@ -198,157 +137,72 @@ scheduler_create_task:
     cmp rdi, MAX_TASKS
     jae .no_slot
 
-
     cmp qword [rel task_rsp_table + rdi * 8], 0
-
     je .found_slot
 
-
     inc rdi
-
     jmp .find_slot
 
-
-; ==============================================================================
-; BRAK SLOTU
-; ==============================================================================
 
 .no_slot:
 
     mov rax, -1
-
     jmp .create_done
 
 
-; ==============================================================================
-; ZNALEZIONO SLOT
-; ==============================================================================
-
 .found_slot:
-
-    ; ==========================================================================
-    ; Zachowaj ID zadania.
-    ;
-    ; RDI będzie używane przez REP STOSQ.
-    ; ==========================================================================
 
     mov rbx, rdi
 
-
-    ; ==========================================================================
-    ; 2. UTWÓRZ IRETQ FRAME
+    ; --------------------------------------------------------------------------
+    ; Budowanie IRETQ frame.
     ;
-    ; Tworzymy go od końca stosu w dół.
-    ;
-    ; Finalny układ od adresu RSP:
-    ;
-    ;   rejestry
-    ;   RIP
-    ;   CS
-    ;   RFLAGS
-    ;   RSP
-    ;   SS
-    ; ==========================================================================
-
-
-    ; ==========================================================================
-    ; SS
-    ; ==========================================================================
+    ; Najpierw RFLAGS
+    ; potem CS
+    ; potem RIP
+    ; --------------------------------------------------------------------------
 
     sub rdx, 8
-
-    mov qword [rdx], 0x10
-
-
-    ; ==========================================================================
-    ; RSP
-    ;
-    ; Zadanie po iretq dostanie stos znajdujący się
-    ; powyżej ramki startowej.
-    ; ==========================================================================
+    mov qword [rdx], 0x202          ; RFLAGS: IF=1
 
     sub rdx, 8
-
-    lea rax, [rdx + 16]
-
-    mov [rdx], rax
-
-
-    ; ==========================================================================
-    ; RFLAGS
-    ;
-    ; IF = 1
-    ; ==========================================================================
+    mov qword [rdx], 0x18           ; CS = GDT_KERNEL_CODE
 
     sub rdx, 8
+    mov [rdx], rcx                  ; RIP = funkcja zadania
 
-    mov qword [rdx], 0x202
-
-
-    ; ==========================================================================
-    ; CS
-    ; ==========================================================================
-
-    sub rdx, 8
-
-    mov qword [rdx], 0x18
-
-
-    ; ==========================================================================
-    ; RIP
-    ; ==========================================================================
-
-    sub rdx, 8
-
-    mov [rdx], rcx
-
-
-    ; ==========================================================================
-    ; 3. ZAREZERWUJ 15 REJESTRÓW
-    ;
-    ; 15 * 8 = 120 bajtów
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Rezerwa na 15 rejestrów GPR
+    ; --------------------------------------------------------------------------
 
     sub rdx, 120
 
-
-    ; ==========================================================================
-    ; 4. WYZERUJ KONTEKST REJESTRÓW
-    ; ==========================================================================
+    ; Wyzerowanie całego kontekstu GPR.
+    ;
+    ; 120 / 8 = 15 rejestrów.
+    ;
 
     mov rcx, 15
-
     mov rdi, rdx
-
     xor rax, rax
 
     rep stosq
 
-
-    ; ==========================================================================
-    ; 5. ZAPISZ RSP ZADANIA
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Zachowujemy RSP nowego zadania.
+    ; --------------------------------------------------------------------------
 
     mov [rel task_rsp_table + rbx * 8], rdx
 
-
-    ; ==========================================================================
-    ; 6. USTAW TASK JAKO GOTOWY
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Oznacz zadanie jako gotowe.
+    ; --------------------------------------------------------------------------
 
     lock bts [rel system_ready_mask], rbx
 
-
-    ; ==========================================================================
-    ; ZWRÓĆ ID
-    ; ==========================================================================
-
+    ; Zwróć ID zadania.
     mov rax, rbx
 
-
-; ==============================================================================
-; KONIEC scheduler_create_task
-; ==============================================================================
 
 .create_done:
 
@@ -362,20 +216,19 @@ scheduler_create_task:
 
 ; ==============================================================================
 ; scheduler_trigger_event
-;
-; Wybudza zadanie.
+; ==============================================================================
 ;
 ; WEJŚCIE:
-;
 ;   RCX = ID zadania
+;
+; Ustawia zadanie jako gotowe do wykonania.
+;
 ; ==============================================================================
 
 scheduler_trigger_event:
 
     cmp rcx, MAX_TASKS
-
     jae .trigger_done
-
 
     lock bts [rel system_ready_mask], rcx
 
@@ -387,78 +240,103 @@ scheduler_trigger_event:
 
 ; ==============================================================================
 ; scheduler_yield
+; ==============================================================================
 ;
-; Aktualne zadanie dobrowolnie oddaje CPU.
+; Aktualne zadanie oddaje CPU.
 ;
-; WEJŚCIE:
-;   brak
+; Task 0 nie jest usuwany z maski, ponieważ jest fallbackiem systemowym.
 ;
 ; ==============================================================================
 
 scheduler_yield:
 
-    ; ==========================================================================
-    ; Pobierz ID aktualnego zadania.
-    ; ==========================================================================
-
     mov ecx, [rel current_task_id]
 
+    ; Task 0 = kernel/idle.
+    ; Nigdy nie usuwamy go z maski gotowych zadań.
 
-    ; ==========================================================================
-    ; Usuń aktualne zadanie z ready mask.
-    ; ==========================================================================
+    test ecx, ecx
+    jz .yield_dispatch
 
     lock btr [rel system_ready_mask], rcx
 
 
-    ; ==========================================================================
-    ; Wywołaj scheduler przez INT 0x80.
-    ;
-    ; IDT powinno mieć vector 0x80 -> isr_int80_handler.
-    ; ==========================================================================
+.yield_dispatch:
 
+    ; INT 0x80 -> scheduler_dispatch
     int 0x80
-
-
-    ; ==========================================================================
-    ; Po powrocie zadanie może być kontynuowane.
-    ; ==========================================================================
 
     ret
 
 
 ; ==============================================================================
 ; scheduler_dispatch
+; ==============================================================================
 ;
-; Pełne przełączenie kontekstu.
+; Główna procedura przełączania zadań.
 ;
-; Wywoływany z:
+; Wejście może nastąpić z:
 ;
-;   1. PIT IRQ0
-;   2. INT 0x80
+;   PIT IRQ0
+;   INT 0x80
 ;
-; Na wejściu CPU ma już na stosie:
+; UWAGA:
+;   Procedura kończy się IRETQ.
+;   Nie wykonujemy tutaj RET.
 ;
-;   RIP
-;   CS
-;   RFLAGS
-;
-; Dispatcher dodaje:
-;
-;   RAX
-;   RBX
-;   RCX
-;   RDX
-;   RSI
-;   RDI
-;   RBP
-;   R8
-;   R9
-;   R10
-;   R11
-;   R12
-;   R13
-;   R14
-;   R15
-;
-; Następnie zapisuje R
+; ==============================================================================
+
+scheduler_dispatch:
+
+    ; --------------------------------------------------------------------------
+    ; Zachowaj pełny kontekst GPR.
+    ; Kolejność musi odpowiadać kolejności POP poniżej.
+    ; --------------------------------------------------------------------------
+
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; --------------------------------------------------------------------------
+    ; Zapisz RSP aktualnego zadania.
+    ; --------------------------------------------------------------------------
+
+    mov ecx, [rel current_task_id]
+
+    mov [rel task_rsp_table + rcx * 8], rsp
+
+    ; --------------------------------------------------------------------------
+    ; Task 0 jest zawsze dostępny jako fallback.
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rel system_ready_mask]
+
+    or rax, 1
+
+    mov [rel system_ready_mask], rax
+
+    ; --------------------------------------------------------------------------
+    ; Round-robin.
+    ;
+    ; Startujemy od zadania znajdującego się po aktualnym.
+    ; --------------------------------------------------------------------------
+
+    mov ecx, [rel current_task_id]
+
+    inc ecx
+
+    and ecx, 63
+
+   
