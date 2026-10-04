@@ -3,44 +3,28 @@
 ; x86-64 / NASM
 ; ==============================================================================
 ;
-; Bezpieczne ładowanie update.pkg:
+; Bezpieczny loader update.pkg.
 ;
-; - sprawdzanie magic
-; - sprawdzanie liczby modułów
-; - sprawdzanie rozmiaru pakietu
-; - sprawdzanie granic nagłówków
-; - sprawdzanie data_offset + size
-; - każdy moduł posiada własny slot 2 MiB
-; - destination musi odpowiadać slotowi modułu
-; - moduł nie może wyjść poza własny slot
-; - sprawdzanie checksum modułu
-; - statyczny skan bezpieczeństwa
-; - backup starego wektora
-; - hot-swap wektora
+; Przebieg aktualizacji jednego modułu:
 ;
-; FORMAT UPDATE.PKG
+;   1. Walidacja Vector ID
+;   2. Walidacja rozmiaru / offsetu / slotu
+;   3. AHS-TUS -> LOADING
+;   4. Static malware scan
+;   5. Kopiowanie modułu
+;   6. Backup starego Vector
+;   7. Atomowy hot-swap Vector
+;   8. AHS-TUS -> INIT
+;   9. Ponowny malware scan AKTYWNEGO modułu
+;  10. AHS-TUS -> SUCCESS
 ;
-; +00  DWORD  magic = USPK
-; +04  DWORD  version
-; +08  DWORD  module count
-; +0C  DWORD  reserved
-; +10  QWORD  XOR checksum
-; +18  module headers
+; W przypadku błędu:
 ;
-; Header modułu = 64 bajty:
-;
-; +00 DWORD  Vector ID
-; +04 DWORD  Size
-; +08 QWORD  Destination
-; +10 QWORD  Reserved
-; +18 QWORD  Reserved
-; +20 QWORD  Checksum
-; +28 QWORD  Data offset
-; +30 QWORD  Reserved
-; +38 QWORD  Reserved
+;   FAILED
+;      |
+;      +--> rollback Vector
 ;
 ; ==============================================================================
-
 
 bits 64
 
@@ -58,10 +42,23 @@ global update_rollback
 global update_is_pending
 
 
+; ==============================================================================
+; EXTERNAL
+; ==============================================================================
+
 extern tgfs_load_and_map_file
 
 extern update_register_vector
 extern update_get_vector_address
+
+extern update_begin
+extern update_mark_init
+extern update_mark_success
+extern update_mark_failed
+
+extern update_get_status
+extern update_get_error
+extern update_get_generation
 
 extern malicious_check_static
 
@@ -86,19 +83,8 @@ PKG_LOAD_ADDR       equ 0x03200000
 ; 16 modułów
 ; każdy moduł = 2 MiB
 ;
-; Slot 0:
-;   0x04000000 - 0x041FFFFF
-;
-; Slot 1:
-;   0x04200000 - 0x043FFFFF
-;
-; ...
-;
-; Slot 15:
-;   0x05E00000 - 0x05FFFFFF
-;
-; ------------------------------------------------------------------------------
- 
+; -----------------------------------------------------------------------------
+
 MODULE_LOAD_BASE    equ 0x04000000
 MODULE_SLOT_SIZE    equ 0x00200000
 MODULE_AREA_END     equ 0x06000000
@@ -121,12 +107,36 @@ MAX_VECTOR_ID       equ 31
 SATA_PORT           equ 0
 
 
+; ------------------------------------------------------------------------------
+; AHS-TUS STATUS
+; ------------------------------------------------------------------------------
+
+UPDATE_STATUS_IDLE       equ 0
+UPDATE_STATUS_LOADING    equ 1
+UPDATE_STATUS_INIT       equ 2
+UPDATE_STATUS_SUCCESS    equ 3
+UPDATE_STATUS_FAILED     equ 4
+
+
+; ------------------------------------------------------------------------------
+; AHS-TUS ERRORS
+; ------------------------------------------------------------------------------
+
+UPDATE_ERROR_NONE            equ 0
+UPDATE_ERROR_INVALID_ID      equ 1
+UPDATE_ERROR_INVALID_ADDRESS equ 2
+UPDATE_ERROR_INIT_FAILED     equ 3
+UPDATE_ERROR_TIMEOUT         equ 4
+UPDATE_ERROR_MALWARE         equ 5
+UPDATE_ERROR_VECTOR          equ 6
+UPDATE_ERROR_BAD_STATE       equ 7
+
+
 ; ==============================================================================
 ; SEKCJA DATA
 ; ==============================================================================
 
 section .data
-
 
 align 8
 
@@ -188,7 +198,12 @@ updated_count:
 ; ------------------------------------------------------------------------------
 ; Backup starych adresów wektorów.
 ;
-; 16 × 8 bajtów
+; Backup jest przechowywany kompaktowo:
+;
+;   backup_vectors[0] = pierwszy aktywowany moduł
+;   backup_vectors[1] = drugi aktywowany moduł
+;   ...
+;
 ; ------------------------------------------------------------------------------
 
 align 8
@@ -198,9 +213,7 @@ backup_vectors:
 
 
 ; ------------------------------------------------------------------------------
-; ID wektorów, które zostały zaktualizowane.
-;
-; 16 × 4 bajty
+; ID wektorów, które zostały aktywowane.
 ; ------------------------------------------------------------------------------
 
 align 4
@@ -209,21 +222,36 @@ updated_vector_ids:
     times MAX_MODULES dd 0
 
 
+; ------------------------------------------------------------------------------
+; Generacja aktualizacji dla każdego modułu.
+;
+; Zachowujemy ją również lokalnie, aby rollback/status nie korzystały
+; z przypadkowej generacji.
+; ------------------------------------------------------------------------------
+
+align 8
+
+updated_generations:
+    times MAX_MODULES dq 0
+
+
+; ==============================================================================
+; CODE
+; ==============================================================================
+
+section .text
+
+
 ; ==============================================================================
 ; UPDATE CHECK
 ; ==============================================================================
 ;
 ; Ładuje update.pkg z TGFS i sprawdza jego poprawność.
 ;
-; Zwraca:
-;
-; RAX = 1  -> poprawna aktualizacja
-; RAX = 0  -> brak aktualizacji / błąd
+; RAX = 1 -> poprawna aktualizacja
+; RAX = 0 -> brak aktualizacji / błąd
 ;
 ; ==============================================================================
-
-section .text
-
 
 update_check:
 
@@ -240,6 +268,8 @@ update_check:
 
     mov byte [rel update_pending], 0
     mov byte [rel pkg_loaded], 0
+
+    mov dword [rel pkg_module_count], 0
 
 
     ; --------------------------------------------------------------------------
@@ -319,11 +349,11 @@ update_check:
 ;
 ; Sprawdza:
 ;
-; 1. minimalny rozmiar nagłówka
-; 2. magic
-; 3. liczbę modułów
-; 4. czy wszystkie nagłówki mieszczą się w pakiecie
-; 5. checksum
+;   1. minimalny rozmiar
+;   2. magic
+;   3. liczbę modułów
+;   4. granice nagłówków
+;   5. checksum
 ;
 ; ==============================================================================
 
@@ -344,7 +374,7 @@ update_verify:
 
 
     ; --------------------------------------------------------------------------
-    ; Pakiet musi posiadać przynajmniej 24 bajty nagłówka.
+    ; Minimalny nagłówek = 24 bajty.
     ; --------------------------------------------------------------------------
 
     mov rdx, [rel tgfs_last_file_size]
@@ -379,11 +409,9 @@ update_verify:
 
 
     ; --------------------------------------------------------------------------
-    ; Oblicz rozmiar:
+    ; Rozmiar nagłówków:
     ;
-    ; 24 bajty nagłówka głównego
-    ; +
-    ; liczba modułów × 64
+    ; 24 + modules * 64
     ; --------------------------------------------------------------------------
 
     mov eax, ecx
@@ -396,7 +424,7 @@ update_verify:
 
 
     ; --------------------------------------------------------------------------
-    ; Nagłówki muszą mieścić się w rzeczywistym pliku.
+    ; Nagłówki muszą mieścić się w pliku.
     ; --------------------------------------------------------------------------
 
     mov rdx, [rel tgfs_last_file_size]
@@ -406,20 +434,14 @@ update_verify:
 
 
     ; --------------------------------------------------------------------------
-    ; CHECKSUM
-    ;
-    ; checksum znajduje się pod +10.
+    ; Checksum pakietu.
     ; --------------------------------------------------------------------------
 
     mov rbx, [rsi + 16]
 
 
     ; --------------------------------------------------------------------------
-    ; XOR wykonywany po całej części nagłówkowej.
-    ;
-    ; Rozmiar jest wielokrotnością 8:
-    ;
-    ; 24 + 64*n
+    ; Rozmiar / 8.
     ; --------------------------------------------------------------------------
 
     shr rax, 3
@@ -429,6 +451,10 @@ update_verify:
     test rcx, rcx
     jz .bad
 
+
+    ; --------------------------------------------------------------------------
+    ; XOR nagłówków.
+    ; --------------------------------------------------------------------------
 
     mov rsi, PKG_LOAD_ADDR + 24
 
@@ -487,19 +513,9 @@ update_verify:
 ; UPDATE APPLY
 ; ==============================================================================
 ;
-; Ładuje moduły z update.pkg.
+; Aktywuje wszystkie poprawne moduły z update.pkg.
 ;
-; Każdy moduł posiada dokładnie jeden slot:
-;
-; slot = MODULE_LOAD_BASE + module_index * MODULE_SLOT_SIZE
-;
-; Moduł NIE może:
-;
-; - wejść przed swój slot
-; - wejść za swój slot
-; - być niewyrównany
-; - używać innego slotu
-; - przekroczyć 2 MiB
+; Każdy moduł jest obsługiwany osobno przez AHS-TUS.
 ;
 ; ==============================================================================
 
@@ -529,7 +545,7 @@ update_apply:
 
 
     ; --------------------------------------------------------------------------
-    ; Wyzeruj licznik aktywowanych modułów.
+    ; Wyzeruj licznik.
     ; --------------------------------------------------------------------------
 
     mov dword [rel updated_count], 0
@@ -537,23 +553,11 @@ update_apply:
 
     ; --------------------------------------------------------------------------
     ; Pierwszy header modułu.
-    ;
-    ; PKG + 24
     ; --------------------------------------------------------------------------
 
     mov rsi, PKG_LOAD_ADDR + 24
 
-
-    ; --------------------------------------------------------------------------
-    ; r14d = indeks modułu.
-    ; --------------------------------------------------------------------------
-
     xor r14d, r14d
-
-
-    ; --------------------------------------------------------------------------
-    ; r15d = liczba modułów.
-    ; --------------------------------------------------------------------------
 
     mov r15d, [rel pkg_module_count]
 
@@ -568,25 +572,25 @@ update_apply:
     jae .done
 
 
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
     ; HEADER
     ;
-    ; +00 Vector ID
-    ; +04 Size
-    ; +08 Destination
-    ; +20 Checksum
-    ; +28 Data offset
-    ; --------------------------------------------------------------------------
+    ; +00 DWORD Vector ID
+    ; +04 DWORD Size
+    ; +08 QWORD Destination
+    ; +20 QWORD Checksum
+    ; +28 QWORD Data offset
+    ; ==========================================================================
 
     mov r12d, [rsi + 0]
 
     mov r13d, [rsi + 4]
 
-    mov rdi,  [rsi + 8]
+    mov rdi, [rsi + 8]
 
-    mov rbx,  [rsi + 32]
+    mov rbx, [rsi + 32]
 
-    mov r10,  [rsi + 40]
+    mov r10, [rsi + 40]
 
 
     ; ==========================================================================
@@ -594,7 +598,7 @@ update_apply:
     ; ==========================================================================
 
     cmp r12d, MAX_VECTOR_ID
-    ja .skip_module
+    ja .module_failed_metadata
 
 
     ; ==========================================================================
@@ -602,71 +606,50 @@ update_apply:
     ; ==========================================================================
 
     test r13d, r13d
-    jz .skip_module
-
-
-    ; --------------------------------------------------------------------------
-    ; Moduł nie może być większy niż jeden slot.
-    ; --------------------------------------------------------------------------
+    jz .module_failed_metadata
 
     cmp r13d, MODULE_SLOT_SIZE
-    ja .skip_module
+    ja .module_failed_metadata
 
 
     ; ==========================================================================
     ; DATA OFFSET
     ; ==========================================================================
 
-    ; --------------------------------------------------------------------------
-    ; Offset nie może wskazywać przed nagłówki.
-    ; --------------------------------------------------------------------------
-
     cmp r10, 24
-    jb .skip_module
+    jb .module_failed_metadata
 
 
     ; --------------------------------------------------------------------------
-    ; Sprawdź:
-    ;
     ; data_offset + size
-    ;
-    ; musi być <= rzeczywisty rozmiar update.pkg.
     ; --------------------------------------------------------------------------
 
     mov rax, r10
 
     add rax, r13
 
-    jc .skip_module
+    jc .module_failed_metadata
 
 
     mov rdx, [rel tgfs_last_file_size]
 
     cmp rax, rdx
-    ja .skip_module
+    ja .module_failed_metadata
 
 
-    ; --------------------------------------------------------------------------
-    ; Oblicz fizyczny adres źródła.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SOURCE ADDRESS
+    ; ==========================================================================
 
     mov r11, PKG_LOAD_ADDR
 
     add r11, r10
 
-    jc .skip_module
+    jc .module_failed_metadata
 
 
     ; ==========================================================================
-    ; WYZNACZENIE SLOTU
-    ; ==========================================================================
-    ;
-    ; Każdy moduł otrzymuje slot wynikający z indeksu.
-    ;
-    ; slot_start =
-    ;
-    ; MODULE_LOAD_BASE + index * MODULE_SLOT_SIZE
-    ;
+    ; SLOT
     ; ==========================================================================
 
     mov eax, MODULE_LOAD_BASE
@@ -677,24 +660,25 @@ update_apply:
 
     add rax, rcx
 
-    jc .skip_module
+    jc .module_failed_metadata
+
+
+    ; --------------------------------------------------------------------------
+    ; RDX = slot start
+    ; --------------------------------------------------------------------------
 
     mov rdx, rax
 
 
     ; --------------------------------------------------------------------------
-    ; rdx = początek slotu.
-    ; --------------------------------------------------------------------------
-    ;
-    ; slot_end = slot_start + 2 MiB
-    ;
+    ; RCX = slot end
     ; --------------------------------------------------------------------------
 
     mov rax, rdx
 
     add rax, MODULE_SLOT_SIZE
 
-    jc .skip_module
+    jc .module_failed_metadata
 
     mov rcx, rax
 
@@ -703,15 +687,13 @@ update_apply:
     ; DESTINATION
     ; ==========================================================================
 
-    ; --------------------------------------------------------------------------
-    ; Jeśli destination = 0:
-    ;
-    ; automatycznie ustaw początek właściwego slotu.
-    ; --------------------------------------------------------------------------
-
     test rdi, rdi
     jnz .destination_explicit
 
+
+    ; --------------------------------------------------------------------------
+    ; Destination 0 = automatyczny slot.
+    ; --------------------------------------------------------------------------
 
     mov rdi, rdx
 
@@ -721,42 +703,37 @@ update_apply:
 .destination_explicit:
 
     ; --------------------------------------------------------------------------
-    ; Explicit destination musi być:
-    ;
-    ; 1. >= początek swojego slotu
-    ; 2. < koniec swojego slotu
-    ; 3. wyrównany do 2 MiB
-    ; 4. dokładnie równy początkowi slotu
+    ; Destination musi być dokładnie początkiem własnego slotu.
     ; --------------------------------------------------------------------------
 
     cmp rdi, rdx
-    jne .skip_module
-
-
-    cmp rdi, rcx
-    jae .skip_module
-
-
-    ; --------------------------------------------------------------------------
-    ; Sprawdź wyrównanie 2 MiB.
-    ; --------------------------------------------------------------------------
-
-    test rdi, MODULE_SLOT_MASK
-    jnz .skip_module
+    jne .module_failed_metadata
 
 
 .destination_ready:
 
-    ; ==========================================================================
-    ; DODATKOWA KONTROLA OBSZARU MODUŁÓW
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Sprawdzenie wyrównania.
+    ; --------------------------------------------------------------------------
+
+    test rdi, MODULE_SLOT_MASK
+    jnz .module_failed_metadata
+
+
+    ; --------------------------------------------------------------------------
+    ; Początek obszaru.
+    ; --------------------------------------------------------------------------
 
     cmp rdi, MODULE_LOAD_BASE
-    jb .skip_module
+    jb .module_failed_metadata
 
+
+    ; --------------------------------------------------------------------------
+    ; Koniec obszaru.
+    ; --------------------------------------------------------------------------
 
     cmp rdi, MODULE_AREA_END
-    jae .skip_module
+    jae .module_failed_metadata
 
 
     ; --------------------------------------------------------------------------
@@ -767,31 +744,49 @@ update_apply:
 
     add rax, r13
 
-    jc .skip_module
+    jc .module_failed_metadata
 
 
     ; --------------------------------------------------------------------------
-    ; Moduł musi zakończyć się przed końcem swojego slotu.
-    ;
-    ; rax = destination + size
-    ; rcx = slot_end
+    ; Nie wyjdź poza slot.
     ; --------------------------------------------------------------------------
 
     cmp rax, rcx
-    ja .skip_module
+    ja .module_failed_metadata
 
 
     ; --------------------------------------------------------------------------
-    ; Dodatkowa kontrola końca całego obszaru.
+    ; Nie wyjdź poza cały obszar modułów.
     ; --------------------------------------------------------------------------
 
     cmp rax, MODULE_AREA_END
-    ja .skip_module
+    ja .module_failed_metadata
 
 
     ; ==========================================================================
-    ; STATIC SECURITY SCAN
+    ; AHS-TUS BEGIN
     ; ==========================================================================
+    ;
+    ; Vector -> LOADING
+    ;
+    ; RAX = generation
+    ; ==========================================================================
+
+    mov rcx, r12
+
+    call update_begin
+
+    cmp rax, -1
+    je .module_failed_state
+
+    mov r9, rax
+
+
+    ; ==========================================================================
+    ; STATIC MALWARE CHECK
+    ; ==========================================================================
+    ;
+    ; Sprawdzamy tylko aktualny moduł.
     ;
     ; RCX = source
     ; RDX = size
@@ -809,15 +804,13 @@ update_apply:
     push r14
     push r15
 
-
     mov rcx, r11
-
     mov rdx, r13
-
     mov r8, rbx
 
     call malicious_check_static
 
+    mov r8, rax
 
     pop r15
     pop r14
@@ -831,11 +824,11 @@ update_apply:
 
 
     ; --------------------------------------------------------------------------
-    ; Jeśli skan wykrył problem -> pomiń moduł.
+    ; Skan wykrył problem.
     ; --------------------------------------------------------------------------
 
-    test rax, rax
-    jnz .skip_module
+    test r8, r8
+    jnz .static_malware_failed
 
 
     ; ==========================================================================
@@ -843,12 +836,11 @@ update_apply:
     ; ==========================================================================
 
     mov r8, r11
-
     mov r9, rdi
 
 
     ; --------------------------------------------------------------------------
-    ; Liczba pełnych QWORD.
+    ; QWORD
     ; --------------------------------------------------------------------------
 
     mov ecx, r13d
@@ -866,27 +858,23 @@ update_apply:
 
     mov [r9], rax
 
-
     add r8, 8
-
     add r9, 8
-
 
     dec rcx
 
     jmp .copy_qword
 
 
-    ; ==========================================================================
-    ; COPY TAIL
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; Tail
+    ; --------------------------------------------------------------------------
 
 .copy_tail:
 
     mov ecx, r13d
 
     and ecx, 7
-
 
     test ecx, ecx
     jz .module_copied
@@ -898,48 +886,43 @@ update_apply:
 
     mov [r9], al
 
-
     inc r8
-
     inc r9
-
 
     dec ecx
 
     jnz .copy_byte
 
 
-    ; ==========================================================================
-    ; MODULE COPIED
-    ; ==========================================================================
+; ==============================================================================
+; MODULE COPIED
+; ==============================================================================
 
 .module_copied:
 
-    ; --------------------------------------------------------------------------
-    ; Pobierz stary adres wektora.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; BACKUP STAREGO VECTOR
+    ; ==========================================================================
 
     mov ecx, r12d
 
     call update_get_vector_address
 
-
     ; --------------------------------------------------------------------------
-    ; Zapisz backup.
-    ; --------------------------------------------------------------------------
-
-    mov [rel backup_vectors + r14 * 8], rax
-
-
-    ; --------------------------------------------------------------------------
-    ; Zapamiętaj Vector ID.
+    ; Index backupu = updated_count
     ; --------------------------------------------------------------------------
 
-    mov [rel updated_vector_ids + r14 * 4], r12d
+    mov edx, [rel updated_count]
+
+    mov [rel backup_vectors + rdx * 8], rax
+
+    mov [rel updated_vector_ids + rdx * 4], r12d
+
+    mov [rel updated_generations + rdx * 8], r9
 
 
     ; ==========================================================================
-    ; AKTYWACJA NOWEGO MODUŁU
+    ; HOT SWAP
     ; ==========================================================================
 
     mov rcx, r12
@@ -948,25 +931,218 @@ update_apply:
 
     call update_register_vector
 
+    test rax, rax
+    jnz .vector_failed
 
-    ; --------------------------------------------------------------------------
-    ; Jeśli rejestracja się nie udała:
+
+    ; ==========================================================================
+    ; INIT
+    ; ==========================================================================
     ;
-    ; moduł pozostaje skopiowany, ale nie zostaje policzony jako aktywny.
-    ; --------------------------------------------------------------------------
+    ; LOADING -> INIT
+    ; ==========================================================================
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    call update_mark_init
 
     test rax, rax
-    jnz .skip_module
+    jnz .init_failed
 
+
+    ; ==========================================================================
+    ; POST-ACTIVATION MALWARE SCAN
+    ; ==========================================================================
+    ;
+    ; Skanujemy teraz rzeczywisty obraz modułu znajdujący się już w jego slocie.
+    ;
+    ; To pozwala wykryć zmianę obrazu po skopiowaniu.
+    ;
+    ; ==========================================================================
+
+    mov rcx, rdi
+
+    mov rdx, r13
+
+    mov r8, rbx
+
+    call malicious_check_static
+
+    test rax, rax
+    jnz .post_scan_failed
+
+
+    ; ==========================================================================
+    ; SUCCESS
+    ; ==========================================================================
+    ;
+    ; INIT -> SUCCESS
+    ; ==========================================================================
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    call update_mark_success
+
+    test rax, rax
+    jnz .success_state_failed
+
+
+    ; --------------------------------------------------------------------------
+    ; Moduł został poprawnie aktywowany.
+    ; --------------------------------------------------------------------------
 
     inc dword [rel updated_count]
+
+    jmp .next_module
+
+
+; ==============================================================================
+; METADATA FAILURE
+; ==============================================================================
+
+.module_failed_metadata:
+
+    ; --------------------------------------------------------------------------
+    ; Jeżeli Vector ID jest poprawny, możemy oznaczyć FAILED.
+    ; --------------------------------------------------------------------------
+
+    cmp r12d, MAX_VECTOR_ID
+    ja .next_module
+
+    mov rcx, r12
+
+    call update_begin
+
+    cmp rax, -1
+    je .next_module
+
+    mov r9, rax
+
+    mov rcx, r12
+    mov rdx, r9
+    mov r8d, UPDATE_ERROR_VECTOR
+
+    call update_mark_failed
+
+    jmp .next_module
+
+
+; ==============================================================================
+; AHS-TUS STATE FAILURE
+; ==============================================================================
+
+.module_failed_state:
+
+    jmp .next_module
+
+
+; ==============================================================================
+; STATIC MALWARE FAILURE
+; ==============================================================================
+
+.static_malware_failed:
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    mov r8d, UPDATE_ERROR_MALWARE
+
+    call update_mark_failed
+
+    jmp .next_module
+
+
+; ==============================================================================
+; VECTOR FAILURE
+; ==============================================================================
+
+.vector_failed:
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    mov r8d, UPDATE_ERROR_VECTOR
+
+    call update_mark_failed
+
+    jmp .next_module
+
+
+; ==============================================================================
+; INIT FAILURE
+; ==============================================================================
+
+.init_failed:
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    mov r8d, UPDATE_ERROR_INIT_FAILED
+
+    call update_mark_failed
+
+    jmp .rollback_current
+
+
+; ==============================================================================
+; POST SCAN FAILURE
+; ==============================================================================
+
+.post_scan_failed:
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    mov r8d, UPDATE_ERROR_MALWARE
+
+    call update_mark_failed
+
+    jmp .rollback_current
+
+
+; ==============================================================================
+; SUCCESS STATE FAILURE
+; ==============================================================================
+
+.success_state_failed:
+
+    mov rcx, r12
+
+    mov rdx, r9
+
+    mov r8d, UPDATE_ERROR_BAD_STATE
+
+    call update_mark_failed
+
+    jmp .rollback_current
+
+
+; ==============================================================================
+; ROLLBACK CURRENT
+; ==============================================================================
+
+.rollback_current:
+
+    mov rcx, r12
+
+    call update_rollback
+
+    jmp .next_module
 
 
 ; ==============================================================================
 ; NEXT MODULE
 ; ==============================================================================
 
-.skip_module:
+.next_module:
 
     add rsi, 64
 
@@ -1024,8 +1200,8 @@ update_apply:
 ; UPDATE ROLLBACK
 ; ==============================================================================
 ;
-; RCX = -1 -> rollback wszystkich
-; RCX = ID  -> rollback konkretnego wektora
+; RCX = -1 -> rollback wszystkich aktywnych modułów
+; RCX = Vector ID -> rollback konkretnego modułu
 ;
 ; ==============================================================================
 
@@ -1041,21 +1217,21 @@ update_rollback:
 
 
     ; --------------------------------------------------------------------------
-    ; Zapamiętaj żądanie rollback.
+    ; Zachowaj żądanie.
     ; --------------------------------------------------------------------------
 
     mov r12, rcx
 
 
     ; --------------------------------------------------------------------------
-    ; Licznik wykonanych rollbacków.
+    ; Liczba rollbacków.
     ; --------------------------------------------------------------------------
 
     xor r13d, r13d
 
 
     ; --------------------------------------------------------------------------
-    ; Liczba zaktualizowanych modułów.
+    ; Liczba aktywnych modułów.
     ; --------------------------------------------------------------------------
 
     mov ebx, [rel updated_count]
@@ -1078,23 +1254,18 @@ update_rollback:
 
 
     ; --------------------------------------------------------------------------
-    ; Pobierz Vector ID.
+    ; Vector ID.
     ; --------------------------------------------------------------------------
 
     mov edx, [rel updated_vector_ids + rcx * 4]
 
 
     ; --------------------------------------------------------------------------
-    ; RCX argument = -1 -> rollback wszystko.
+    ; Jeśli rollback konkretnego ID:
     ; --------------------------------------------------------------------------
 
     cmp r12, -1
     je .rollback_this
-
-
-    ; --------------------------------------------------------------------------
-    ; Jeśli żądany ID różni się od aktualnego -> następny.
-    ; --------------------------------------------------------------------------
 
     cmp rdx, r12
     jne .next
@@ -1103,35 +1274,48 @@ update_rollback:
 .rollback_this:
 
     ; --------------------------------------------------------------------------
-    ; Index -> offset backupu.
+    ; Pobierz backup.
     ; --------------------------------------------------------------------------
 
     mov rax, rcx
 
     shl rax, 3
 
-
-    ; --------------------------------------------------------------------------
-    ; Pobierz stary adres.
-    ; --------------------------------------------------------------------------
-
     mov rsi, [rel backup_vectors + rax]
 
 
     ; --------------------------------------------------------------------------
-    ; Brak starego adresu.
+    ; Jeśli nie ma starego Vector:
+    ; wyzeruj Vector.
     ; --------------------------------------------------------------------------
 
     test rsi, rsi
-    jz .clear_backup
+    jnz .restore_vector
 
 
     ; --------------------------------------------------------------------------
-    ; Przywróć stary wektor.
+    ; Brak poprzedniego adresu.
+    ; --------------------------------------------------------------------------
+
+    mov rcx, rdx
+
+    xor edx, edx
+
+    ; update_register_vector odrzuca 0,
+    ; dlatego przy braku starego adresu nie wykonujemy rejestracji.
+    ;
+    ; Vector pozostaje taki jak jest tylko w tym szczególnym przypadku.
+    ;
+    jmp .clear_backup
+
+
+.restore_vector:
+
+    ; --------------------------------------------------------------------------
+    ; Przywróć stary Vector.
     ; --------------------------------------------------------------------------
 
     push rcx
-
 
     mov rcx, rdx
 
@@ -1139,9 +1323,10 @@ update_rollback:
 
     call update_register_vector
 
-
     pop rcx
 
+    test rax, rax
+    jnz .clear_backup
 
     inc r13d
 
@@ -1159,6 +1344,13 @@ update_rollback:
     mov qword [rel backup_vectors + rax], 0
 
 
+    ; --------------------------------------------------------------------------
+    ; Wyzeruj ID.
+    ; --------------------------------------------------------------------------
+
+    mov dword [rel updated_vector_ids + rcx * 4], 0
+
+
 .next:
 
     inc ecx
@@ -1172,8 +1364,19 @@ update_rollback:
 
 .done:
 
-    mov eax, r13d
+    ; --------------------------------------------------------------------------
+    ; Jeśli wykonaliśmy rollback wszystkich, licznik aktywnych modułów = 0.
+    ; --------------------------------------------------------------------------
 
+    cmp r12, -1
+    jne .return_count
+
+    mov dword [rel updated_count], 0
+
+
+.return_count:
+
+    mov eax, r13d
 
     pop r13
     pop r12
@@ -1187,13 +1390,12 @@ update_rollback:
 
 
 ; ==============================================================================
-; NOTHING TO ROLLBACK
+; NOTHING
 ; ==============================================================================
 
 .nothing:
 
     xor eax, eax
-
 
     pop r13
     pop r12
@@ -1209,8 +1411,6 @@ update_rollback:
 ; ==============================================================================
 ; UPDATE IS PENDING
 ; ==============================================================================
-;
-; Zwraca:
 ;
 ; RAX = 1 -> aktualizacja oczekuje
 ; RAX = 0 -> brak aktualizacji
