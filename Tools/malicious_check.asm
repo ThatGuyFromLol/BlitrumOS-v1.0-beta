@@ -1,33 +1,32 @@
-; ==============================================================================
-;        MALICIOUS CODE DETECTOR — STATYCZNY SKANER BINAREK
-; ==============================================================================
-; Nazwa pliku:   malicious_check.asm
-; Architektura:  x86_64 (Long Mode)
-; Składnia:      NASM (Intel)
+; =============================================================================
+; BLITRUM OS - MALICIOUS MODULE CHECKER
+; =============================================================================
+; Plik: Tools/malicious_check.asm
 ;
-; OCHRONA DWUPOZIOMOWA:
-;   Poziom 1 — Statyczny skaner (przed załadowaniem modułu):
-;     - Weryfikacja checksum XOR-64
-;     - Skanowanie wzorców niebezpiecznych instrukcji (blacklist)
-;     - Weryfikacja rozmiaru modułu
-;     - Wykrywanie shellcode padów (0x90 NOP sled)
+; API:
+;   malicious_check_static
+;   malicious_check_runtime
+;   mcd_get_last_error
+;   mcd_get_error_offset
 ;
-;   Poziom 2 — Runtime Guard (podczas działania modułu):
-;     - Moduł dostaje własny chroniony przedział RAM
-;     - Każdy zapis poza przedział → natychmiastowy rollback
-;     - Próba wykonania kodu spoza przedziału → rollback
+; malicious_check_static:
+;   RDI = adres modułu
+;   RSI = rozmiar modułu
+;   RDX = oczekiwany checksum XOR
 ;
-; Zwracane kody błędów:
-;   0  = OK — moduł bezpieczny
-;   1  = Zły checksum
-;   2  = Niebezpieczna instrukcja (blacklist)
-;   3  = NOP sled (shellcode padding)
-;   4  = Moduł za duży
-;   5  = Moduł za mały (podejrzane — może być stub)
-;   6  = Próba zapisu poza obszar RAM modułu (runtime)
-; ==============================================================================
+;   RAX = 0 -> OK
+;   RAX = 1 -> moduł odrzucony
+;
+; malicious_check_runtime:
+;   RCX = Vector ID
+;   RDX = adres naruszenia / CR2
+;
+;   RAX = 0 -> OK
+;   RAX = 1 -> naruszenie
+; =============================================================================
 
 bits 64
+
 section .text
 
 global malicious_check_static
@@ -37,302 +36,596 @@ global mcd_get_error_offset
 
 extern update_rollback
 
-; --- LIMITY ROZMIARU MODUŁU ---
-MODULE_MAX_SIZE     equ 0x00200000   ; 2MB maksymalnie
-MODULE_MIN_SIZE     equ 0x00000010   ; 16 bajtów minimum
-NOP_SLED_THRESHOLD  equ 16           ; 16 kolejnych NOP = podejrzane
+; =============================================================================
+; KONFIGURACJA
+; =============================================================================
 
-; --- PRZEDZIAŁY PAMIĘCI DOZWOLONE DLA MODUŁÓW ---
-MODULE_RAM_BASE     equ 0x03000000   ; Start obszaru modułów
-MODULE_RAM_END      equ 0x03100000   ; Koniec obszaru modułów (1MB)
+MODULE_MAX_SIZE        equ 0x00200000
+MODULE_MIN_SIZE        equ 0x10
+
+; Aktualny obszar slotów AHS-TUS
+MODULE_RAM_BASE        equ 0x04000000
+MODULE_RAM_END         equ 0x06000000
+
+NOP_SLED_THRESHOLD     equ 16
+
+; =============================================================================
+; KODY BŁĘDÓW
+; =============================================================================
+
+MCD_ERROR_NONE         equ 0
+MCD_ERROR_SIZE         equ 1
+MCD_ERROR_CHECKSUM     equ 2
+MCD_ERROR_NOP_SLED     equ 3
+MCD_ERROR_BLACKLIST    equ 4
+MCD_ERROR_ADDRESS      equ 5
+
+; =============================================================================
+; DANE
+; =============================================================================
 
 section .data
-align 8
-last_error:         dd 0             ; Ostatni kod błędu
-error_offset:       dq 0             ; Offset w module gdzie wykryto błąd
 
-; ==============================================================================
-; BLACKLISTA NIEBEZPIECZNYCH WZORCÓW INSTRUKCJI
-;
-; Każdy wpis: 4 bajty wzorca + 1 bajt maski (ile bajtów sprawdzać) + 3 bajty opis
-; Format: db bajt1, bajt2, bajt3, bajt4, maska, 0, 0, 0
-;
-; Blokujemy:
-;   - Bezpośredni zapis do CR0/CR3/CR4 (zmiana trybu/stron)
-;   - LGDT / LIDT (podmiana tablic systemowych)
-;   - IN / OUT (bezpośredni dostęp do portów I/O)
-;   - CLI (wyłączenie przerwań na stałe)
-;   - MOV do MSR (WRMSR — zapis do rejestrów modelu)
-;   - HLT poza kernelem
-;   - INVLPG (unieważnienie TLB)
-;   - Skoki do adresów poza obszarem modułów
-; ==============================================================================
 align 8
-blacklist:
-    ; MOV CR0, reg  (0F 22 C0..CF) — zmiana trybu procesora
-    db 0x0F, 0x22, 0xC0, 0x00,   3, 0, 0, 0
-    ; MOV CR3, reg  (0F 22 D8..DF) — podmiana tablicy stron
-    db 0x0F, 0x22, 0xD8, 0x00,   3, 0, 0, 0
-    ; MOV CR4, reg  (0F 22 E0..EF) — zmiana flag CPU
-    db 0x0F, 0x22, 0xE0, 0x00,   3, 0, 0, 0
-    ; LGDT (0F 01 /2) — podmiana GDT
-    db 0x0F, 0x01, 0x10, 0x00,   2, 0, 0, 0
-    ; LIDT (0F 01 /3) — podmiana IDT
-    db 0x0F, 0x01, 0x18, 0x00,   2, 0, 0, 0
-    ; WRMSR (0F 30) — zapis do rejestrów modelu CPU
-    db 0x0F, 0x30, 0x00, 0x00,   2, 0, 0, 0
-    ; INVLPG (0F 01 38) — unieważnienie TLB
-    db 0x0F, 0x01, 0x38, 0x00,   3, 0, 0, 0
-    ; IN AL, DX  (EC) — odczyt z portu I/O
-    db 0xEC, 0x00, 0x00, 0x00,   1, 0, 0, 0
-    ; IN EAX, DX (ED) — odczyt z portu I/O (32-bit)
-    db 0xED, 0x00, 0x00, 0x00,   1, 0, 0, 0
-    ; OUT DX, AL  (EE) — zapis do portu I/O
-    db 0xEE, 0x00, 0x00, 0x00,   1, 0, 0, 0
-    ; OUT DX, EAX (EF) — zapis do portu I/O (32-bit)
-    db 0xEF, 0x00, 0x00, 0x00,   1, 0, 0, 0
-    ; CLI (FA) — wyłączenie przerwań
-    db 0xFA, 0x00, 0x00, 0x00,   1, 0, 0, 0
-    ; HLT (F4) — zatrzymanie procesora
-    db 0xF4, 0x00, 0x00, 0x00,   1, 0, 0, 0
-blacklist_end:
 
-BLACKLIST_ENTRY_SIZE equ 8
-BLACKLIST_COUNT equ (blacklist_end - blacklist) / BLACKLIST_ENTRY_SIZE
+mcd_last_error:
+    dq MCD_ERROR_NONE
+
+mcd_error_offset:
+    dq 0
+
+; =============================================================================
+; KODY INSTRUKCJI
+; =============================================================================
+
+; 1-byte
+OP_CLI                  equ 0xFA
+OP_HLT                  equ 0xF4
+
+OP_IN_AL_IMM            equ 0xE4
+OP_IN_EAX_IMM           equ 0xE5
+OP_OUT_IMM_AL           equ 0xE6
+OP_OUT_IMM_EAX          equ 0xE7
+
+OP_IN_AL_DX             equ 0xEC
+OP_IN_EAX_DX            equ 0xED
+OP_OUT_DX_AL            equ 0xEE
+OP_OUT_DX_EAX           equ 0xEF
+
+; 0F xx
+OP0F_INVLPG             equ 0x01
+OP0F_MOV_FROM_CR        equ 0x20
+OP0F_MOV_TO_CR          equ 0x22
+OP0F_WRMSR              equ 0x30
+
+; =============================================================================
+; CODE
+; =============================================================================
 
 section .text
 
-; ==============================================================================
-; FUNKCJA: malicious_check_static
-; Skanuje moduł przed załadowaniem.
+; =============================================================================
+; malicious_check_static
 ;
-; Wejście:
-;   RCX = Adres bufora z danymi modułu w RAM
-;   RDX = Rozmiar modułu w bajtach
-;   R8  = Oczekiwany checksum XOR-64
-;
-; Zwraca:
-;   RAX = 0 OK, lub kod błędu (1-5)
-; ==============================================================================
+; RDI = module
+; RSI = size
+; RDX = expected checksum
+; =============================================================================
+
 malicious_check_static:
+
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
     push r12
     push r13
     push r14
+    push r15
 
-    mov r12, rcx                ; R12 = adres modułu
-    mov r13, rdx                ; R13 = rozmiar
-    mov r14, r8                 ; R14 = oczekiwany checksum
+    ; -------------------------------------------------------------------------
+    ; reset status
+    ; -------------------------------------------------------------------------
 
-    ; --- TEST 1: Rozmiar modułu ---
-    cmp r13, MODULE_MIN_SIZE
-    jb .err_too_small
+    mov qword [rel mcd_last_error], MCD_ERROR_NONE
+    mov qword [rel mcd_error_offset], 0
 
-    cmp r13, MODULE_MAX_SIZE
-    ja .err_too_big
+    ; -------------------------------------------------------------------------
+    ; address
+    ; -------------------------------------------------------------------------
 
-    ; --- TEST 2: Checksum XOR-64 ---
-    mov rsi, r12
-    mov rcx, r13
-    shr rcx, 3                  ; Liczba qwordów
-    xor rax, rax
-.checksum_loop:
-    xor rax, [rsi]
-    add rsi, 8
+    test rdi, rdi
+    jz .bad_address
+
+    ; -------------------------------------------------------------------------
+    ; size
+    ; -------------------------------------------------------------------------
+
+    cmp rsi, MODULE_MIN_SIZE
+    jb .bad_size
+
+    cmp rsi, MODULE_MAX_SIZE
+    ja .bad_size
+
+    ; -------------------------------------------------------------------------
+    ; address + size overflow
+    ; -------------------------------------------------------------------------
+
+    mov rax, rdi
+    add rax, rsi
+    jc .bad_address
+
+    ; -------------------------------------------------------------------------
+    ; CHECKSUM
+    ;
+    ; XOR pełnych QWORD + pozostałych bajtów.
+    ; -------------------------------------------------------------------------
+
+    mov r8, rdi
+    mov r9, rsi
+
+    xor r10, r10
+
+    mov rcx, r9
+    shr rcx, 3
+
+.check_qword:
+
+    test rcx, rcx
+    jz .check_remainder
+
+    xor r10, qword [r8]
+
+    add r8, 8
     dec rcx
-    jnz .checksum_loop
 
-    cmp rax, r14
-    jne .err_checksum
+    jmp .check_qword
 
-    ; --- TEST 3: NOP sled detection ---
-    ; Szukamy 16 lub więcej kolejnych bajtów 0x90 (NOP)
-    mov rsi, r12
-    mov rcx, r13
-    xor rbx, rbx                ; RBX = licznik kolejnych NOP
+.check_remainder:
+
+    mov rcx, r9
+    and rcx, 7
+
+    test rcx, rcx
+    jz .checksum_done
+
+    xor r11, r11
+
+.check_byte:
+
+    movzx rax, byte [r8]
+
+    ; przesunięcie zgodne z pozycją pozostałego bajtu
+    mov r12, r11
+    shl r12, 3
+
+    mov cl, r12b
+    shl rax, cl
+
+    xor r10, rax
+
+    inc r8
+    inc r11
+
+    cmp r11, 8
+    jb .check_byte
+
+.checksum_done:
+
+    cmp r10, rdx
+    jne .bad_checksum
+
+    ; -------------------------------------------------------------------------
+    ; NOP SLED
+    ; -------------------------------------------------------------------------
+
+    xor r10, r10
+    xor r11, r11
+
 .nop_scan:
-    cmp rcx, 0
-    je .nop_ok
-    mov al, [rsi]
+
+    cmp r10, r9
+    jae .instruction_scan_start
+
+    mov al, byte [rdi + r10]
+
     cmp al, 0x90
     jne .nop_reset
-    inc rbx
-    cmp rbx, NOP_SLED_THRESHOLD
-    jae .err_nop_sled
-    jmp .nop_next
-.nop_reset:
-    xor rbx, rbx
-.nop_next:
-    inc rsi
-    dec rcx
+
+    inc r11
+
+    cmp r11, NOP_SLED_THRESHOLD
+    jae .bad_nop
+
+    inc r10
     jmp .nop_scan
-.nop_ok:
 
-    ; --- TEST 4: Blacklist scan ---
-    ; Dla każdego bajtu w module sprawdzamy czy pasuje do wzorca z blacklisty
-    mov r13, rdx                ; Przywróć rozmiar
-    mov rsi, r12                ; RSI = aktualny bajt w module
-    mov rcx, r13
-.scan_loop:
-    cmp rcx, 0
-    je .scan_ok
+.nop_reset:
 
-    ; Sprawdź każdy wpis blacklisty
-    lea rdi, [rel blacklist]
-    mov rbx, BLACKLIST_COUNT
-.bl_loop:
-    test rbx, rbx
-    jz .bl_next_byte
+    xor r11, r11
+    inc r10
 
-    ; Pobierz maskę (ile bajtów porównywać)
-    movzx r8, byte [rdi + 4]    ; R8 = maska (liczba bajtów do sprawdzenia)
+    jmp .nop_scan
 
-    ; Upewnij się że mamy wystarczająco bajtów w module
-    cmp r8, rcx
-    ja .bl_next_entry
+    ; -------------------------------------------------------------------------
+    ; INSTRUCTION SCAN
+    ;
+    ; Nie jest to pełny disassembler.
+    ; Rozpoznajemy instrukcje bezpieczeństwa, które mają jednoznaczne
+    ; kodowanie.
+    ; -------------------------------------------------------------------------
 
-    ; Porównaj bajty wzorca z aktualną pozycją w module
-    push rsi
-    push rcx
-    mov rcx, r8
-.compare_loop:
-    mov al, [rsi]
-    mov ah, [rdi + rcx - 1]
-    cmp al, ah
-    jne .compare_fail
-    inc rsi
-    dec rcx
-    jnz .compare_loop
+.instruction_scan_start:
 
-    ; Wzorzec pasuje — niebezpieczna instrukcja!
-    pop rcx
-    pop rsi
-    ; Zapisz offset gdzie znaleziono
-    mov rax, rsi
-    sub rax, r12
-    mov [error_offset], rax
-    jmp .err_blacklist
+    xor r10, r10
 
-.compare_fail:
-    pop rcx
-    pop rsi
+.instruction_loop:
 
-.bl_next_entry:
-    add rdi, BLACKLIST_ENTRY_SIZE
-    dec rbx
-    jmp .bl_loop
+    cmp r10, r9
+    jae .success
 
-.bl_next_byte:
-    inc rsi
-    dec rcx
-    jmp .scan_loop
+    movzx eax, byte [rdi + r10]
 
-.scan_ok:
-    ; Wszystkie testy przeszły — moduł bezpieczny
-    mov dword [last_error], 0
-    mov qword [error_offset], 0
-    xor rax, rax
-    jmp .exit
+    ; -------------------------------------------------------------------------
+    ; CLI
+    ; -------------------------------------------------------------------------
 
-.err_checksum:
-    mov dword [last_error], 1
-    mov rax, 1
-    jmp .exit
+    cmp al, OP_CLI
+    je .bad_instruction
 
-.err_blacklist:
-    mov dword [last_error], 2
-    mov rax, 2
-    jmp .exit
+    ; -------------------------------------------------------------------------
+    ; HLT
+    ; -------------------------------------------------------------------------
 
-.err_nop_sled:
-    mov dword [last_error], 3
-    mov rax, 3
-    jmp .exit
+    cmp al, OP_HLT
+    je .bad_instruction
 
-.err_too_big:
-    mov dword [last_error], 4
-    mov rax, 4
-    jmp .exit
+    ; -------------------------------------------------------------------------
+    ; IN/OUT immediate
+    ; -------------------------------------------------------------------------
 
-.err_too_small:
-    mov dword [last_error], 5
-    mov rax, 5
-    jmp .exit
+    cmp al, OP_IN_AL_IMM
+    je .bad_instruction
 
-.exit:
+    cmp al, OP_IN_EAX_IMM
+    je .bad_instruction
+
+    cmp al, OP_OUT_IMM_AL
+    je .bad_instruction
+
+    cmp al, OP_OUT_IMM_EAX
+    je .bad_instruction
+
+    ; -------------------------------------------------------------------------
+    ; IN/OUT DX
+    ; -------------------------------------------------------------------------
+
+    cmp al, OP_IN_AL_DX
+    je .bad_instruction
+
+    cmp al, OP_IN_EAX_DX
+    je .bad_instruction
+
+    cmp al, OP_OUT_DX_AL
+    je .bad_instruction
+
+    cmp al, OP_OUT_DX_EAX
+    je .bad_instruction
+
+    ; -------------------------------------------------------------------------
+    ; sprawdź prefix 0F
+    ; -------------------------------------------------------------------------
+
+    cmp al, 0x0F
+    jne .next_instruction
+
+    ; musi istnieć drugi bajt
+    mov r11, r9
+    sub r11, r10
+
+    cmp r11, 2
+    jb .next_instruction
+
+    movzx ebx, byte [rdi + r10 + 1]
+
+    ; -------------------------------------------------------------------------
+    ; 0F 30 = WRMSR
+    ; -------------------------------------------------------------------------
+
+    cmp bl, OP0F_WRMSR
+    je .bad_instruction_2
+
+    ; -------------------------------------------------------------------------
+    ; 0F 20 / 0F 22 = MOV CRx
+    ;
+    ; ModR/M:
+    ;
+    ; 0F 20 /r
+    ; 0F 22 /r
+    ;
+    ; MOV CR:
+    ;   mod = 11b
+    ;
+    ; reg = numer CR
+    ;
+    ; Odrzucamy CR0, CR3 i CR4.
+    ; Pozostałe CR również są traktowane jako uprzywilejowane.
+    ; -------------------------------------------------------------------------
+
+    cmp bl, OP0F_MOV_FROM_CR
+    je .check_mov_cr
+
+    cmp bl, OP0F_MOV_TO_CR
+    je .check_mov_cr
+
+    ; -------------------------------------------------------------------------
+    ; 0F 01 /r
+    ;
+    ; ModR/M reg field:
+    ;
+    ; /0 = SGDT
+    ; /1 = SIDT
+    ; /2 = LGDT
+    ; /3 = LIDT
+    ; /4 = SMSW
+    ; /7 = INVLPG
+    ;
+    ; Dla bezpieczeństwa blokujemy LGDT, LIDT oraz INVLPG.
+    ; SGDT/SIDT/SMSW pozostawiamy dozwolone.
+    ; -------------------------------------------------------------------------
+
+    cmp bl, OP0F_INVLPG
+    jne .next_instruction
+
+    ; musi istnieć ModR/M
+    mov r11, r9
+    sub r11, r10
+
+    cmp r11, 3
+    jb .next_instruction
+
+    movzx eax, byte [rdi + r10 + 2]
+
+    ; ModR/M reg = b5..b3
+    mov ecx, eax
+    shr ecx, 3
+    and ecx, 7
+
+    ; /2 = LGDT
+    cmp ecx, 2
+    je .bad_instruction_3
+
+    ; /3 = LIDT
+    cmp ecx, 3
+    je .bad_instruction_3
+
+    ; /7 = INVLPG
+    cmp ecx, 7
+    je .bad_instruction_3
+
+    jmp .next_instruction
+
+.check_mov_cr:
+
+    ; musi istnieć ModR/M
+    mov r11, r9
+    sub r11, r10
+
+    cmp r11, 3
+    jb .next_instruction
+
+    movzx eax, byte [rdi + r10 + 2]
+
+    ; Mod musi być 11b.
+    ; Jeżeli nie jest, to nie jest prawidłowe MOV CR.
+    mov ecx, eax
+    shr ecx, 6
+    and ecx, 3
+
+    cmp ecx, 3
+    jne .next_instruction
+
+    ; reg field = CR number
+    mov ecx, eax
+    shr ecx, 3
+    and ecx, 7
+
+    ; CR0
+    cmp ecx, 0
+    je .bad_instruction_3
+
+    ; CR2
+    cmp ecx, 2
+    je .bad_instruction_3
+
+    ; CR3
+    cmp ecx, 3
+    je .bad_instruction_3
+
+    ; CR4
+    cmp ecx, 4
+    je .bad_instruction_3
+
+    ; CR8
+    cmp ecx, 8
+    jae .bad_instruction_3
+
+    jmp .next_instruction
+
+    ; -------------------------------------------------------------------------
+    ; następny bajt
+    ; -------------------------------------------------------------------------
+
+.next_instruction:
+
+    inc r10
+    jmp .instruction_loop
+
+    ; -------------------------------------------------------------------------
+    ; ERROR
+    ; -------------------------------------------------------------------------
+
+.bad_instruction:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_BLACKLIST
+    mov [rel mcd_error_offset], r10
+
+    mov eax, 1
+    jmp .done
+
+.bad_instruction_2:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_BLACKLIST
+    mov [rel mcd_error_offset], r10
+
+    mov eax, 1
+    jmp .done
+
+.bad_instruction_3:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_BLACKLIST
+    mov [rel mcd_error_offset], r10
+
+    mov eax, 1
+    jmp .done
+
+.bad_address:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_ADDRESS
+    mov qword [rel mcd_error_offset], 0
+
+    mov eax, 1
+    jmp .done
+
+.bad_size:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_SIZE
+    mov qword [rel mcd_error_offset], 0
+
+    mov eax, 1
+    jmp .done
+
+.bad_checksum:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_CHECKSUM
+    mov qword [rel mcd_error_offset], 0
+
+    mov eax, 1
+    jmp .done
+
+.bad_nop:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_NOP_SLED
+    mov [rel mcd_error_offset], r10
+
+    mov eax, 1
+    jmp .done
+
+.success:
+
+    xor eax, eax
+
+.done:
+
+    pop r15
     pop r14
     pop r13
     pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
+
     ret
 
 
-; ==============================================================================
-; FUNKCJA: malicious_check_runtime
-; Sprawdza czy moduł próbuje pisać/wykonywać kod poza swoim obszarem RAM.
-; Wywoływana z page fault handlera (#PF, wektor 14) w IDT.
+; =============================================================================
+; malicious_check_runtime
 ;
-; Wejście:
-;   RCX = Adres który spowodował naruszenie (z rejestru CR2)
-;   RDX = Vector ID modułu który jest aktualnie aktywny
+; RCX = Vector ID
+; RDX = CR2 / adres naruszenia
 ;
-; Zwraca:
-;   RAX = 0 OK (dozwolony dostęp), 6 = naruszenie (rollback wymagany)
-; ==============================================================================
+; Jeżeli adres znajduje się w obszarze modułów AHS-TUS,
+; wykonywany jest rollback odpowiedniego Vector ID.
+; =============================================================================
+
 malicious_check_runtime:
+
+    push rbx
     push rcx
     push rdx
 
-    ; Sprawdź czy adres jest w dozwolonym obszarze modułów
-    cmp rcx, MODULE_RAM_BASE
-    jb .violation
-    cmp rcx, MODULE_RAM_END
-    jae .violation
+    ; -------------------------------------------------------------------------
+    ; adres poniżej obszaru modułów
+    ; -------------------------------------------------------------------------
 
-    ; Adres w dozwolonym zakresie
-    xor rax, rax
-    jmp .exit
+    cmp rdx, MODULE_RAM_BASE
+    jb .runtime_ok
 
-.violation:
-    ; Naruszenie — zapisz błąd i wywołaj rollback
-    mov dword [last_error], 6
-    mov [error_offset], rcx     ; Zapisz adres naruszenia
+    ; -------------------------------------------------------------------------
+    ; adres poza końcem
+    ; -------------------------------------------------------------------------
 
-    ; Wywołaj rollback dla tego konkretnego wektora
-    push rdx
-    mov rcx, rdx                ; Vector ID
+    cmp rdx, MODULE_RAM_END
+    jae .runtime_ok
+
+    ; -------------------------------------------------------------------------
+    ; naruszenie
+    ; -------------------------------------------------------------------------
+
+    mov qword [rel mcd_last_error], MCD_ERROR_ADDRESS
+    mov [rel mcd_error_offset], rdx
+
+    mov rbx, rcx
+
+    ; rollback(Vector ID)
+    mov rcx, rbx
     call update_rollback
-    pop rdx
 
-    mov rax, 6
+    mov eax, 1
+    jmp .runtime_done
 
-.exit:
+.runtime_ok:
+
+    mov qword [rel mcd_last_error], MCD_ERROR_NONE
+    mov qword [rel mcd_error_offset], 0
+
+    xor eax, eax
+
+.runtime_done:
+
     pop rdx
     pop rcx
+    pop rbx
+
     ret
 
 
-; ==============================================================================
-; FUNKCJA: mcd_get_last_error
-; Zwraca: RAX = ostatni kod błędu
-; ==============================================================================
+; =============================================================================
+; mcd_get_last_error
+; =============================================================================
+
 mcd_get_last_error:
-    mov rax, [last_error]
+
+    mov rax, [rel mcd_last_error]
     ret
 
 
-; ==============================================================================
-; FUNKCJA: mcd_get_error_offset
-; Zwraca: RAX = offset w module gdzie wykryto błąd (dla debugowania)
-; ==============================================================================
+; =============================================================================
+; mcd_get_error_offset
+; =============================================================================
+
 mcd_get_error_offset:
-    mov rax, [error_offset]
+
+    mov rax, [rel mcd_error_offset]
     ret
