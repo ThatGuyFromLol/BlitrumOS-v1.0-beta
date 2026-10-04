@@ -206,7 +206,7 @@ isr_pit_handler:
     ; Dlatego ta funkcja NIE może wykonywać iretq po powrocie.
     ; ==========================================================================
 
-    call scheduler_dispatch
+    jmp scheduler_dispatch
 
 
     ; ==========================================================================
