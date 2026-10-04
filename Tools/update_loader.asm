@@ -1,33 +1,19 @@
 ; ==============================================================================
-;        UPDATE LOADER — SYSTEM AKTUALIZACJI W LOCIE (AHS-TUS POWERED)
-; ==============================================================================
-; Nazwa pliku:   update_loader.asm
-; Architektura:  x86_64 (Long Mode)
-; Składnia:      NASM (Intel)
+;        BLITRUM OS - UPDATE LOADER / AHS-TUS
+;        x86-64 / NASM
 ;
-; FLOW:
-;   1. update_check()        — szuka paczki na dysku TGFS (TAG_SYSTEM, ID=99)
-;   2. update_verify()       — weryfikuje nagłówek "USPK" i checksum XOR-64
-;   3. update_apply()        — ładuje każdy moduł, podmienia wektor AHS-TUS
-;   4. update_rollback()     — wywoływane przez IDT przy crashu nowego modułu
-;
-; FORMAT PACZKI .pkg:
-;   Offset  0: "USPK"           (4 bajty — magic)
-;   Offset  4: wersja           (4 bajty)
-;   Offset  8: liczba modułów   (4 bajty — max 16)
-;   Offset 12: zarezerwowane    (4 bajty)
-;   Offset 16: checksum XOR-64  (8 bajtów)
-;   Offset 24: nagłówki modułów (każdy 64 bajty):
-;     +0:  Vector ID   (4 bajty)
-;     +4:  Rozmiar     (4 bajty)
-;     +8:  Load addr   (8 bajtów — 0 = auto)
-;     +16: Nazwa       (16 bajtów ASCII)
-;     +32: Checksum    (8 bajtów XOR-64)
-;     +40: Offset danych (8 bajtów)
-;     +48: zarezerwowane (16 bajtów)
+;        Aktualizacje systemu:
+;          - wyszukiwanie update.pkg w TGFS
+;          - weryfikacja paczki
+;          - weryfikacja modułów
+;          - ładowanie modułów
+;          - backup starych wektorów AHS-TUS
+;          - podmiana wektorów
+;          - rollback
 ; ==============================================================================
 
 bits 64
+
 section .text
 
 global update_check
@@ -44,139 +30,317 @@ extern pmm_alloc_page
 extern malicious_check_static
 extern mcd_get_last_error
 
+
+; ==============================================================================
+; STAŁE
+; ==============================================================================
+
 PKG_MAGIC           equ 0x4B505355
 PKG_TGFS_ID         equ 99
+
 PKG_LOAD_ADDR       equ 0x03200000
 MODULE_LOAD_BASE    equ 0x03000000
-BACKUP_VECTOR_BASE  equ 0x03100000
+MODULE_SLOT_SIZE    equ 0x00200000
+
 MAX_MODULES         equ 16
+MAX_VECTOR_ID       equ 31
+
 SATA_PORT           equ 0
 
+
+; ==============================================================================
+; DANE
+; ==============================================================================
+
 section .data
+
 align 8
-pkg_loaded:         db 0
-pkg_module_count:   dd 0
-pkg_base_addr:      dq PKG_LOAD_ADDR
-update_pending:     db 0
-crash_vector_id:    dd 0xFFFFFFFF
-backup_vectors:     times MAX_MODULES dq 0
-updated_vector_ids: times MAX_MODULES dd 0
-updated_count:      dd 0
+
+pkg_loaded:
+    db 0
+
+pkg_module_count:
+    dd 0
+
+pkg_base_addr:
+    dq PKG_LOAD_ADDR
+
+update_pending:
+    db 0
+
+crash_vector_id:
+    dd 0xFFFFFFFF
+
+updated_count:
+    dd 0
+
+; Adres starego sterownika dla każdego modułu.
+;
+; backup_vectors[i]
+;     = stary adres wektora przed aktualizacją
+;
+backup_vectors:
+    times MAX_MODULES dq 0
+
+; ID wektora odpowiadający pozycji w backup_vectors[].
+updated_vector_ids:
+    times MAX_MODULES dd 0
+
+
+; ==============================================================================
+; UPDATE CHECK
+;
+; Szuka pliku TGFS ID=99.
+;
+; RAX:
+;   1 = znaleziono i poprawne
+;   0 = brak / błąd
+; ==============================================================================
 
 section .text
 
-; ==============================================================================
-; FUNKCJA: update_check
-; Szuka paczki aktualizacji na dysku TGFS (ID=99).
-; Zwraca: RAX = 1 znaleziono, 0 brak
-; ==============================================================================
 update_check:
+
     push rbx
     push rcx
     push rdx
     push r8
     push r9
 
+    mov byte [rel update_pending], 0
+    mov byte [rel pkg_loaded], 0
+
+    ; --------------------------------------------------------------------------
+    ; Załaduj update.pkg
+    ;
+    ; RCX = port SATA
+    ; RDX = TGFS file ID
+    ; R8  = adres docelowy
+    ; --------------------------------------------------------------------------
+
     mov rcx, SATA_PORT
     mov rdx, PKG_TGFS_ID
     mov r8, PKG_LOAD_ADDR
+
     call tgfs_load_and_map_file
 
     cmp rax, -1
     je .not_found
-    cmp rax, 0
-    je .not_found
+
+    test rax, rax
+    jz .not_found
+
+
+    ; --------------------------------------------------------------------------
+    ; Zweryfikuj paczkę
+    ; --------------------------------------------------------------------------
 
     call update_verify
-    cmp rax, 1
-    jne .not_found
 
-    mov byte [update_pending], 1
-    mov rax, 1
+    test rax, rax
+    jz .not_found
+
+
+    mov byte [rel update_pending], 1
+
+    mov eax, 1
+
     jmp .exit
 
+
 .not_found:
-    mov byte [update_pending], 0
-    xor rax, rax
+
+    mov byte [rel update_pending], 0
+    mov byte [rel pkg_loaded], 0
+
+    xor eax, eax
+
 
 .exit:
+
     pop r9
     pop r8
     pop rdx
     pop rcx
     pop rbx
+
     ret
 
 
 ; ==============================================================================
-; FUNKCJA: update_verify
-; Weryfikuje nagłówek "USPK" i checksum XOR-64.
-; Zwraca: RAX = 1 OK, 0 błąd
+; UPDATE VERIFY
+;
+; Format:
+;
+; +00  "USPK"
+; +04  version
+; +08  module count
+; +0C  reserved
+; +10  XOR checksum
+; +18  module headers
+;
+; Jeden nagłówek = 64 bajty.
+;
+; RAX:
+;   1 = OK
+;   0 = błąd
 ; ==============================================================================
+
 update_verify:
-    push rbx
-    push rcx
-    push rsi
 
-    mov rsi, PKG_LOAD_ADDR
-
-    mov ebx, [rsi]
-    cmp ebx, PKG_MAGIC
-    jne .bad
-
-    mov ecx, [rsi + 8]
-    cmp ecx, MAX_MODULES
-    ja .bad
-    mov [pkg_module_count], ecx
-
-    mov rbx, [rsi + 16]
-
-    mov rax, rcx
-    shl rax, 6
-    add rax, 24
-    mov rcx, rax
-    shr rcx, 3
-
-    mov rsi, PKG_LOAD_ADDR
-    add rsi, 24
-
-    xor rax, rax
-.xor_loop:
-    xor rax, [rsi]
-    add rsi, 8
-    dec rcx
-    jnz .xor_loop
-
-    cmp rax, rbx
-    jne .bad
-
-    mov byte [pkg_loaded], 1
-    mov rax, 1
-    jmp .exit
-
-.bad:
-    mov byte [pkg_loaded], 0
-    xor rax, rax
-
-.exit:
-    pop rsi
-    pop rcx
-    pop rbx
-    ret
-
-
-; ==============================================================================
-; FUNKCJA: update_apply
-; Ładuje moduły z paczki i podmienia wektory AHS-TUS.
-; Przed podmianą zapisuje stare adresy do backup (rollback).
-; Zwraca: RAX = liczba pomyślnie zaktualizowanych modułów
-; ==============================================================================
-update_apply:
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+
+    mov rsi, PKG_LOAD_ADDR
+
+
+    ; --------------------------------------------------------------------------
+    ; Magic
+    ; --------------------------------------------------------------------------
+
+    mov eax, [rsi]
+
+    cmp eax, PKG_MAGIC
+    jne .bad
+
+
+    ; --------------------------------------------------------------------------
+    ; Liczba modułów
+    ; --------------------------------------------------------------------------
+
+    mov ecx, [rsi + 8]
+
+    test ecx, ecx
+    jz .bad
+
+    cmp ecx, MAX_MODULES
+    ja .bad
+
+    mov [pkg_module_count], ecx
+
+
+    ; --------------------------------------------------------------------------
+    ; Zachowaj oczekiwany checksum
+    ; --------------------------------------------------------------------------
+
+    mov rbx, [rsi + 16]
+
+
+    ; --------------------------------------------------------------------------
+    ; Oblicz długość obszaru nagłówków
+    ;
+    ; 24 + module_count * 64
+    ; --------------------------------------------------------------------------
+
+    mov eax, ecx
+    shl rax, 6
+    add rax, 24
+
+    mov rcx, rax
+
+    shr rcx, 3
+
+    test rcx, rcx
+    jz .bad
+
+
+    ; --------------------------------------------------------------------------
+    ; XOR checksum
+    ;
+    ; Pomijamy pierwsze 16 bajtów?
+    ;
+    ; Zgodnie z formatem checksum znajduje się pod +16.
+    ; Obszar kontrolowany zaczyna się od +24.
+    ; --------------------------------------------------------------------------
+
+    mov rsi, PKG_LOAD_ADDR
+    add rsi, 24
+
+    xor rax, rax
+
+
+.xor_loop:
+
+    xor rax, [rsi]
+
+    add rsi, 8
+
+    dec rcx
+
+    jnz .xor_loop
+
+
+    ; --------------------------------------------------------------------------
+    ; Porównaj checksum
+    ; --------------------------------------------------------------------------
+
+    cmp rax, rbx
+    jne .bad
+
+
+    ; --------------------------------------------------------------------------
+    ; Paczka poprawna
+    ; --------------------------------------------------------------------------
+
+    mov byte [pkg_loaded], 1
+
+    mov eax, 1
+
+    jmp .exit
+
+
+.bad:
+
+    mov byte [pkg_loaded], 0
+
+    xor eax, eax
+
+
+.exit:
+
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+
+    ret
+
+
+; ==============================================================================
+; UPDATE APPLY
+;
+; Ładuje wszystkie moduły z paczki.
+;
+; WAŻNE:
+; Przed zmianą każdego wektora zapisujemy jego poprzedni adres.
+;
+; Dzięki temu:
+;
+;   update_rollback(-1)
+;
+; może przywrócić poprzedni stan.
+;
+; RAX:
+;   liczba zaktualizowanych modułów
+; ==============================================================================
+
+update_apply:
+
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
     push r12
     push r13
     push r14
@@ -185,177 +349,487 @@ update_apply:
     cmp byte [pkg_loaded], 1
     jne .not_ready
 
+
+    ; --------------------------------------------------------------------------
+    ; Wyzeruj licznik
+    ; --------------------------------------------------------------------------
+
     mov dword [updated_count], 0
+
+
+    ; --------------------------------------------------------------------------
+    ; Początek nagłówków
+    ; --------------------------------------------------------------------------
 
     mov rsi, PKG_LOAD_ADDR
     add rsi, 24
 
+    xor r14d, r14d
+
     mov r15d, [pkg_module_count]
-    xor r14, r14
+
 
 .module_loop:
-    cmp r14, r15
-    jge .done
 
-    mov r12d, [rsi + 0]         ; Vector ID
-    mov r13d, [rsi + 4]         ; Rozmiar
-    mov rdi, [rsi + 8]          ; Adres docelowy (0 = auto)
-    mov rbx, [rsi + 32]         ; Checksum modułu
-    mov rdx, [rsi + 40]         ; Offset danych
+    cmp r14d, r15d
+    jae .done
+
+
+    ; ==========================================================================
+    ; Odczytaj nagłówek
+    ; ==========================================================================
+
+    ; +0 Vector ID
+    mov r12d, [rsi + 0]
+
+    ; +4 Size
+    mov r13d, [rsi + 4]
+
+    ; +8 Load address
+    mov rdi, [rsi + 8]
+
+    ; +32 Module checksum
+    mov rbx, [rsi + 32]
+
+    ; +40 Data offset
+    mov rdx, [rsi + 40]
+
+
+    ; ==========================================================================
+    ; Walidacja Vector ID
+    ; ==========================================================================
+
+    cmp r12d, MAX_VECTOR_ID
+    ja .skip_module
+
+
+    ; ==========================================================================
+    ; Walidacja rozmiaru
+    ; ==========================================================================
+
+    test r13d, r13d
+    jz .skip_module
+
+
+    ; ==========================================================================
+    ; Ustal adres danych modułu w paczce
+    ; ==========================================================================
 
     mov rax, PKG_LOAD_ADDR
     add rax, rdx
 
+
+    ; ==========================================================================
+    ; Ustal adres docelowy
+    ;
+    ; Jeśli nagłówek podał adres:
+    ;
+    ;     używamy go.
+    ;
+    ; Jeśli 0:
+    ;
+    ;     MODULE_LOAD_BASE + index * MODULE_SLOT_SIZE
+    ; ==========================================================================
+
     test rdi, rdi
-    jnz .has_addr
-    mov rdi, MODULE_LOAD_BASE
-    mov rcx, r14
-    shl rcx, 17
-    add rdi, rcx
-.has_addr:
+    jnz .destination_ready
 
-      ; Weryfikacja checksum modułu przed załadowaniem
+
+    mov edi, MODULE_LOAD_BASE
+
+    mov eax, r14d
+    imul rax, MODULE_SLOT_SIZE
+
+    add rdi, rax
+
+
+.destination_ready:
+
+
+    ; ==========================================================================
+    ; Zabezpieczenie przed przekroczeniem pojedynczego slotu
+    ; ==========================================================================
+
+    mov eax, r13d
+
+    cmp eax, MODULE_SLOT_SIZE
+    ja .skip_module
+
+
+    ; ==========================================================================
+    ; Weryfikacja modułu
+    ;
+    ; malicious_check_static:
+    ;
+    ; RCX = adres modułu
+    ; RDX = rozmiar
+    ; R8  = oczekiwany checksum
+    ;
+    ; RAX = 0 -> OK
+    ; RAX != 0 -> odrzucony
+    ; ==========================================================================
+
     push rsi
     push rdi
+    push rbx
+    push r12
     push r13
-    mov rsi, rax                ; Adres danych modułu
-    mov rcx, rax                ; RCX = adres
-    mov rdx, r13                ; RDX = rozmiar
-    mov r8, rbx                 ; R8  = oczekiwany checksum
-    call malicious_check_static ; Skaner statyczny + blacklist + NOP sled
-    pop r13
-    pop rdi
-    pop rsi
+    push r14
+    push r15
 
-    test rax, rax
-    jnz .skip_module            ; Nie przeszedł skanowania — pomijamy moduł
-    
-; Kopiuj dane modułu pod adres docelowy
-    push rsi
-    mov rsi, PKG_LOAD_ADDR
-    add rsi, rdx
-    mov rcx, r13
-    push rcx
-    push rdi
-    shr rcx, 3
-.copy_loop:
-    mov rax, [rsi]
-    mov [rdi], rax
-    add rsi, 8
-    add rdi, 8
-    dec rcx
-    jnz .copy_loop
-    pop rdi
-    pop rcx
-    pop rsi
+    mov rcx, rax
+    mov rdx, r13
+    mov r8, rbx
 
-    ; Zapisz Vector ID do tablicy dla rollback
-    mov [updated_vector_ids + r14 * 4], r12d
+    call malicious_check_static
 
-    ; Podmień wektor w AHS-TUS
-    push rcx
-    mov rcx, r12
-    mov rdx, rdi
-    call update_register_vector
-    pop rcx
-
-    inc dword [updated_count]
-
-.skip_module:
-    add rsi, 64
-    inc r14
-    jmp .module_loop
-
-.done:
-    mov byte [update_pending], 0
-    mov eax, [updated_count]
-    jmp .exit
-
-.not_ready:
-    xor rax, rax
-
-.exit:
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
+    pop rdi
+    pop rsi
+
+    test rax, rax
+    jnz .skip_module
+
+
+    ; ==========================================================================
+    ; Kopiowanie modułu
+    ;
+    ; Kopiujemy dokładne DWORD/QWORD ilości.
+    ; Najpierw 8-bajtowe bloki, potem ewentualną końcówkę.
+    ; ==========================================================================
+
+    mov rax, PKG_LOAD_ADDR
+    add rax, rdx
+
+
+    ; RCX = liczba pełnych QWORD
+    mov ecx, r13d
+    shr rcx, 3
+
+    mov r8, rax
+    mov r9, rdi
+
+
+.copy_qword_loop:
+
+    test rcx, rcx
+    jz .copy_tail
+
+    mov rax, [r8]
+
+    mov [r9], rax
+
+    add r8, 8
+    add r9, 8
+
+    dec rcx
+
+    jmp .copy_qword_loop
+
+
+.copy_tail:
+
+    mov ecx, r13d
+    and ecx, 7
+
+    test ecx, ecx
+    jz .module_copied
+
+
+.copy_byte_loop:
+
+    mov al, [r8]
+
+    mov [r9], al
+
+    inc r8
+    inc r9
+
+    dec ecx
+
+    jnz .copy_byte_loop
+
+
+.module_copied:
+
+
+    ; ==========================================================================
+    ; ZACHOWAJ STARY ADRES WEKTORA
+    ;
+    ; To był brakujący element poprzedniej wersji.
+    ;
+    ; update_register_vector nie udostępnia getter'a, więc tutaj czytamy
+    ; bezpośrednio tabelę AHS-TUS.
+    ;
+    ; Tabela:
+    ;
+    ;     system_vector_table + vector_id * 8
+    ;
+    ; ==========================================================================
+    ;
+    ; Nie możemy bezpośrednio odwołać się do symbolu z innego modułu,
+    ; dlatego używamy update_call_vector? Nie nadaje się do odczytu.
+    ;
+    ; Rozwiązanie:
+    ; update_register_vector zostanie użyty z aktualnym adresem,
+    ; a poprzedni adres zachowujemy przez osobną funkcję poniżej.
+    ;
+    ; Na potrzeby bezpiecznego ABI używamy lokalnego helpera:
+    ; update_get_vector_address
+    ;
+    ; ==========================================================================
+    
+    mov ecx, r12d
+
+    call update_get_vector_address
+
+    ; RAX = stary adres
+    mov [backup_vectors + r14 * 8], rax
+
+    ; Zapisz ID
+    mov [updated_vector_ids + r14 * 4], r12d
+
+
+    ; ==========================================================================
+    ; Podmień wektor
+    ; ==========================================================================
+
+    mov rcx, r12
+
+    mov rdx, rdi
+
+    call update_register_vector
+
+
+    ; ==========================================================================
+    ; Zwiększ licznik
+    ; ==========================================================================
+
+    inc dword [updated_count]
+
+
+.skip_module:
+
+    add rsi, 64
+
+    inc r14d
+
+    jmp .module_loop
+
+
+.done:
+
+    mov byte [update_pending], 0
+
+    mov eax, [updated_count]
+
+    jmp .exit
+
+
+.not_ready:
+
+    xor eax, eax
+
+
+.exit:
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
+
     ret
 
 
 ; ==============================================================================
-; FUNKCJA: update_rollback
-; Przywraca stare wektory z tablicy backup.
-; Wejście: RCX = Vector ID (-1 = rollback wszystkich)
-; Zwraca:  RAX = liczba przywróconych wektorów
+; UPDATE ROLLBACK
+;
+; RCX:
+;   -1 = rollback wszystkich
+;   ID  = rollback konkretnego wektora
+;
+; RAX:
+;   liczba przywróconych wektorów
 ; ==============================================================================
+
 update_rollback:
+
     push rbx
     push rcx
     push rdx
     push rsi
+    push rdi
     push r12
     push r13
 
+
     mov r12, rcx
-    xor r13, r13
+
+    xor r13d, r13d
 
     mov ebx, [updated_count]
+
     test ebx, ebx
     jz .nothing
 
-    xor rcx, rcx
+    xor ecx, ecx
+
+
 .rollback_loop:
+
     cmp ecx, ebx
-    jge .done
+    jae .done
+
+
+    ; --------------------------------------------------------------------------
+    ; ID wektora
+    ; --------------------------------------------------------------------------
 
     mov edx, [updated_vector_ids + rcx * 4]
 
+
+    ; --------------------------------------------------------------------------
+    ; Jeśli rollback konkretnego ID
+    ; --------------------------------------------------------------------------
+
     cmp r12, -1
-    je .do_rollback
+    je .rollback_this
+
     cmp rdx, r12
     jne .next
 
-.do_rollback:
+
+.rollback_this:
+
+
+    ; --------------------------------------------------------------------------
+    ; Stary adres
+    ; --------------------------------------------------------------------------
+
     mov rax, rcx
+
     shl rax, 3
+
     mov rsi, [backup_vectors + rax]
+
     test rsi, rsi
     jz .next
 
+
+    ; --------------------------------------------------------------------------
+    ; Przywróć
+    ; --------------------------------------------------------------------------
+
     push rcx
+
     mov rcx, rdx
+
     mov rdx, rsi
+
     call update_register_vector
+
     pop rcx
 
-    inc r13
+
+    ; --------------------------------------------------------------------------
+    ; Wyzeruj backup po udanym rollbacku
+    ; --------------------------------------------------------------------------
+
+    mov rax, rcx
+
+    shl rax, 3
+
+    mov qword [backup_vectors + rax], 0
+
+
+    inc r13d
+
 
 .next:
-    inc rcx
+
+    inc ecx
+
     jmp .rollback_loop
 
+
 .done:
+
 .nothing:
-    mov rax, r13
+
+    mov eax, r13d
+
 
     pop r13
     pop r12
+    pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
+
     ret
 
 
 ; ==============================================================================
-; FUNKCJA: update_is_pending
-; Zwraca: RAX = 1 jeśli aktualizacja czeka, 0 jeśli nie
+; UPDATE IS PENDING
+;
+; RAX:
+;   1 = oczekuje aktualizacja
+;   0 = brak
 ; ==============================================================================
+
 update_is_pending:
-    movzx rax, byte [update_pending]
+
+    movzx eax, byte [update_pending]
+
     ret
+
+
+; ==============================================================================
+; UPDATE GET VECTOR ADDRESS
+;
+; WEWNĘTRZNY HELPER
+;
+; RCX = Vector ID
+; RAX = aktualny adres
+;
+; Zabezpieczenie:
+;   ID >= MAX_VECTORS -> RAX = 0
+; ==============================================================================
+
+update_get_vector_address:
+
+    cmp rcx, MAX_VECTOR_ID
+    ja .invalid
+
+    mov rax, [system_vector_table + rcx * 8]
+
+    ret
+
+
+.invalid:
+
+    xor eax, eax
+
+    ret
+
+
+; ==============================================================================
+; UWAGA
+;
+; Tabela AHS-TUS znajduje się w innym module.
+;
+; Aby powyższy helper mógł bezpośrednio korzystać z tabeli, potrzebujemy
+; eksportu symbolu z Tools/ahs-tus.asm.
+; ==============================================================================
