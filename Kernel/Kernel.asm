@@ -36,11 +36,11 @@ extern __bss_end
 ; SYSTEM
 ; ==============================================================================
 
+extern gdt_init
 extern pit_init
 extern bsod_init
 extern serial_init
 extern serial_log
-extern gdt_init
 
 ; ==============================================================================
 ; HID / IDT
