@@ -1,214 +1,460 @@
 ;==============================================================================
-   ;urządzenia usb (klawiatura + mysz)
-  ; ============================================================================
+; BLITRUM OS - USB CONTROLLER / xHCI
+;==============================================================================
+; x86-64 / NASM
+;
+; Funkcje:
+;   - wyszukiwanie kontrolera USB 3.x / xHCI
+;   - odczyt BAR0
+;   - obsługa 32-bitowego i 64-bitowego BAR
+;   - przejęcie xHCI od BIOS/UEFI
+;
+; Wspólny dostęp do PCI znajduje się w:
+;
+;   Tools/pci_dyski.asm
+;
+; Funkcja:
+;
+;   pci_read_config_dword
+;
+; NIE definiujemy jej tutaj drugi raz.
+;==============================================================================
+
 bits 64
+
+
 section .text
 
-global find_usb_controllers
-global pci_read_config_dword
 
-; ==============================================================================
+;==============================================================================
+; GLOBALS
+;==============================================================================
+
+global find_usb_controllers
+
+
+;==============================================================================
+; EXTERNALS
+;==============================================================================
+
+extern pci_read_config_dword
+
+
+;==============================================================================
 ; FUNKCJA: find_usb_controllers
+;
 ; Przeszukuje magistralę PCI w poszukiwaniu kontrolera USB 3.0 (xHCI).
-; Wywołuje handshake z BIOS-em i zwraca adres MMIO.
-; 
+;
 ; Zwraca:
-;   RAX = Pełny, 64-bitowy adres fizyczny rejestrów MMIO kontrolera xHCI
-;   Flaga Carry (CF): wyczyszczona (0) = sukces, ustawiona (1) = nie znaleziono USB 3.0
-; ==============================================================================
+;
+;   RAX = pełny 64-bitowy adres fizyczny MMIO kontrolera xHCI
+;
+;   CF = 0
+;       znaleziono kontroler
+;
+;   CF = 1
+;       nie znaleziono kontrolera
+;
+;==============================================================================
 find_usb_controllers:
+
     push rbx
     push rcx
     push rdx
 
-    mov bh, 0               ; BH = Bus (Magistrala, zaczynamy od 0)
+
+    ;==========================================================================
+    ; BUS = 0
+    ;==========================================================================
+
+    mov bh, 0
+
+
 .loop_bus:
-    mov bl, 0               ; BL = Device (Urządzenie, zaczynamy od 0)
+
+    ;==========================================================================
+    ; DEVICE = 0
+    ;==========================================================================
+
+    mov bl, 0
+
+
 .loop_dev:
-    mov ch, 0               ; CH = Function (Funkcja, zaczynamy od 0)
+
+    ;==========================================================================
+    ; FUNCTION = 0
+    ;==========================================================================
+
+    mov ch, 0
+
+
 .loop_func:
 
-    ; Krok 1: Sprawdź czy urządzenie istnieje (Offset 0x00: Vendor ID)
+    ;==========================================================================
+    ; SPRAWDŹ VENDOR ID
+    ;
+    ; PCI offset 0x00
+    ;==========================================================================
+
     mov cl, 0x00
+
     call pci_read_config_dword
-    cmp ax, 0xFFFF          ; 0xFFFF oznacza brak sprzętu pod tym adresem
+
+    cmp ax, 0xFFFF
+
     je .next_func
 
-    ; Krok 2: Odczytaj klasę urządzenia (Offset 0x08)
+
+    ;==========================================================================
+    ; ODCZYTAJ CLASS / SUBCLASS / PROGIF
+    ;
+    ; PCI offset 0x08
+    ;
+    ; Wynik:
+    ;
+    ;   bits 31:24 = Revision ID
+    ;   bits 23:16 = ProgIF
+    ;   bits 15:8  = Subclass
+    ;   bits 7:0   = Class
+    ;
+    ; Po SHR 8:
+    ;
+    ;   EAX = 0x00CCSSPP
+    ;
+    ; dla xHCI:
+    ;
+    ;   Class    = 0x0C
+    ;   Subclass = 0x03
+    ;   ProgIF   = 0x30
+    ;==========================================================================
+
     mov cl, 0x08
+
     call pci_read_config_dword
 
-    ; Wyizoluj wyższe 24 bity (Class, Subclass, ProgIF), odrzucając Revision ID
-    shr eax, 8              
-    
-    ; Sprawdź czy to USB xHCI (Class=0x0C, Subclass=0x03, ProgIF=0x30)
+    shr eax, 8
+
     cmp eax, 0x0C0330
+
     je .found_xhci
 
+
 .next_func:
-    inc ch                  ; Następna funkcja (0-7)
+
+    ;==========================================================================
+    ; FUNCTION++
+    ;==========================================================================
+
+    inc ch
+
     cmp ch, 8
+
     jne .loop_func
 
-    inc bl                  ; Następne urządzenie (0-31)
+
+    ;==========================================================================
+    ; DEVICE++
+    ;==========================================================================
+
+    inc bl
+
     cmp bl, 32
+
     jne .loop_dev
 
-    inc bh                  ; Następna magistrala (0-31)
-    cmp bh, 32              
+
+    ;==========================================================================
+    ; BUS++
+    ;==========================================================================
+
+    inc bh
+
+    cmp bh, 32
+
     jne .loop_bus
 
-    ; Jeśli pętla się skończyła i nic nie znaleziono
+
+    ;==========================================================================
+    ; NIE ZNALEZIONO
+    ;==========================================================================
+
     pop rdx
     pop rcx
     pop rbx
-    stc                     ; Ustaw flagę Carry (błąd / nie znaleziono)
+
+    stc
+
     ret
+
+
+;==============================================================================
+; ZNALEZIONO xHCI
+;==============================================================================
 
 .found_xhci:
-    ; Krok 3: Pobierz adres fizyczny BAR0 (Offset 0x10)
-    mov cl, 0x10
-    call pci_read_config_dword
-    mov rdx, rax            ; Zachowaj dolną część adresu w RDX
-    
-    ; Sprawdź bity 1-2 w BAR0, aby dowiedzieć się czy adres jest 64-bitowy
-    and al, 0x06
-    cmp al, 0x04            ; Czy UEFI zmapowało kontroler w przestrzeni 64-bit?
-    jne .bar_32bit
 
-.bar_64bit:
-    ; Pobierz wyższe 32 bity adresu z BAR1 (Offset 0x14)
-    mov cl, 0x14
+    ;==========================================================================
+    ; ODCZYTAJ BAR0
+    ;
+    ; PCI offset 0x10
+    ;==========================================================================
+
+    mov cl, 0x10
+
     call pci_read_config_dword
-    shl rax, 32             ; Przesuń wyższą część na właściwą pozycję
-    and rdx, -16           ; Wyczyść bity konfiguracyjne dolnej części
-    or rdx, rax             ; Połącz dolną i górną część w pełny adres 64-bitowy
-    jmp .handshake_start
+
+    mov rdx, rax
+
+
+    ;==========================================================================
+    ; SPRAWDŹ TYP BAR
+    ;
+    ; BAR:
+    ;
+    ; bit 0      = 0 dla MMIO
+    ; bit 1..2   = typ
+    ;
+    ; 00 = 32-bit
+    ; 10 = 64-bit
+    ;==========================================================================
+
+    mov eax, edx
+
+    and eax, 0x06
+
+    cmp eax, 0x04
+
+    je .bar_64bit
+
+
+;==============================================================================
+; BAR 32-BIT
+;==============================================================================
 
 .bar_32bit:
-    and rdx, -16          ; Dla starego mapowania wyczyść tylko bity konfiguracyjne
+
+    and rdx, -16
+
+    jmp .handshake_start
+
+
+;==============================================================================
+; BAR 64-BIT
+;==============================================================================
+
+.bar_64bit:
+
+    ;==========================================================================
+    ; BAR1 = górne 32 bity
+    ;==========================================================================
+
+    mov cl, 0x14
+
+    call pci_read_config_dword
+
+    shl rax, 32
+
+    and rdx, -16
+
+    or rdx, rax
+
+
+;==============================================================================
+; xHCI BIOS HANDSHAKE
+;==============================================================================
 
 .handshake_start:
-    mov rax, rdx            ; RAX zawiera teraz PEŁNY 64-bitowy adres MMIO
-    
-    ; Wykonaj procedurę przejęcia kontroli od BIOS-u
+
+    mov rax, rdx
+
     call xhci_bios_handshake
+
+
+    ;==========================================================================
+    ; SUKCES
+    ;==========================================================================
 
     pop rdx
     pop rcx
     pop rbx
-    clc                     ; Wyczyść flagę Carry (sukces)
+
+    clc
+
     ret
 
 
-; ==============================================================================
-; PROCEDURA: xhci_bios_handshake
-; Bezpiecznie odbiera kontrolę nad urządzeniem USB 3.0 od BIOS-u (UEFI CSM).
-; Argument wejściowy: RAX = 64-bitowy adres MMIO kontrolera xHCI
-; ==============================================================================
+;==============================================================================
+; xhci_bios_handshake
+;
+; WEJŚCIE:
+;
+;   RAX = adres MMIO kontrolera xHCI
+;
+; Działanie:
+;
+;   1. znajduje Extended Capabilities
+;   2. wyszukuje USB Legacy Support
+;   3. ustawia OS Owned Semaphore
+;   4. czeka na zwolnienie BIOS Owned Semaphore
+;   5. wyłącza SMI
+;
+;==============================================================================
 xhci_bios_handshake:
+
     push rax
     push rbx
     push rcx
     push rdx
 
-    ; 1. Odczytaj rejestr HCCPARAMS1 (Offset 0x10 od adresu bazowego MMIO)
-    mov ecx, [rax + 0x10]
-    shr ecx, 16             ; ECX = offset rozszerzeń (w dwordach)
-    shl ecx, 2              ; Mnożenie przez 4 = offset w bajtach
-    jz .no_extended_caps    ; Jeśli zero, brak rozszerzeń w tym kontrolerze
 
-    ; Budujemy pełny 64-bitowy adres pierwszego rozszerzenia w pamięci RAM
-    mov rdx, rax            ; RDX = baza MMIO
-    add rdx, rcx            ; RDX = adres pierwszego rozszerzenia
+    ;==========================================================================
+    ; HCCPARAMS1
+    ;
+    ; Offset:
+    ;
+    ;   0x10
+    ;
+    ; xECP znajduje się w bits 31:16.
+    ;==========================================================================
+
+    mov ecx, [rax + 0x10]
+
+    shr ecx, 16
+
+    shl ecx, 2
+
+    jz .no_extended_caps
+
+
+    ;==========================================================================
+    ; RDX = pierwszy Extended Capability
+    ;==========================================================================
+
+    mov rdx, rax
+
+    add rdx, rcx
+
+
+;==============================================================================
+; SZUKAJ USB LEGACY SUPPORT
+;==============================================================================
 
 .search_loop:
-    mov ebx, [rdx]          ; Odczytaj nagłówek rozszerzenia
-    mov al, bl              ; Najniższy bajt to Capability ID
-    cmp al, 1               ; Czy ID == 1 (USB Legacy Support)?
+
+    ;==========================================================================
+    ; Odczytaj nagłówek capability
+    ;==========================================================================
+
+    mov ebx, [rdx]
+
+
+    ;==========================================================================
+    ; Capability ID
+    ;
+    ; bits 7:0
+    ;
+    ; USB Legacy Support = 1
+    ;==========================================================================
+
+    mov al, bl
+
+    cmp al, 1
+
     je .found_legacy
 
-    ; Jeśli nie, sprawdź następne rozszerzenie na liście
-    shr ebx, 8
-    movzx rbx, bl           ; RBX = następny offset (w dwordach)
-    and rbx, 0xFF
-    jz .no_legacy_found     ; Jeśli offset to 0, lista się skończyła
 
-    shl rbx, 2              ; Zamiana dwordów na bajty
-    add rdx, rbx            ; Przesuń wskaźnik 64-bitowy do przodu
+    ;==========================================================================
+    ; Next Capability Pointer
+    ;
+    ; bits 15:8
+    ;
+    ; offset jest podany w DWORD-ach.
+    ;==========================================================================
+
+    mov eax, ebx
+
+    shr eax, 8
+
+    and eax, 0xFF
+
+    test eax, eax
+
+    jz .no_legacy_found
+
+
+    ;==========================================================================
+    ; DWORD -> BYTE
+    ;==========================================================================
+
+    shl rax, 2
+
+    add rdx, rax
+
     jmp .search_loop
 
+
+;==============================================================================
+; ZNALEZIONO USB LEGACY SUPPORT
+;==============================================================================
+
 .found_legacy:
-    ; RDX wskazuje teraz dokładnie na rejestr USBLEGSUP
-    ; Krok A: Ustaw bit 24 (OS Owned Semaphore)
+
+    ;==========================================================================
+    ; USBLEGSUP
+    ;
+    ; bit 24 = OS Owned Semaphore
+    ;
+    ; ustawiamy:
+    ;
+    ;   OS Owned = 1
+    ;==========================================================================
+
     mov eax, [rdx]
-    or eax, 0x01000000      
-    mov [rdx], eax          
+
+    or eax, 0x01000000
+
+    mov [rdx], eax
+
+
+;==============================================================================
+; CZEKAJ NA BIOS
+;==============================================================================
 
 .wait_bios:
-    ; Krok B: Czekaj w pętli, aż BIOS wyczyści bit 16 (BIOS Owned Semaphore)
-    mov eax, [rdx]
-    test eax, 0x00010000    
-    jnz .wait_bios          ; Jeśli BIOS wciąż trzyma, czekaj
 
-    ; Krok C: Wyłącz bity kontroli SMI (bity 0-14 w rejestrze USBLEGCTLSTS)
-    ; Znajduje się on pod offsetem RDX + 4, zapobiega to wtrącaniu się BIOS-u w tle.
+    mov eax, [rdx]
+
+    test eax, 0x00010000
+
+    jnz .wait_bios
+
+
+    ;==========================================================================
+    ; USBLEGCTLSTS
+    ;
+    ; RDX + 4
+    ;
+    ; Wyłączamy SMI control.
+    ;==========================================================================
+
     mov eax, [rdx + 4]
-    and eax, 0xFFFFE000     
+
+    and eax, 0xFFFFE000
+
     mov [rdx + 4], eax
 
+
+;==============================================================================
+; KONIEC HANDSHAKE
+;==============================================================================
+
 .no_legacy_found:
+
 .no_extended_caps:
+
     pop rdx
     pop rcx
     pop rbx
     pop rax
-    ret
 
-
-; ==============================================================================
-; FUNKCJA: pci_read_config_dword
-; Odczytuje 32-bitowy rejestr konfiguracyjny PCI przez porty wejścia/wyjścia.
-; Parametry wejściowe: BH = Bus, BL = Device, CH = Function, CL = Offset
-; Zwraca wynik w rejestrze EAX.
-; ==============================================================================
-pci_read_config_dword:
-    push rbx
-    push rcx
-    push rdx
-
-    xor eax, eax            ; Czyszczenie EAX
-
-    ; Budowanie 32-bitowego adresu dla portu 0xCF8
-    mov eax, 0x80000000     ; Bit 31 = 1 (Enable)
-
-    movzx edx, bh
-    shl edx, 16
-    or eax, edx             ; Dodaj Bus
-
-    movzx edx, bl
-    and dl, 0x1F            ; Max 32 urządzenia
-    shl edx, 11
-    or eax, edx             ; Dodaj Device
-
-    movzx edx, ch
-    and dl, 0x07            ; Max 8 funkcji
-    shl edx, 8
-    or eax, edx             ; Dodaj Function
-
-    movzx edx, cl
-    and dl, 0xFC            ; Wyrównanie offsetu do 4 bajtów
-    or eax, edx             ; Dodaj Register Offset
-
-    ; Wysyłanie adresu do kontrolera PCI
-    mov dx, 0xCF8
-    out dx, eax             
-
-    ; Odczyt danych z kontrolera PCI
-    mov dx, 0xCFC
-    in eax, dx              
-
-    pop rdx
-    pop rcx
-    pop rbx
     ret
