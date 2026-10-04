@@ -5,18 +5,19 @@
 ;
 ; Bezpieczny loader update.pkg.
 ;
-; Przebieg aktualizacji jednego modułu:
+; Przebieg aktualizacji:
 ;
 ;   1. Walidacja Vector ID
 ;   2. Walidacja rozmiaru / offsetu / slotu
 ;   3. AHS-TUS -> LOADING
-;   4. Static malware scan
+;   4. Static malware scan źródła
 ;   5. Kopiowanie modułu
 ;   6. Backup starego Vector
 ;   7. Atomowy hot-swap Vector
-;   8. AHS-TUS -> INIT
-;   9. Ponowny malware scan AKTYWNEGO modułu
-;  10. AHS-TUS -> SUCCESS
+;   8. Dodanie modułu do listy aktywnych
+;   9. AHS-TUS -> INIT
+;  10. Ponowny malware scan aktywnego modułu
+;  11. AHS-TUS -> SUCCESS
 ;
 ; W przypadku błędu:
 ;
@@ -30,7 +31,7 @@ bits 64
 
 
 ; ==============================================================================
-; SEKCJA CODE
+; CODE
 ; ==============================================================================
 
 section .text
@@ -64,12 +65,8 @@ extern malicious_check_static
 
 
 ; ==============================================================================
-; STAŁE
+; CONSTANTS
 ; ==============================================================================
-
-; ------------------------------------------------------------------------------
-; UPDATE PACKAGE
-; ------------------------------------------------------------------------------
 
 PKG_MAGIC           equ 0x4B505355
 PKG_TGFS_ID         equ 99
@@ -79,11 +76,7 @@ PKG_LOAD_ADDR       equ 0x03200000
 
 ; ------------------------------------------------------------------------------
 ; MODULE SLOTS
-;
-; 16 modułów
-; każdy moduł = 2 MiB
-;
-; -----------------------------------------------------------------------------
+; ------------------------------------------------------------------------------
 
 MODULE_LOAD_BASE    equ 0x04000000
 MODULE_SLOT_SIZE    equ 0x00200000
@@ -133,7 +126,7 @@ UPDATE_ERROR_BAD_STATE       equ 7
 
 
 ; ==============================================================================
-; SEKCJA DATA
+; DATA
 ; ==============================================================================
 
 section .data
@@ -188,22 +181,65 @@ crash_vector_id:
 
 
 ; ------------------------------------------------------------------------------
-; Liczba poprawnie aktywowanych modułów.
+; Liczba AKTYWNIE aktualizowanych modułów.
 ; ------------------------------------------------------------------------------
 
 updated_count:
     dd 0
 
 
+align 8
+
+
+; ------------------------------------------------------------------------------
+; Aktualna generacja modułu będącego właśnie przetwarzanym.
+;
+; Nie trzymamy jej w rejestrze podczas kopiowania, ponieważ kopiowanie używa
+; tych samych rejestrów.
+; ------------------------------------------------------------------------------
+
+current_generation:
+    dq 0
+
+
+; ------------------------------------------------------------------------------
+; Aktualny Vector ID.
+; ------------------------------------------------------------------------------
+
+current_vector_id:
+    dd 0
+
+align 4
+
+
+; ------------------------------------------------------------------------------
+; Aktualny adres modułu.
+; ------------------------------------------------------------------------------
+
+current_module_address:
+    dq 0
+
+
+; ------------------------------------------------------------------------------
+; Aktualny rozmiar modułu.
+; ------------------------------------------------------------------------------
+
+current_module_size:
+    dq 0
+
+
+; ------------------------------------------------------------------------------
+; Aktualny checksum.
+; ------------------------------------------------------------------------------
+
+current_module_checksum:
+    dq 0
+
+
 ; ------------------------------------------------------------------------------
 ; Backup starych adresów wektorów.
 ;
-; Backup jest przechowywany kompaktowo:
-;
-;   backup_vectors[0] = pierwszy aktywowany moduł
-;   backup_vectors[1] = drugi aktywowany moduł
-;   ...
-;
+; backup_vectors[index]
 ; ------------------------------------------------------------------------------
 
 align 8
@@ -213,7 +249,9 @@ backup_vectors:
 
 
 ; ------------------------------------------------------------------------------
-; ID wektorów, które zostały aktywowane.
+; ID aktywowanych Vectorów.
+;
+; updated_vector_ids[index]
 ; ------------------------------------------------------------------------------
 
 align 4
@@ -223,10 +261,9 @@ updated_vector_ids:
 
 
 ; ------------------------------------------------------------------------------
-; Generacja aktualizacji dla każdego modułu.
+; Generacja aktywowanego Vectora.
 ;
-; Zachowujemy ją również lokalnie, aby rollback/status nie korzystały
-; z przypadkowej generacji.
+; updated_generations[index]
 ; ------------------------------------------------------------------------------
 
 align 8
@@ -246,9 +283,7 @@ section .text
 ; UPDATE CHECK
 ; ==============================================================================
 ;
-; Ładuje update.pkg z TGFS i sprawdza jego poprawność.
-;
-; RAX = 1 -> poprawna aktualizacja
+; RAX = 1 -> poprawna aktualizacja oczekuje
 ; RAX = 0 -> brak aktualizacji / błąd
 ;
 ; ==============================================================================
@@ -288,23 +323,19 @@ update_check:
 
 
     ; --------------------------------------------------------------------------
-    ; TGFS zwrócił błąd.
+    ; Błąd.
     ; --------------------------------------------------------------------------
 
     cmp rax, -1
     je .not_found
 
 
-    ; --------------------------------------------------------------------------
-    ; TGFS zwrócił zero.
-    ; --------------------------------------------------------------------------
-
     test rax, rax
     jz .not_found
 
 
     ; --------------------------------------------------------------------------
-    ; Zweryfikuj pakiet.
+    ; Weryfikacja pakietu.
     ; --------------------------------------------------------------------------
 
     call update_verify
@@ -314,7 +345,7 @@ update_check:
 
 
     ; --------------------------------------------------------------------------
-    ; Pakiet jest gotowy.
+    ; Pakiet gotowy.
     ; --------------------------------------------------------------------------
 
     mov byte [rel update_pending], 1
@@ -353,7 +384,7 @@ update_check:
 ;   2. magic
 ;   3. liczbę modułów
 ;   4. granice nagłówków
-;   5. checksum
+;   5. checksum nagłówków
 ;
 ; ==============================================================================
 
@@ -441,12 +472,12 @@ update_verify:
 
 
     ; --------------------------------------------------------------------------
-    ; Rozmiar / 8.
+    ; Liczba QWORD.
     ; --------------------------------------------------------------------------
 
-    shr rax, 3
-
     mov rcx, rax
+
+    shr rcx, 3
 
     test rcx, rcx
     jz .bad
@@ -473,7 +504,7 @@ update_verify:
 
 
     ; --------------------------------------------------------------------------
-    ; Porównaj checksum.
+    ; Porównanie checksum.
     ; --------------------------------------------------------------------------
 
     cmp rax, rbx
@@ -513,9 +544,7 @@ update_verify:
 ; UPDATE APPLY
 ; ==============================================================================
 ;
-; Aktywuje wszystkie poprawne moduły z update.pkg.
-;
-; Każdy moduł jest obsługiwany osobno przez AHS-TUS.
+; Aktywuje moduły z update.pkg.
 ;
 ; ==============================================================================
 
@@ -545,14 +574,18 @@ update_apply:
 
 
     ; --------------------------------------------------------------------------
-    ; Wyzeruj licznik.
+    ; Wyzeruj stan aktywowanych modułów.
     ; --------------------------------------------------------------------------
 
     mov dword [rel updated_count], 0
 
+    mov qword [rel current_generation], 0
+
+    mov dword [rel current_vector_id], 0
+
 
     ; --------------------------------------------------------------------------
-    ; Pierwszy header modułu.
+    ; Pierwszy header.
     ; --------------------------------------------------------------------------
 
     mov rsi, PKG_LOAD_ADDR + 24
@@ -591,6 +624,13 @@ update_apply:
     mov rbx, [rsi + 32]
 
     mov r10, [rsi + 40]
+
+
+    ; --------------------------------------------------------------------------
+    ; Zapamiętaj bieżący Vector ID.
+    ; --------------------------------------------------------------------------
+
+    mov [rel current_vector_id], r12d
 
 
     ; ==========================================================================
@@ -703,7 +743,7 @@ update_apply:
 .destination_explicit:
 
     ; --------------------------------------------------------------------------
-    ; Destination musi być dokładnie początkiem własnego slotu.
+    ; Destination musi być początkiem własnego slotu.
     ; --------------------------------------------------------------------------
 
     cmp rdi, rdx
@@ -713,7 +753,7 @@ update_apply:
 .destination_ready:
 
     ; --------------------------------------------------------------------------
-    ; Sprawdzenie wyrównania.
+    ; Wyrównanie.
     ; --------------------------------------------------------------------------
 
     test rdi, MODULE_SLOT_MASK
@@ -756,18 +796,25 @@ update_apply:
 
 
     ; --------------------------------------------------------------------------
-    ; Nie wyjdź poza cały obszar modułów.
+    ; Nie wyjdź poza cały obszar.
     ; --------------------------------------------------------------------------
 
     cmp rax, MODULE_AREA_END
     ja .module_failed_metadata
 
 
+    ; --------------------------------------------------------------------------
+    ; Zapamiętaj moduł.
+    ; --------------------------------------------------------------------------
+
+    mov [rel current_module_address], rdi
+    mov [rel current_module_size], r13
+    mov [rel current_module_checksum], rbx
+
+
     ; ==========================================================================
     ; AHS-TUS BEGIN
     ; ==========================================================================
-    ;
-    ; Vector -> LOADING
     ;
     ; RAX = generation
     ; ==========================================================================
@@ -779,30 +826,20 @@ update_apply:
     cmp rax, -1
     je .module_failed_state
 
-    mov r9, rax
+
+    ; --------------------------------------------------------------------------
+    ; WAŻNE:
+    ;
+    ; generation zapisujemy w pamięci.
+    ; Nie może zostać utracona podczas kopiowania.
+    ; --------------------------------------------------------------------------
+
+    mov [rel current_generation], rax
 
 
     ; ==========================================================================
     ; STATIC MALWARE CHECK
     ; ==========================================================================
-    ;
-    ; Sprawdzamy tylko aktualny moduł.
-    ;
-    ; RCX = source
-    ; RDX = size
-    ; R8  = checksum
-    ;
-    ; ==========================================================================
-
-    push rsi
-    push rdi
-    push rbx
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
 
     mov rcx, r11
     mov rdx, r13
@@ -810,24 +847,7 @@ update_apply:
 
     call malicious_check_static
 
-    mov r8, rax
-
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop rbx
-    pop rdi
-    pop rsi
-
-
-    ; --------------------------------------------------------------------------
-    ; Skan wykrył problem.
-    ; --------------------------------------------------------------------------
-
-    test r8, r8
+    test rax, rax
     jnz .static_malware_failed
 
 
@@ -903,22 +923,35 @@ update_apply:
     ; ==========================================================================
     ; BACKUP STAREGO VECTOR
     ; ==========================================================================
+    ;
+    ; Backup zapisujemy przed zmianą Vectora.
+    ; ==========================================================================
 
     mov ecx, r12d
 
     call update_get_vector_address
 
     ; --------------------------------------------------------------------------
-    ; Index backupu = updated_count
+    ; Index = aktualny updated_count.
     ; --------------------------------------------------------------------------
 
     mov edx, [rel updated_count]
+
+    cmp edx, MAX_MODULES
+    jae .module_failed_state
+
+
+    ; --------------------------------------------------------------------------
+    ; Backup.
+    ; --------------------------------------------------------------------------
 
     mov [rel backup_vectors + rdx * 8], rax
 
     mov [rel updated_vector_ids + rdx * 4], r12d
 
-    mov [rel updated_generations + rdx * 8], r9
+    mov rax, [rel current_generation]
+
+    mov [rel updated_generations + rdx * 8], rax
 
 
     ; ==========================================================================
@@ -936,6 +969,18 @@ update_apply:
 
 
     ; ==========================================================================
+    ; WAŻNE:
+    ;
+    ; Moduł zostaje dodany do listy aktywnych NATYCHMIAST po hot-swapie.
+    ;
+    ; Dzięki temu jeżeli INIT albo post-scan zawiedzie,
+    ; update_rollback może znaleźć również bieżący moduł.
+    ; ==========================================================================
+
+    inc dword [rel updated_count]
+
+
+    ; ==========================================================================
     ; INIT
     ; ==========================================================================
     ;
@@ -944,7 +989,7 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     call update_mark_init
 
@@ -956,17 +1001,14 @@ update_apply:
     ; POST-ACTIVATION MALWARE SCAN
     ; ==========================================================================
     ;
-    ; Skanujemy teraz rzeczywisty obraz modułu znajdujący się już w jego slocie.
-    ;
-    ; To pozwala wykryć zmianę obrazu po skopiowaniu.
-    ;
+    ; Skan rzeczywistego obrazu po hot-swapie.
     ; ==========================================================================
 
-    mov rcx, rdi
+    mov rcx, [rel current_module_address]
 
-    mov rdx, r13
+    mov rdx, [rel current_module_size]
 
-    mov r8, rbx
+    mov r8, [rel current_module_checksum]
 
     call malicious_check_static
 
@@ -983,7 +1025,7 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     call update_mark_success
 
@@ -992,10 +1034,8 @@ update_apply:
 
 
     ; --------------------------------------------------------------------------
-    ; Moduł został poprawnie aktywowany.
+    ; Moduł poprawnie aktywowany.
     ; --------------------------------------------------------------------------
-
-    inc dword [rel updated_count]
 
     jmp .next_module
 
@@ -1007,11 +1047,16 @@ update_apply:
 .module_failed_metadata:
 
     ; --------------------------------------------------------------------------
-    ; Jeżeli Vector ID jest poprawny, możemy oznaczyć FAILED.
+    ; Nie próbuj używać niepoprawnego Vector ID.
     ; --------------------------------------------------------------------------
 
     cmp r12d, MAX_VECTOR_ID
     ja .next_module
+
+
+    ; --------------------------------------------------------------------------
+    ; Rozpocznij status dla poprawnego ID.
+    ; --------------------------------------------------------------------------
 
     mov rcx, r12
 
@@ -1020,10 +1065,18 @@ update_apply:
     cmp rax, -1
     je .next_module
 
-    mov r9, rax
+
+    mov [rel current_generation], rax
+
+
+    ; --------------------------------------------------------------------------
+    ; FAILED.
+    ; --------------------------------------------------------------------------
 
     mov rcx, r12
-    mov rdx, r9
+
+    mov rdx, [rel current_generation]
+
     mov r8d, UPDATE_ERROR_VECTOR
 
     call update_mark_failed
@@ -1048,7 +1101,7 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     mov r8d, UPDATE_ERROR_MALWARE
 
@@ -1065,11 +1118,15 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     mov r8d, UPDATE_ERROR_VECTOR
 
     call update_mark_failed
+
+    ; --------------------------------------------------------------------------
+    ; Vector nie został zmieniony, więc nie wykonujemy rollbacku.
+    ; --------------------------------------------------------------------------
 
     jmp .next_module
 
@@ -1082,7 +1139,7 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     mov r8d, UPDATE_ERROR_INIT_FAILED
 
@@ -1099,7 +1156,7 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     mov r8d, UPDATE_ERROR_MALWARE
 
@@ -1116,7 +1173,7 @@ update_apply:
 
     mov rcx, r12
 
-    mov rdx, r9
+    mov rdx, [rel current_generation]
 
     mov r8d, UPDATE_ERROR_BAD_STATE
 
@@ -1200,8 +1257,11 @@ update_apply:
 ; UPDATE ROLLBACK
 ; ==============================================================================
 ;
-; RCX = -1 -> rollback wszystkich aktywnych modułów
-; RCX = Vector ID -> rollback konkretnego modułu
+; RCX = -1       -> rollback wszystkich
+; RCX = VectorID -> rollback konkretnego Vectora
+;
+; Wynik:
+;   RAX = liczba wykonanych rollbacków
 ;
 ; ==============================================================================
 
@@ -1212,6 +1272,10 @@ update_rollback:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
     push r12
     push r13
 
@@ -1231,7 +1295,7 @@ update_rollback:
 
 
     ; --------------------------------------------------------------------------
-    ; Liczba aktywnych modułów.
+    ; Liczba aktywnych wpisów.
     ; --------------------------------------------------------------------------
 
     mov ebx, [rel updated_count]
@@ -1240,17 +1304,21 @@ update_rollback:
     jz .nothing
 
 
+    ; ==========================================================================
+    ; ROLLBACK WSZYSTKICH
+    ; ==========================================================================
+
+    cmp r12, -1
+    jne .rollback_specific
+
+
     xor ecx, ecx
 
 
-; ==============================================================================
-; ROLLBACK LOOP
-; ==============================================================================
-
-.rollback_loop:
+.rollback_all_loop:
 
     cmp ecx, ebx
-    jae .done
+    jae .rollback_all_done
 
 
     ; --------------------------------------------------------------------------
@@ -1261,59 +1329,22 @@ update_rollback:
 
 
     ; --------------------------------------------------------------------------
-    ; Jeśli rollback konkretnego ID:
-    ; --------------------------------------------------------------------------
-
-    cmp r12, -1
-    je .rollback_this
-
-    cmp rdx, r12
-    jne .next
-
-
-.rollback_this:
-
-    ; --------------------------------------------------------------------------
-    ; Pobierz backup.
+    ; Backup.
     ; --------------------------------------------------------------------------
 
     mov rax, rcx
-
     shl rax, 3
 
     mov rsi, [rel backup_vectors + rax]
 
 
     ; --------------------------------------------------------------------------
-    ; Jeśli nie ma starego Vector:
-    ; wyzeruj Vector.
+    ; Przywróć tylko jeśli backup istnieje.
     ; --------------------------------------------------------------------------
 
     test rsi, rsi
-    jnz .restore_vector
+    jz .rollback_all_clear
 
-
-    ; --------------------------------------------------------------------------
-    ; Brak poprzedniego adresu.
-    ; --------------------------------------------------------------------------
-
-    mov rcx, rdx
-
-    xor edx, edx
-
-    ; update_register_vector odrzuca 0,
-    ; dlatego przy braku starego adresu nie wykonujemy rejestracji.
-    ;
-    ; Vector pozostaje taki jak jest tylko w tym szczególnym przypadku.
-    ;
-    jmp .clear_backup
-
-
-.restore_vector:
-
-    ; --------------------------------------------------------------------------
-    ; Przywróć stary Vector.
-    ; --------------------------------------------------------------------------
 
     push rcx
 
@@ -1326,60 +1357,202 @@ update_rollback:
     pop rcx
 
     test rax, rax
-    jnz .clear_backup
+    jnz .rollback_all_clear
 
     inc r13d
 
 
-.clear_backup:
-
-    ; --------------------------------------------------------------------------
-    ; Wyzeruj backup.
-    ; --------------------------------------------------------------------------
+.rollback_all_clear:
 
     mov rax, rcx
-
     shl rax, 3
 
     mov qword [rel backup_vectors + rax], 0
 
-
-    ; --------------------------------------------------------------------------
-    ; Wyzeruj ID.
-    ; --------------------------------------------------------------------------
+    mov qword [rel updated_generations + rax], 0
 
     mov dword [rel updated_vector_ids + rcx * 4], 0
 
-
-.next:
-
     inc ecx
 
-    jmp .rollback_loop
+    jmp .rollback_all_loop
 
 
-; ==============================================================================
-; ROLLBACK DONE
-; ==============================================================================
-
-.done:
-
-    ; --------------------------------------------------------------------------
-    ; Jeśli wykonaliśmy rollback wszystkich, licznik aktywnych modułów = 0.
-    ; --------------------------------------------------------------------------
-
-    cmp r12, -1
-    jne .return_count
+.rollback_all_done:
 
     mov dword [rel updated_count], 0
 
+    jmp .rollback_return
 
-.return_count:
+
+; ==============================================================================
+; ROLLBACK SPECIFIC
+; ==============================================================================
+
+.rollback_specific:
+
+    xor ecx, ecx
+
+
+.rollback_find:
+
+    cmp ecx, ebx
+    jae .rollback_return
+
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź Vector ID.
+    ; --------------------------------------------------------------------------
+
+    mov edx, [rel updated_vector_ids + rcx * 4]
+
+    cmp edx, r12d
+    je .rollback_found
+
+
+    inc ecx
+
+    jmp .rollback_find
+
+
+; ==============================================================================
+; FOUND
+; ==============================================================================
+
+.rollback_found:
+
+    ; --------------------------------------------------------------------------
+    ; Backup.
+    ; --------------------------------------------------------------------------
+
+    mov rax, rcx
+    shl rax, 3
+
+    mov rsi, [rel backup_vectors + rax]
+
+
+    ; --------------------------------------------------------------------------
+    ; Jeżeli nie ma backupu, tylko usuń wpis.
+    ; --------------------------------------------------------------------------
+
+    test rsi, rsi
+    jz .remove_entry
+
+
+    ; --------------------------------------------------------------------------
+    ; Przywróć Vector.
+    ; --------------------------------------------------------------------------
+
+    push rcx
+
+    mov rcx, r12
+
+    mov rdx, rsi
+
+    call update_register_vector
+
+    pop rcx
+
+    test rax, rax
+    jnz .remove_entry
+
+
+    inc r13d
+
+
+; ==============================================================================
+; REMOVE ENTRY
+; ==============================================================================
+;
+; Usuwamy wpis z tablicy kompaktowo:
+;
+;   [index] <- [last]
+;   updated_count--
+;
+; Dzięki temu nie zostają dziury.
+; ==============================================================================
+
+.remove_entry:
+
+    mov eax, ebx
+
+    dec eax
+
+    cmp ecx, eax
+    je .remove_last
+
+
+    ; --------------------------------------------------------------------------
+    ; Przenieś ostatni wpis na miejsce usuniętego.
+    ; --------------------------------------------------------------------------
+
+    mov edx, [rel updated_vector_ids + rax * 4]
+
+    mov [rel updated_vector_ids + rcx * 4], edx
+
+
+    ; --------------------------------------------------------------------------
+    ; Backup.
+    ; --------------------------------------------------------------------------
+
+    mov r8, rax
+    shl r8, 3
+
+    mov r9, [rel backup_vectors + r8]
+
+    mov r10, rcx
+    shl r10, 3
+
+    mov [rel backup_vectors + r10], r9
+
+
+    ; --------------------------------------------------------------------------
+    ; Generation.
+    ; --------------------------------------------------------------------------
+
+    mov r9, [rel updated_generations + r8]
+
+    mov [rel updated_generations + r10], r9
+
+
+.remove_last:
+
+    ; --------------------------------------------------------------------------
+    ; Wyzeruj ostatni wpis.
+    ; --------------------------------------------------------------------------
+
+    mov rax, [rel updated_count]
+
+    dec rax
+
+    mov r8, rax
+
+    shl r8, 3
+
+    mov qword [rel backup_vectors + r8], 0
+
+    mov qword [rel updated_generations + r8], 0
+
+    mov dword [rel updated_vector_ids + rax * 4], 0
+
+
+    ; --------------------------------------------------------------------------
+    ; Zmniejsz liczbę aktywnych.
+    ; --------------------------------------------------------------------------
+
+    dec dword [rel updated_count]
+
+
+.rollback_return:
 
     mov eax, r13d
 
     pop r13
     pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -1399,6 +1572,10 @@ update_rollback:
 
     pop r13
     pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -1413,7 +1590,7 @@ update_rollback:
 ; ==============================================================================
 ;
 ; RAX = 1 -> aktualizacja oczekuje
-; RAX = 0 -> brak aktualizacji
+; RAX = 0 -> brak
 ;
 ; ==============================================================================
 
