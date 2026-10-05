@@ -5,8 +5,23 @@
 ; Architektura : x86-64
 ; Składnia     : NASM
 ;
-; UEFI -> BOOTX64.EFI -> GOP -> kernel.bin -> BootInfo -> ExitBootServices
+; UEFI -> BOOTX64.EFI -> GOP -> kernel.bin -> BootInfo
+; -> ACPI RSDP -> memory map -> ExitBootServices
 ; -> kernel @ 0x00100000
+;
+; BootInfo:
+;
+;   +0x00  framebuffer address
+;   +0x08  framebuffer size
+;   +0x10  width
+;   +0x14  height
+;   +0x18  pixels per scanline
+;   +0x1C  pixel format
+;   +0x20  memory map pointer
+;   +0x28  memory map size
+;   +0x30  descriptor size
+;   +0x38  descriptor version
+;   +0x40  ACPI RSDP pointer
 ;
 ; ==============================================================================
 
@@ -47,6 +62,25 @@ file_info_guid:
 
 
 ; ==============================================================================
+; ACPI GUIDS
+; ==============================================================================
+
+; ACPI 2.0 / EFI_ACPI_20_TABLE_GUID
+acpi2_guid:
+    dd 0x8868E871
+    dw 0xE4F1
+    dw 0x11D3
+    db 0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81
+
+; ACPI 1.0 / EFI_ACPI_TABLE_GUID
+acpi1_guid:
+    dd 0xEB9D2D30
+    dw 0x2D88
+    dw 0x11D3
+    db 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D
+
+
+; ==============================================================================
 ; CONSTANTS
 ; ==============================================================================
 
@@ -78,7 +112,9 @@ MAX_KERNEL_SIZE equ 0x01000000
 ; EFI SYSTEM TABLE
 ; ==============================================================================
 
-SYSTEM_TABLE_BOOT_SERVICES equ 0x60
+SYSTEM_TABLE_BOOT_SERVICES        equ 0x60
+SYSTEM_TABLE_NUMBER_OF_TABLES     equ 0x68
+SYSTEM_TABLE_CONFIGURATION_TABLE  equ 0x70
 
 
 ; ==============================================================================
@@ -143,16 +179,13 @@ _start:
 
     ; 32 bajty shadow space + miejsce na argumenty stosowe.
     ;
-    ; Dla wywołań UEFI:
-    ;   [rsp + 0x20] = piąty argument funkcji
-    ;
-    ; UEFI korzysta z konwencji x64:
+    ; UEFI x64:
     ;   RCX = argument 1
     ;   RDX = argument 2
     ;   R8  = argument 3
     ;   R9  = argument 4
-    ;   [rsp+0x20] = argument 5
-    ;
+    ;   [RSP+0x20] = argument 5
+
     sub rsp, 0x40
 
 
@@ -394,7 +427,6 @@ _start:
 
     xor rax, rax
 
-    ; 5. argument = Attributes
     mov [rsp + 0x20], rax
 
     call qword [rbx + EFI_FILE_OPEN_OFFSET]
@@ -543,7 +575,104 @@ _start:
 
 
 ; ==============================================================================
-; 15. BOOTINFO - GOP
+; 15. FIND ACPI RSDP
+; ==============================================================================
+;
+; EFI_SYSTEM_TABLE:
+;
+; +0x68 = NumberOfTableEntries
+; +0x70 = ConfigurationTable
+;
+; EFI_CONFIGURATION_TABLE:
+;
+; +0x00 = VendorGuid
+; +0x10 = VendorTable
+;
+; Szukamy najpierw ACPI 2.0.
+; Jeśli go nie ma, używamy ACPI 1.0.
+;
+; ==============================================================================
+
+    mov rsi, [rel sys_table]
+
+    mov rcx, [rsi + SYSTEM_TABLE_NUMBER_OF_TABLES]
+
+    mov rdi, [rsi + SYSTEM_TABLE_CONFIGURATION_TABLE]
+
+    mov qword [rel acpi_rsdp], 0
+
+    test rcx, rcx
+    jz .acpi_done
+
+    test rdi, rdi
+    jz .acpi_done
+
+
+.acpi_scan:
+
+    cmp rcx, 0
+    je .acpi_done
+
+    mov rax, [rdi + 0x10]
+
+    test rax, rax
+    jz .acpi_next
+
+
+; ------------------------------------------------------------------------------
+; ACPI 2.0
+; ------------------------------------------------------------------------------
+
+    mov rdx, [rdi + 0x00]
+
+    cmp rdx, [rel acpi2_guid + 0x00]
+    jne .check_acpi1
+
+    mov rdx, [rdi + 0x08]
+
+    cmp rdx, [rel acpi2_guid + 0x08]
+    jne .check_acpi1
+
+    mov [rel acpi_rsdp], rax
+
+    jmp .acpi_done
+
+
+; ------------------------------------------------------------------------------
+; ACPI 1.0
+; ------------------------------------------------------------------------------
+
+.check_acpi1:
+
+    mov rdx, [rdi + 0x00]
+
+    cmp rdx, [rel acpi1_guid + 0x00]
+    jne .acpi_next
+
+    mov rdx, [rdi + 0x08]
+
+    cmp rdx, [rel acpi1_guid + 0x08]
+    jne .acpi_next
+
+    mov [rel acpi_rsdp], rax
+
+    jmp .acpi_done
+
+
+.acpi_next:
+
+    add rdi, 24
+
+    dec rcx
+
+    jmp .acpi_scan
+
+
+.acpi_done:
+
+
+; ==============================================================================
+; 16. BOOTINFO - GOP
 ; ==============================================================================
 
     mov rax, [rel fb_base]
@@ -570,9 +699,13 @@ _start:
 
     mov [rel boot_info + 0x1C], eax
 
+    mov rax, [rel acpi_rsdp]
+
+    mov [rel boot_info + 0x40], rax
+
 
 ; ==============================================================================
-; 16. FIRST GET MEMORY MAP
+; 17. FIRST GET MEMORY MAP
 ; ==============================================================================
 
     mov r11, [rel boot_services]
@@ -589,7 +722,6 @@ _start:
 
     xor r9, r9
 
-    ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
     mov [rsp + 0x20], rax
@@ -601,7 +733,7 @@ _start:
 
 
 ; ==============================================================================
-; 17. CHECK MEMORY MAP SIZE
+; 18. CHECK MEMORY MAP SIZE
 ; ==============================================================================
 
     mov rax, [rel mmap_size]
@@ -617,7 +749,7 @@ _start:
 
 
 ; ==============================================================================
-; 18. SECOND GET MEMORY MAP
+; 19. SECOND GET MEMORY MAP
 ; ==============================================================================
 
     mov r11, [rel boot_services]
@@ -638,7 +770,6 @@ _start:
 
     lea r9, [rel mmap_desc_size]
 
-    ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
     mov [rsp + 0x20], rax
@@ -650,7 +781,7 @@ _start:
 
 
 ; ==============================================================================
-; 19. VALIDATE MEMORY MAP
+; 20. VALIDATE MEMORY MAP
 ; ==============================================================================
 
     cmp qword [rel mmap_size], 0
@@ -661,7 +792,7 @@ _start:
 
 
 ; ==============================================================================
-; 20. BOOTINFO - MEMORY MAP
+; 21. BOOTINFO - MEMORY MAP
 ; ==============================================================================
 
     lea rax, [rel mmap_buffer]
@@ -682,7 +813,7 @@ _start:
 
 
 ; ==============================================================================
-; 21. EXIT BOOT SERVICES
+; 22. EXIT BOOT SERVICES
 ; ==============================================================================
 
 .exit_boot_services:
@@ -704,11 +835,7 @@ _start:
 
 
 ; ==============================================================================
-; 22. MEMORY MAP CHANGED
-; ==============================================================================
-;
-; Musimy ponownie wykonać GetMemoryMap().
-;
+; 23. MEMORY MAP CHANGED
 ; ==============================================================================
 
 .retry_memory_map:
@@ -731,7 +858,6 @@ _start:
 
     lea r9, [rel mmap_desc_size]
 
-    ; 5. argument = DescriptorVersion*
     lea rax, [rel mmap_desc_version]
 
     mov [rsp + 0x20], rax
@@ -743,7 +869,7 @@ _start:
 
 
 ; ==============================================================================
-; 23. UPDATE BOOTINFO
+; 24. UPDATE BOOTINFO
 ; ==============================================================================
 
     lea rax, [rel mmap_buffer]
@@ -764,7 +890,7 @@ _start:
 
 
 ; ==============================================================================
-; 24. RETRY EXIT BOOT SERVICES
+; 25. RETRY EXIT BOOT SERVICES
 ; ==============================================================================
 
     mov r11, [rel boot_services]
@@ -787,7 +913,7 @@ _start:
 
 
 ; ==============================================================================
-; 25. BOOT SERVICES EXITED
+; 26. BOOT SERVICES EXITED
 ; ==============================================================================
 
 .boot_services_exited:
@@ -795,9 +921,11 @@ _start:
     mov qword [rel boot_services], 0
 
     ; RCX = BootInfo
+
     lea rcx, [rel boot_info]
 
     ; RAX = Kernel
+
     mov rax, KERNEL_LOAD_ADDRESS
 
     jmp rax
@@ -868,6 +996,14 @@ fb_pps:
 
 fb_pixel_format:
     dd 0
+
+
+; ==============================================================================
+; ACPI
+; ==============================================================================
+
+acpi_rsdp:
+    dq 0
 
 
 ; ==============================================================================
@@ -964,6 +1100,9 @@ boot_info:
 
     ; padding
     dd 0
+
+    ; +0x40 ACPI RSDP pointer
+    dq 0
 
 
 ; ==============================================================================
