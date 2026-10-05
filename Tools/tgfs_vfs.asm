@@ -4,6 +4,8 @@
 ; Blitrum OS - x86-64 / NASM
 ;
 ; Wersja poprawiona:
+;   - sprawdzanie CF po KAŻDYM ahci_read_sectors
+;   - bezpieczny mount TGFS
 ;   - walidacja TGFS registry
 ;   - walidacja LBA
 ;   - walidacja rozmiaru pliku
@@ -66,19 +68,13 @@ TGFS_MAX_ENTRIES          equ 8
 
 TGFS_SECTOR_SIZE          equ 512
 
-; Maksymalny rozmiar pojedynczego pliku ładowanego przez TGFS.
-; Chroni przed absurdalnym rozmiarem z uszkodzonego registry.
-TGFS_MAX_FILE_SIZE        equ 0x00200000        ; 2 MiB
-
+TGFS_MAX_FILE_SIZE        equ 0x00200000
 TGFS_MIN_FILE_SIZE        equ 1
 
-; --------------------------------------------------------------------------
-; Bezpieczny obszar pamięci dla ładowanych modułów.
-;
-; 0x04000000 - 0x06000000
-;
-; Ten zakres jest również używany przez runtime protection.
-; --------------------------------------------------------------------------
+
+; ==============================================================================
+; BEZPIECZNY OBSZAR ŁADOWANIA
+; ==============================================================================
 
 TGFS_LOAD_MIN             equ 0x04000000
 TGFS_LOAD_MAX             equ 0x06000000
@@ -88,7 +84,7 @@ TGFS_LOAD_MAX             equ 0x06000000
 ; ELF64
 ; ==============================================================================
 
-ELF_MAGIC                 equ 0x464C457F        ; "\x7FELF"
+ELF_MAGIC                 equ 0x464C457F
 
 ELF_CLASS_64              equ 2
 ELF_DATA_LSB              equ 1
@@ -105,8 +101,8 @@ ELF64_PHDR_SIZE           equ 56
 ; PE32+
 ; ==============================================================================
 
-PE_DOS_MAGIC              equ 0x5A4D            ; MZ
-PE_SIGNATURE              equ 0x00004550        ; PE\0\0
+PE_DOS_MAGIC              equ 0x5A4D
+PE_SIGNATURE              equ 0x00004550
 PE64_OPTIONAL_MAGIC       equ 0x020B
 
 
@@ -160,11 +156,6 @@ vfs_mount_drive:
     push rsi
     push r12
 
-    ; --------------------------------------------------------------------------
-    ; RCX = port SATA
-    ; Zachowujemy go w R12.
-    ; --------------------------------------------------------------------------
-
     mov r12, rcx
 
     sub rsp, TGFS_SECTOR_SIZE
@@ -182,12 +173,21 @@ vfs_mount_drive:
     call ahci_read_sectors
 
     ; --------------------------------------------------------------------------
-    ; Sprawdź sygnaturę.
+    ; KRYTYCZNE:
+    ; CF = 1 oznacza błąd AHCI.
+    ;
+    ; Nie wolno wtedy analizować bufora.
+    ; --------------------------------------------------------------------------
+
+    jc .unknown_fs
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź sygnaturę TGFS.
     ; --------------------------------------------------------------------------
 
     mov eax, [rsp]
 
-    cmp eax, 0x53464754       ; "TGFS"
+    cmp eax, 0x53464754
     jne .unknown_fs
 
     ; --------------------------------------------------------------------------
@@ -196,13 +196,15 @@ vfs_mount_drive:
 
     mov rax, [rsp + 8]
 
-    ; LBA nie może być zerowe.
     test rax, rax
     jz .invalid_superblock
 
-    ; Registry musi znajdować się poza sektorem MBR.
     cmp rax, 1
     jbe .invalid_superblock
+
+    ; --------------------------------------------------------------------------
+    ; Zapamiętaj registry.
+    ; --------------------------------------------------------------------------
 
     mov [rel tgfs_registry_lba], rax
 
@@ -275,15 +277,40 @@ tgfs_find_files_by_tag:
     mov r13, r8
     mov r14, rcx
 
+    ; --------------------------------------------------------------------------
+    ; Output buffer musi istnieć.
+    ; --------------------------------------------------------------------------
+
+    test r13, r13
+    jz .search_error_no_stack
+
     sub rsp, TGFS_SECTOR_SIZE
 
     mov r9, rsp
 
+    ; --------------------------------------------------------------------------
+    ; Odczytaj registry.
+    ; --------------------------------------------------------------------------
+
     mov rdx, [rel tgfs_registry_lba]
+
+    test rdx, rdx
+    jz .search_error
+
+    cmp rdx, 1
+    jbe .search_error
+
     mov r8, 1
     mov rcx, r14
 
     call ahci_read_sectors
+
+    ; --------------------------------------------------------------------------
+    ; KRYTYCZNE:
+    ; AHCI read failed -> nie analizujemy registry.
+    ; --------------------------------------------------------------------------
+
+    jc .search_error
 
     xor rsi, rsi
     xor rbx, rbx
@@ -323,7 +350,8 @@ tgfs_find_files_by_tag:
     jne .next_entry
 
     ; --------------------------------------------------------------------------
-    ; Maksymalnie nie zapisujemy poza oczekiwany output.
+    ; Zapisz ID do output.
+    ;
     ; Caller powinien dostarczyć bufor >= 8 DWORD.
     ; --------------------------------------------------------------------------
 
@@ -343,6 +371,29 @@ tgfs_find_files_by_tag:
     mov rax, rsi
 
     add rsp, TGFS_SECTOR_SIZE
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop r9
+    pop r8
+    pop rbx
+
+    ret
+
+
+.search_error:
+
+    add rsp, TGFS_SECTOR_SIZE
+
+.search_error_no_stack:
+
+    xor eax, eax
 
     pop r15
     pop r14
@@ -394,10 +445,6 @@ tgfs_load_and_map_file:
     push r14
     push r15
 
-    ; --------------------------------------------------------------------------
-    ; Domyślnie brak poprawnego pliku.
-    ; --------------------------------------------------------------------------
-
     mov qword [rel tgfs_last_file_size], 0
 
     ; --------------------------------------------------------------------------
@@ -420,11 +467,15 @@ tgfs_load_and_map_file:
     jz .load_error
 
     ; --------------------------------------------------------------------------
-    ; Destination musi znajdować się w izolowanym obszarze modułów.
+    ; Destination >= TGFS_LOAD_MIN
     ; --------------------------------------------------------------------------
 
     cmp r13, TGFS_LOAD_MIN
     jb .load_error
+
+    ; --------------------------------------------------------------------------
+    ; Destination < TGFS_LOAD_MAX
+    ; --------------------------------------------------------------------------
 
     cmp r13, TGFS_LOAD_MAX
     jae .load_error
@@ -439,7 +490,6 @@ tgfs_load_and_map_file:
 
     mov rdx, [rel tgfs_registry_lba]
 
-    ; Registry LBA musi być poprawne.
     test rdx, rdx
     jz .load_error_stack
 
@@ -450,6 +500,13 @@ tgfs_load_and_map_file:
     mov rcx, r14
 
     call ahci_read_sectors
+
+    ; --------------------------------------------------------------------------
+    ; KRYTYCZNE:
+    ; Jeśli registry nie zostało odczytane, kończymy.
+    ; --------------------------------------------------------------------------
+
+    jc .load_error_stack
 
     xor rbx, rbx
 
@@ -527,17 +584,13 @@ tgfs_load_and_map_file:
     ja .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; Sprawdzenie:
-    ;
     ; sectors = ceil(size / 512)
-    ;
-    ; Dla max 2 MiB będzie maksymalnie 4096 sektorów.
     ; --------------------------------------------------------------------------
 
     mov r15, rsi
+
     add r15, TGFS_SECTOR_SIZE - 1
 
-    ; Overflow.
     jc .load_error_stack
 
     shr r15, 9
@@ -555,11 +608,13 @@ tgfs_load_and_map_file:
     mov [rel tgfs_last_file_size], rsi
 
     ; --------------------------------------------------------------------------
-    ; Sprawdzenie końca adresu destination + file size.
+    ; destination + file size
     ; --------------------------------------------------------------------------
 
     mov rax, r13
+
     add rax, rsi
+
     jc .load_error_stack
 
     cmp rax, TGFS_LOAD_MAX
@@ -579,6 +634,13 @@ tgfs_load_and_map_file:
     mov r9, r13
 
     call ahci_read_sectors
+
+    ; --------------------------------------------------------------------------
+    ; KRYTYCZNE:
+    ; Nie zwracamy sukcesu po nieudanym odczycie.
+    ; --------------------------------------------------------------------------
+
+    jc .load_error_stack
 
     mov rax, rsi
 
@@ -614,6 +676,12 @@ tgfs_load_and_map_file:
 
     call ahci_read_sectors
 
+    ; --------------------------------------------------------------------------
+    ; Sprawdź wynik AHCI.
+    ; --------------------------------------------------------------------------
+
+    jc .load_error_stack
+
     mov rax, r13
 
     jmp .clean_exit
@@ -626,7 +694,7 @@ tgfs_load_and_map_file:
 .handle_foreign_elf:
 
     ; --------------------------------------------------------------------------
-    ; Najpierw załaduj cały plik do destination.
+    ; Załaduj cały plik do destination.
     ; --------------------------------------------------------------------------
 
     mov rcx, r14
@@ -637,6 +705,13 @@ tgfs_load_and_map_file:
     call ahci_read_sectors
 
     ; --------------------------------------------------------------------------
+    ; KRYTYCZNE:
+    ; Nie walidujemy bufora po nieudanym odczycie.
+    ; --------------------------------------------------------------------------
+
+    jc .load_error_stack
+
+    ; --------------------------------------------------------------------------
     ; ELF magic
     ; --------------------------------------------------------------------------
 
@@ -644,12 +719,15 @@ tgfs_load_and_map_file:
     jne .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; e_ident[4] = ELFCLASS64
-    ; e_ident[5] = little endian
+    ; ELFCLASS64
     ; --------------------------------------------------------------------------
 
     cmp byte [r13 + 4], ELF_CLASS_64
     jne .load_error_stack
+
+    ; --------------------------------------------------------------------------
+    ; Little endian
+    ; --------------------------------------------------------------------------
 
     cmp byte [r13 + 5], ELF_DATA_LSB
     jne .load_error_stack
@@ -705,9 +783,6 @@ tgfs_load_and_map_file:
 
     ; --------------------------------------------------------------------------
     ; e_phoff + e_phnum * e_phentsize <= file size
-    ;
-    ; e_phoff = +32
-    ; e_phnum = +56
     ; --------------------------------------------------------------------------
 
     mov rax, [r13 + 32]
@@ -724,6 +799,7 @@ tgfs_load_and_map_file:
     jc .load_error_stack
 
     add rax, rcx
+
     jc .load_error_stack
 
     cmp rax, rsi
@@ -732,8 +808,7 @@ tgfs_load_and_map_file:
     ; --------------------------------------------------------------------------
     ; e_entry != 0
     ;
-    ; Nie wykonujemy jeszcze pełnego segment loadera.
-    ; Zwracamy entrypoint zgodnie z dotychczasowym API.
+    ; Pełne PT_LOAD mapping będzie osobnym etapem.
     ; --------------------------------------------------------------------------
 
     mov rax, [r13 + 24]
@@ -762,6 +837,12 @@ tgfs_load_and_map_file:
     call ahci_read_sectors
 
     ; --------------------------------------------------------------------------
+    ; Sprawdź wynik AHCI.
+    ; --------------------------------------------------------------------------
+
+    jc .load_error_stack
+
+    ; --------------------------------------------------------------------------
     ; DOS MZ
     ; --------------------------------------------------------------------------
 
@@ -769,7 +850,7 @@ tgfs_load_and_map_file:
     jne .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; e_lfanew musi znajdować się wewnątrz pliku.
+    ; e_lfanew
     ; --------------------------------------------------------------------------
 
     mov eax, [r13 + 0x3C]
@@ -783,13 +864,14 @@ tgfs_load_and_map_file:
     jae .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; Potrzebujemy minimum:
-    ;
-    ; PE signature + COFF header + optional header magic.
+    ; Minimum:
+    ; PE signature + COFF header + optional header.
     ; --------------------------------------------------------------------------
 
     mov rax, r10
+
     add rax, 0x18
+
     jc .load_error_stack
 
     cmp rax, rsi
@@ -803,46 +885,28 @@ tgfs_load_and_map_file:
     jne .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; Optional Header Magic:
-    ;
-    ; PE header:
-    ;   +00 signature
-    ;   +04 machine
-    ;   +06 number of sections
-    ;   +14 optional header size
-    ;   +18 optional header
-    ;
-    ; OptionalHeader.Magic = +00
+    ; Optional Header Magic.
     ; --------------------------------------------------------------------------
 
     mov rax, r10
+
     add rax, 0x18
+
     movzx eax, word [r13 + rax]
 
     cmp eax, PE64_OPTIONAL_MAGIC
     jne .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; EntryPoint RVA:
-    ;
-    ; PE header offset:
-    ;   e_lfanew
-    ;
-    ; Optional Header:
-    ;   PE + 0x18
-    ;
     ; AddressOfEntryPoint:
-    ;   OptionalHeader + 0x10
     ;
-    ; czyli:
-    ;   e_lfanew + 0x28
+    ; e_lfanew + 0x28
     ; --------------------------------------------------------------------------
 
     mov rax, r10
-    add rax, 0x28
-    jc .load_error_stack
 
-    add rax, 4
+    add rax, 0x28
+
     jc .load_error_stack
 
     cmp rax, rsi
@@ -854,7 +918,7 @@ tgfs_load_and_map_file:
     jz .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; Entry RVA musi mieścić się w obrazie.
+    ; Entry RVA musi mieścić się w załadowanym obrazie.
     ; --------------------------------------------------------------------------
 
     mov r11, rax
@@ -863,11 +927,13 @@ tgfs_load_and_map_file:
     jae .load_error_stack
 
     ; --------------------------------------------------------------------------
-    ; Zwracamy adres destination + EntryPoint RVA.
+    ; Zwracamy destination + EntryPoint RVA.
     ; --------------------------------------------------------------------------
 
     mov rax, r13
+
     add rax, r11
+
     jc .load_error_stack
 
     cmp rax, TGFS_LOAD_MAX
@@ -888,6 +954,12 @@ tgfs_load_and_map_file:
     mov r9, r13
 
     call ahci_read_sectors
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź wynik AHCI.
+    ; --------------------------------------------------------------------------
+
+    jc .load_error_stack
 
     mov rax, rsi
 
@@ -1041,55 +1113,10 @@ syscall_compatibility_layer:
 
 .emulate_sys_mmap:
 
-    ; --------------------------------------------------------------------------
-    ; Obecna implementacja PMM zwraca jedną stronę.
-    ;
-    ; Nie udajemy, że mmap przydzielił większy obszar.
-    ; Zaokrąglamy żądanie do minimum jednej strony, ale alokujemy
-    ; pojedynczą stronę zgodnie z aktualnym PMM API.
-    ; --------------------------------------------------------------------------
-
     call pmm_alloc_page
 
     ret
 
 
 ; ==============================================================================
-; SYS_MUNMAP
-; ==============================================================================
-
-.emulate_sys_munmap:
-
-    push rcx
-
-    mov rcx, rdi
-
-    call pmm_free_page
-
-    pop rcx
-
-    xor rax, rax
-
-    ret
-
-
-; ==============================================================================
-; SYS_EXIT
-; ==============================================================================
-
-.emulate_sys_exit:
-
-    xor rax, rax
-
-    ret
-
-
-; ==============================================================================
-; SYS_BRK
-; ==============================================================================
-
-.emulate_sys_brk:
-
-    mov rax, rdi
-
-    ret
+;
