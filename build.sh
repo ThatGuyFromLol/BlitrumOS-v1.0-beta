@@ -1,16 +1,33 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # =============================================================================
-# BLITRUM OS - UEFI BUILD SYSTEM
+# BLITRUM OS - UEFI ONLY BUILD SYSTEM
 # =============================================================================
-# Architektura: x86-64
-# Boot: UEFI
-# Kernel: 0x00100000
-# Interrupt architecture:
-#   ACPI -> LAPIC -> IOAPIC
 #
-# PIC/PIT pozostają jeszcze jako fallback.
+# Architecture : x86-64
+# Boot         : UEFI
+#
+# Output:
+#   build/EFI/BOOT/BOOTX64.EFI
+#   build/Blitrum/kernel.bin
+#
+# Kernel load address:
+#   0x00100000
+#
+# Interrupt architecture:
+#
+#   ACPI
+#     |
+#     +---- LAPIC
+#     |       |
+#     |       +---- LAPIC Timer -> IDT 0x20 -> Scheduler
+#     |
+#     +---- IOAPIC -> device IRQs
+#
+# Legacy BIOS boot is intentionally NOT built.
+# PIT is NOT used as the scheduler timer.
+#
 # =============================================================================
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -25,18 +42,48 @@ KERNEL_ELF="$BUILD/kernel.elf"
 KERNEL_BIN="$BLITRUM_DIR/kernel.bin"
 BOOT_EFI="$EFI_DIR/BOOTX64.EFI"
 
-mkdir -p "$OBJ"
-mkdir -p "$EFI_DIR"
-mkdir -p "$BLITRUM_DIR"
-
 NASM="${NASM:-nasm}"
 LD="${LD:-ld.lld}"
 OBJCOPY="${OBJCOPY:-llvm-objcopy}"
 LLD_LINK="${LLD_LINK:-lld-link}"
 
+# =============================================================================
+# DIRECTORIES
+# =============================================================================
+
+rm -rf "$OBJ"
+
+mkdir -p "$OBJ"
+mkdir -p "$EFI_DIR"
+mkdir -p "$BLITRUM_DIR"
+
+# =============================================================================
+# TOOLCHAIN CHECK
+# =============================================================================
+
+command -v "$NASM" >/dev/null 2>&1 || {
+    echo "ERROR: NASM not found: $NASM"
+    exit 1
+}
+
+command -v "$LD" >/dev/null 2>&1 || {
+    echo "ERROR: linker not found: $LD"
+    exit 1
+}
+
+command -v "$OBJCOPY" >/dev/null 2>&1 || {
+    echo "ERROR: objcopy not found: $OBJCOPY"
+    exit 1
+}
+
+command -v "$LLD_LINK" >/dev/null 2>&1 || {
+    echo "ERROR: lld-link not found: $LLD_LINK"
+    exit 1
+}
+
 echo
 echo "============================================================"
-echo " BLITRUM OS - UEFI BUILD"
+echo " BLITRUM OS - UEFI ONLY BUILD"
 echo "============================================================"
 echo
 
@@ -44,11 +91,12 @@ echo
 # HELPERS
 # =============================================================================
 
-compile_elf64() {
+compile_elf64()
+{
     local SRC="$1"
     local OUT="$2"
 
-    echo "[NASM] $SRC"
+    echo "[NASM ELF64] $SRC"
 
     "$NASM" \
         -f elf64 \
@@ -56,11 +104,12 @@ compile_elf64() {
         -o "$OUT"
 }
 
-compile_efi() {
+compile_efi()
+{
     local SRC="$1"
     local OUT="$2"
 
-    echo "[NASM/EFI] $SRC"
+    echo "[NASM WIN64] $SRC"
 
     "$NASM" \
         -f win64 \
@@ -74,6 +123,7 @@ compile_efi() {
 
 echo
 echo "[1/4] Building UEFI bootloader..."
+echo
 
 compile_efi \
     "Bootloders/uefi_boot.asm" \
@@ -87,6 +137,11 @@ compile_efi \
     /out:"$BOOT_EFI" \
     "$OBJ/uefi_boot.o"
 
+if [ ! -f "$BOOT_EFI" ]; then
+    echo "ERROR: BOOTX64.EFI was not created."
+    exit 1
+fi
+
 echo "[OK] $BOOT_EFI"
 
 # =============================================================================
@@ -95,9 +150,10 @@ echo "[OK] $BOOT_EFI"
 
 echo
 echo "[2/4] Building kernel objects..."
+echo
 
 # -----------------------------------------------------------------------------
-# CPU / GDT / IDT
+# CORE
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -109,19 +165,22 @@ compile_elf64 \
     "$OBJ/idt.o"
 
 # -----------------------------------------------------------------------------
-# Timer / serial
+# SERIAL / TIMER
 # -----------------------------------------------------------------------------
-
-compile_elf64 \
-    "Tools/pit_timer.asm" \
-    "$OBJ/pit_timer.o"
 
 compile_elf64 \
     "Tools/serial.asm" \
     "$OBJ/serial.o"
 
+# PIT remains compiled only because the source contains legacy fallback
+# support. It is NOT used as the scheduler timer by the kernel.
+
+compile_elf64 \
+    "Tools/pit_timer.asm" \
+    "$OBJ/pit_timer.o"
+
 # -----------------------------------------------------------------------------
-# Memory manager
+# MEMORY
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -129,39 +188,39 @@ compile_elf64 \
     "$OBJ/ppm.o"
 
 # -----------------------------------------------------------------------------
-# ACPI
+# ACPI / APIC
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
     "Tools/acpi.asm" \
     "$OBJ/acpi.o"
 
-# -----------------------------------------------------------------------------
-# LAPIC
-# -----------------------------------------------------------------------------
-
 compile_elf64 \
     "Tools/lapic.asm" \
     "$OBJ/lapic.o"
-
-# -----------------------------------------------------------------------------
-# IOAPIC
-# -----------------------------------------------------------------------------
 
 compile_elf64 \
     "Tools/ioapic.asm" \
     "$OBJ/ioapic.o"
 
 # -----------------------------------------------------------------------------
-# PCI
+# PCI / STORAGE
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
     "Tools/pci_dyski.asm" \
     "$OBJ/pci_dyski.o"
 
+compile_elf64 \
+    "Tools/ahci.asm" \
+    "$OBJ/ahci.o"
+
+compile_elf64 \
+    "Tools/tgfs_vfs.asm" \
+    "$OBJ/tgfs_vfs.o"
+
 # -----------------------------------------------------------------------------
-# USB
+# USB / HID
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -181,19 +240,7 @@ compile_elf64 \
     "$OBJ/hid_parser.o"
 
 # -----------------------------------------------------------------------------
-# AHCI / storage / TGFS
-# -----------------------------------------------------------------------------
-
-compile_elf64 \
-    "Tools/ahci.asm" \
-    "$OBJ/ahci.o"
-
-compile_elf64 \
-    "Tools/tgfs_vfs.asm" \
-    "$OBJ/tgfs_vfs.o"
-
-# -----------------------------------------------------------------------------
-# Scheduler / multicore
+# SCHEDULER / MULTICORE
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -205,7 +252,7 @@ compile_elf64 \
     "$OBJ/multicore_legacy.o"
 
 # -----------------------------------------------------------------------------
-# GUI / video
+# GUI / VIDEO
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -229,7 +276,7 @@ compile_elf64 \
     "$OBJ/simd_argb-64.o"
 
 # -----------------------------------------------------------------------------
-# Audio
+# AUDIO
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -237,7 +284,7 @@ compile_elf64 \
     "$OBJ/audio.o"
 
 # -----------------------------------------------------------------------------
-# Shell / BSOD
+# SHELL / BSOD
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -249,7 +296,7 @@ compile_elf64 \
     "$OBJ/bsod.o"
 
 # -----------------------------------------------------------------------------
-# AHS-TUS / security / update
+# AHS-TUS / SECURITY / UPDATE
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
@@ -265,14 +312,15 @@ compile_elf64 \
     "$OBJ/update_loader.o"
 
 # -----------------------------------------------------------------------------
-# Kernel
+# MAIN KERNEL
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
     "Kernel/Kernel.asm" \
     "$OBJ/kernel.o"
 
-echo "[OK] Kernel objects built."
+echo
+echo "[OK] All kernel objects built."
 
 # =============================================================================
 # 3. LINK KERNEL
@@ -280,27 +328,30 @@ echo "[OK] Kernel objects built."
 
 echo
 echo "[3/4] Linking kernel..."
+echo
 
 "$LD" \
-    -Ttext 0x00100000 \
-    -e _start \
+    -m elf_x86_64 \
+    -T "$ROOT/linker.ld" \
+    -nostdlib \
+    -static \
     -o "$KERNEL_ELF" \
     "$OBJ/kernel.o" \
     "$OBJ/gdt.o" \
     "$OBJ/idt.o" \
-    "$OBJ/pit_timer.o" \
     "$OBJ/serial.o" \
+    "$OBJ/pit_timer.o" \
     "$OBJ/ppm.o" \
     "$OBJ/acpi.o" \
     "$OBJ/lapic.o" \
     "$OBJ/ioapic.o" \
     "$OBJ/pci_dyski.o" \
+    "$OBJ/ahci.o" \
+    "$OBJ/tgfs_vfs.o" \
     "$OBJ/usb_controller.o" \
     "$OBJ/usb_interrupts.o" \
     "$OBJ/xhci.o" \
     "$OBJ/hid_parser.o" \
-    "$OBJ/ahci.o" \
-    "$OBJ/tgfs_vfs.o" \
     "$OBJ/custom_sceduler.o" \
     "$OBJ/multicore_legacy.o" \
     "$OBJ/gui_hdr.o" \
@@ -315,25 +366,44 @@ echo "[3/4] Linking kernel..."
     "$OBJ/malicious_check.o" \
     "$OBJ/update_loader.o"
 
+if [ ! -f "$KERNEL_ELF" ]; then
+    echo "ERROR: kernel.elf was not created."
+    exit 1
+fi
+
 echo "[OK] Kernel linked:"
 echo "     $KERNEL_ELF"
 
 # =============================================================================
-# 4. ELF -> RAW KERNEL
+# 4. ELF -> RAW BINARY
 # =============================================================================
 
 echo
-echo "[4/4] Creating kernel.bin..."
+echo "[4/4] Creating raw kernel.bin..."
+echo
 
 "$OBJCOPY" \
     -O binary \
     "$KERNEL_ELF" \
     "$KERNEL_BIN"
 
+if [ ! -f "$KERNEL_BIN" ]; then
+    echo "ERROR: kernel.bin was not created."
+    exit 1
+fi
+
+KERNEL_SIZE=$(stat -c%s "$KERNEL_BIN" 2>/dev/null || wc -c < "$KERNEL_BIN")
+
+if [ "$KERNEL_SIZE" -eq 0 ]; then
+    echo "ERROR: kernel.bin is empty."
+    exit 1
+fi
+
 echo "[OK] $KERNEL_BIN"
+echo "     Size: $KERNEL_SIZE bytes"
 
 # =============================================================================
-# RESULT
+# FINAL VALIDATION
 # =============================================================================
 
 echo
@@ -341,7 +411,7 @@ echo "============================================================"
 echo " BLITRUM OS BUILD COMPLETE"
 echo "============================================================"
 echo
-echo "UEFI:"
+echo "Bootloader:"
 echo "  EFI/BOOT/BOOTX64.EFI"
 echo
 echo "Kernel:"
@@ -352,9 +422,14 @@ echo "  0x00100000"
 echo
 echo "Interrupt architecture:"
 echo "  ACPI   : ENABLED"
-echo "  LAPIC  : ENABLED"
-echo "  IOAPIC : ENABLED"
-echo "  PIC    : FALLBACK"
-echo "  PIT    : FALLBACK"
+echo "  LAPIC  : PRIMARY"
+echo "  LAPIC TIMER : SCHEDULER"
+echo "  IOAPIC : DEVICE IRQ ROUTING"
+echo "  PIC    : DISABLED / LEGACY ONLY"
+echo "  PIT    : FALLBACK ONLY"
+echo
+echo "Scheduler timer:"
+echo "  LAPIC Timer"
+echo "  Default target: 500 us"
 echo
 echo "============================================================"
