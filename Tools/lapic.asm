@@ -2,10 +2,37 @@
 ; BLITRUM OS - LOCAL APIC + ADAPTIVE LAPIC TIMER
 ; x86-64 / NASM
 ; ==============================================================================
+;
+; ARCHITEKTURA:
+;
+;   LAPIC Timer
+;       |
+;       v
+;   vector 0x20
+;       |
+;       v
+;   lapic_timer_handler
+;       |
+;       v
+;   scheduler_dispatch
+;       |
+;       v
+;   IRETQ
+;
+;
+; PIT NIE jest aktywnym timerem schedulera.
+;
+; PIT Channel 2 jest używany WYŁĄCZNIE podczas kalibracji
+; częstotliwości LAPIC Timer.
+;
+; ==============================================================================
 
 bits 64
 
-section .text
+
+; ==============================================================================
+; PUBLIC
+; ==============================================================================
 
 global lapic_init
 global lapic_available
@@ -20,6 +47,11 @@ global lapic_timer_init_ms
 global lapic_timer_init_us
 global lapic_timer_stop
 global lapic_timer_handler
+
+
+; ==============================================================================
+; EXTERNAL
+; ==============================================================================
 
 extern scheduler_dispatch
 
@@ -48,18 +80,25 @@ LAPIC_ICR_HIGH           equ 0x310
 ; ==============================================================================
 
 LAPIC_SW_ENABLE          equ (1 << 8)
+
 LAPIC_SPURIOUS_VECTOR    equ 0xFF
 
 LAPIC_TIMER_VECTOR       equ 0x20
+
 LAPIC_TIMER_PERIODIC     equ (1 << 17)
 
-; APIC divide value:
+LAPIC_TIMER_MASK         equ (1 << 16)
+
+
+; ==============================================================================
+; LAPIC TIMER DIVIDE
 ;
 ; 000 = /2
 ; 001 = /4
 ; 010 = /8
 ; 011 = /16
-;
+; ==============================================================================
+
 LAPIC_TIMER_DIVIDE_16    equ 0x3
 
 
@@ -72,27 +111,44 @@ CPUID_APIC_BIT           equ 9
 
 
 ; ==============================================================================
+; IA32_APIC_BASE
+; ==============================================================================
+
+IA32_APIC_BASE_MSR       equ 0x1B
+
+IA32_APIC_ENABLE         equ (1 << 11)
+
+
+; ==============================================================================
 ; PIT CHANNEL 2
 ;
-; Używany WYŁĄCZNIE do kalibracji LAPIC Timer.
-; Nie jest scheduler timerem.
+; WYŁĄCZNIE DO KALIBRACJI.
 ; ==============================================================================
 
 PIT_CH2                  equ 0x42
 PIT_CMD                  equ 0x43
 PIT_PORT_B               equ 0x61
 
-; ~10 ms przy 1.193182 MHz.
+; 1.193182 MHz / 11932 ~= 100 Hz
+; czyli około 10 ms.
 PIT_CALIBRATION_COUNT    equ 11932
 
-; 10 ms = 10000 us.
 PIT_CALIBRATION_US       equ 10000
 
+; Limit bezpieczeństwa pętli kalibracyjnej.
 PIT_CALIBRATION_TIMEOUT  equ 5000000
 
 
 ; ==============================================================================
 ; lapic_init
+;
+; Włącza LAPIC przez IA32_APIC_BASE + SVR.
+;
+; ZWRACA:
+;
+;   RAX = 1  LAPIC dostępny
+;   RAX = 0  LAPIC niedostępny
+;
 ; ==============================================================================
 
 lapic_init:
@@ -101,50 +157,70 @@ lapic_init:
     push rcx
     push rdx
 
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
     ; CPUID.1
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov eax, CPUID_FEATURES
     cpuid
 
     test edx, (1 << CPUID_APIC_BIT)
+
     jz .no_apic
 
 
-    ; --------------------------------------------------------------------------
-    ; IA32_APIC_BASE MSR
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; IA32_APIC_BASE
+    ; ==========================================================================
 
-    mov ecx, 0x1B
+    mov ecx, IA32_APIC_BASE_MSR
 
     rdmsr
 
-    or eax, (1 << 11)
+
+    ; ==========================================================================
+    ; Włącz APIC globalnie.
+    ; ==========================================================================
+
+    or eax, IA32_APIC_ENABLE
 
     wrmsr
 
 
-    ; --------------------------------------------------------------------------
-    ; Ponowny odczyt APIC BASE.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; Odczytaj ponownie bazę.
+    ; ==========================================================================
 
-    mov ecx, 0x1B
+    mov ecx, IA32_APIC_BASE_MSR
 
     rdmsr
 
-    and rax, 0xFFFFF000
+
+    ; EAX = low 32 bit
+    ; EDX = high 32 bit
+    ;
+    ; APIC base znajduje się w bitach 12..35.
+    ; ==========================================================================
+
+    shl rdx, 32
+
+    or rax, rdx
+
+    and rax, 0xFFFFFFFFFFFFF000
+
 
     test rax, rax
 
     jz .no_apic
 
+
     mov [rel lapic_base], rax
 
 
-    ; --------------------------------------------------------------------------
-    ; Software enable.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SOFTWARE ENABLE
+    ; ==========================================================================
 
     mov rbx, rax
 
@@ -152,6 +228,7 @@ lapic_init:
 
     or eax, LAPIC_SW_ENABLE
 
+    ; zachowaj tylko właściwe bity wektora
     and eax, 0xFFFFFF00
 
     or eax, LAPIC_SPURIOUS_VECTOR
@@ -159,9 +236,23 @@ lapic_init:
     mov [rbx + LAPIC_SVR], eax
 
 
-    ; --------------------------------------------------------------------------
-    ; Status.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; Na starcie wyłącz timer.
+    ;
+    ; Nie chcemy, aby stary / przypadkowy LVT Timer wygenerował IRQ
+    ; zanim IDT i scheduler zostaną przygotowane.
+    ; ==========================================================================
+
+    mov eax, LAPIC_TIMER_VECTOR | LAPIC_TIMER_MASK
+
+    mov [rbx + LAPIC_LVT_TIMER], eax
+
+    mov dword [rbx + LAPIC_INITIAL_COUNT], 0
+
+
+    ; ==========================================================================
+    ; STATUS
+    ; ==========================================================================
 
     mov byte [rel lapic_present], 1
 
@@ -173,6 +264,10 @@ lapic_init:
 .no_apic:
 
     mov byte [rel lapic_present], 0
+
+    mov byte [rel lapic_timer_calibrated], 0
+
+    mov byte [rel lapic_timer_running], 0
 
     mov qword [rel lapic_base], 0
 
@@ -197,6 +292,7 @@ lapic_enable:
     cmp byte [rel lapic_present], 1
 
     jne .fail
+
 
     mov rax, [rel lapic_base]
 
@@ -244,6 +340,11 @@ lapic_available:
 
 ; ==============================================================================
 ; lapic_get_id
+;
+; ZWRACA:
+;
+;   EAX = Local APIC ID
+;
 ; ==============================================================================
 
 lapic_get_id:
@@ -251,6 +352,7 @@ lapic_get_id:
     cmp byte [rel lapic_present], 1
 
     jne .zero
+
 
     mov rdx, [rel lapic_base]
 
@@ -278,6 +380,7 @@ lapic_eoi:
 
     jne .done
 
+
     mov rdx, [rel lapic_base]
 
     mov dword [rdx + LAPIC_EOI], 0
@@ -291,8 +394,11 @@ lapic_eoi:
 ; ==============================================================================
 ; lapic_send_ipi
 ;
-; RCX = destination APIC ID
-; RDX = ICR LOW
+; WEJŚCIE:
+;
+;   RCX = destination APIC ID
+;   RDX = ICR LOW
+;
 ; ==============================================================================
 
 lapic_send_ipi:
@@ -300,6 +406,7 @@ lapic_send_ipi:
     push rax
     push rbx
     push r8
+
 
     cmp byte [rel lapic_present], 1
 
@@ -309,7 +416,9 @@ lapic_send_ipi:
     mov rbx, [rel lapic_base]
 
 
-    ; Destination APIC ID.
+    ; ==========================================================================
+    ; DESTINATION APIC ID
+    ; ==========================================================================
 
     mov eax, ecx
 
@@ -318,12 +427,16 @@ lapic_send_ipi:
     mov [rbx + LAPIC_ICR_HIGH], eax
 
 
-    ; ICR low.
+    ; ==========================================================================
+    ; ICR LOW
+    ; ==========================================================================
 
     mov [rbx + LAPIC_ICR_LOW], edx
 
 
-    ; Delivery status.
+    ; ==========================================================================
+    ; WAIT FOR DELIVERY STATUS = 0
+    ; ==========================================================================
 
     mov r8d, 1000000
 
@@ -335,6 +448,7 @@ lapic_send_ipi:
     test eax, (1 << 12)
 
     jz .done
+
 
     dec r8d
 
@@ -353,11 +467,11 @@ lapic_send_ipi:
 ; ==============================================================================
 ; lapic_timer_calibrate
 ;
-; PIT channel 2 daje stały punkt odniesienia.
+; Kalibracja LAPIC Timer przy pomocy PIT Channel 2.
 ;
-; Wynik:
+; ZWRACA:
 ;
-;   RAX = liczba ticków LAPIC na mikrosekundę
+;   RAX = LAPIC ticks / microsecond
 ;   RAX = 0 -> błąd
 ;
 ; ==============================================================================
@@ -383,22 +497,23 @@ lapic_timer_calibrate:
     jz .fail
 
 
-    ; --------------------------------------------------------------------------
-    ; Zatrzymaj LAPIC Timer.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; WYŁĄCZ LAPIC TIMER
+    ; ==========================================================================
+
+    mov eax, LAPIC_TIMER_VECTOR | LAPIC_TIMER_MASK
+
+    mov [rbx + LAPIC_LVT_TIMER], eax
 
     mov dword [rbx + LAPIC_INITIAL_COUNT], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; PIT channel 2:
-    ;
-    ; bit 0 portu 0x61 = gate.
-    ; bit 1 = speaker.
+    ; ==========================================================================
+    ; PIT CHANNEL 2
     ;
     ; Gate = 1
     ; Speaker = 0
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     in al, PIT_PORT_B
 
@@ -409,23 +524,24 @@ lapic_timer_calibrate:
     out PIT_PORT_B, al
 
 
-    ; --------------------------------------------------------------------------
-    ; Channel 2
+    ; ==========================================================================
+    ; PIT CHANNEL 2
+    ;
     ; LSB/MSB
     ; Mode 0
     ; Binary
     ;
     ; 10110000b = B0h
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov al, 0xB0
 
     out PIT_CMD, al
 
 
-    ; --------------------------------------------------------------------------
-    ; PIT divisor ~10 ms.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; USTAW OKOŁO 10 ms
+    ; ==========================================================================
 
     mov ax, PIT_CALIBRATION_COUNT
 
@@ -436,14 +552,23 @@ lapic_timer_calibrate:
     out PIT_CH2, al
 
 
-    ; --------------------------------------------------------------------------
-    ; LAPIC Timer start.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; LAPIC TIMER:
+    ;
+    ; Divide = /16
+    ; Initial = FFFFFFFF
+    ; ==========================================================================
 
     mov dword [rbx + LAPIC_DIVIDE_CONFIG], LAPIC_TIMER_DIVIDE_16
 
     mov dword [rbx + LAPIC_INITIAL_COUNT], 0xFFFFFFFF
 
+
+    ; ==========================================================================
+    ; CZEKAJ NA OUT PIT
+    ;
+    ; Channel 2 OUT = bit 5 portu 0x61.
+    ; ==========================================================================
 
     xor edi, edi
 
@@ -464,7 +589,9 @@ lapic_timer_calibrate:
     jb .wait_pit
 
 
-    ; Timeout.
+    ; ==========================================================================
+    ; TIMEOUT
+    ; ==========================================================================
 
     mov dword [rbx + LAPIC_INITIAL_COUNT], 0
 
@@ -473,21 +600,23 @@ lapic_timer_calibrate:
 
 .pit_done:
 
-    ; --------------------------------------------------------------------------
-    ; Odczytaj aktualny count.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ODCZYTAJ AKTUALNY COUNT
+    ; ==========================================================================
 
     mov esi, [rbx + LAPIC_CURRENT_COUNT]
 
 
-    ; Zatrzymaj timer.
+    ; ==========================================================================
+    ; ZATRZYMAJ LAPIC TIMER
+    ; ==========================================================================
 
     mov dword [rbx + LAPIC_INITIAL_COUNT], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Wyłącz PIT channel 2 gate.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; WYŁĄCZ GATE PIT
+    ; ==========================================================================
 
     in al, PIT_PORT_B
 
@@ -496,9 +625,9 @@ lapic_timer_calibrate:
     out PIT_PORT_B, al
 
 
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
     ; elapsed = 0xFFFFFFFF - current
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov eax, 0xFFFFFFFF
 
@@ -507,9 +636,11 @@ lapic_timer_calibrate:
     jz .fail
 
 
-    ; --------------------------------------------------------------------------
-    ; ticks / 10000 us = ticks/us
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ticks / 10000 us
+    ;
+    ; Wynik = ticks/us.
+    ; ==========================================================================
 
     xor edx, edx
 
@@ -528,10 +659,18 @@ lapic_timer_calibrate:
     mov byte [rel lapic_timer_calibrated], 1
 
 
+    ; ==========================================================================
+    ; ZWRÓĆ WYNIK
+    ; ==========================================================================
+
     jmp .success
 
 
 .fail_cleanup:
+
+    ; ==========================================================================
+    ; WYŁĄCZ PIT
+    ; ==========================================================================
 
     in al, PIT_PORT_B
 
@@ -566,12 +705,19 @@ lapic_timer_calibrate:
 ; ==============================================================================
 ; lapic_timer_init
 ;
-; RCX = surowy Initial Count
+; WEJŚCIE:
+;
+;   RCX = Initial Count
+;
+; ZWRACA:
+;
+;   RAX = 1 sukces
+;   RAX = 0 błąd
+;
 ; ==============================================================================
 
 lapic_timer_init:
 
-    push rax
     push rdx
 
 
@@ -587,25 +733,38 @@ lapic_timer_init:
 
     mov rdx, [rel lapic_base]
 
+    test rdx, rdx
 
-    ; Divide by 16.
+    jz .fail
+
+
+    ; ==========================================================================
+    ; DIVIDE /16
+    ; ==========================================================================
 
     mov dword [rdx + LAPIC_DIVIDE_CONFIG], LAPIC_TIMER_DIVIDE_16
 
 
-    ; Periodic mode, vector 0x20.
+    ; ==========================================================================
+    ; TIMER VECTOR 0x20
+    ; PERIODIC
+    ;
+    ; Na razie nie jest maskowany.
+    ; ==========================================================================
 
     mov eax, LAPIC_TIMER_VECTOR | LAPIC_TIMER_PERIODIC
 
     mov [rdx + LAPIC_LVT_TIMER], eax
 
 
-    ; Start timer.
+    ; ==========================================================================
+    ; START
+    ; ==========================================================================
 
     mov [rdx + LAPIC_INITIAL_COUNT], ecx
 
-
     mov byte [rel lapic_timer_running], 1
+
 
     mov eax, 1
 
@@ -620,7 +779,6 @@ lapic_timer_init:
 .done:
 
     pop rdx
-    pop rax
 
     ret
 
@@ -628,41 +786,56 @@ lapic_timer_init:
 ; ==============================================================================
 ; lapic_timer_init_ms
 ;
-; RCX = milliseconds
+; WEJŚCIE:
+;
+;   RCX = milliseconds
+;
+; PRZYKŁAD:
+;
+;   RCX = 1
+;   => 1000 us
+;
+; ZWRACA:
+;
+;   RAX = 1 sukces
+;   RAX = 0 błąd
+;
 ; ==============================================================================
 
 lapic_timer_init_ms:
-
-    push rax
-    push rdx
-    push r8
-
 
     test rcx, rcx
 
     jz .fail
 
 
+    ; ==========================================================================
+    ; ms -> us
+    ;
+    ; sprawdzenie overflow
+    ; ==========================================================================
+
+    cmp rcx, 0xFFFFFFFF / 1000
+
+    ja .fail
+
+
     imul rcx, 1000
 
-    jc .fail
 
+    ; ==========================================================================
+    ; WAŻNE:
+    ;
+    ; lapic_timer_init_us zwraca wynik w RAX.
+    ; Nie zapisujemy RAX na stosie.
+    ; ==========================================================================
 
-    call lapic_timer_init_us
-
-    jmp .done
+    jmp lapic_timer_init_us
 
 
 .fail:
 
     xor eax, eax
-
-
-.done:
-
-    pop r8
-    pop rdx
-    pop rax
 
     ret
 
@@ -670,19 +843,25 @@ lapic_timer_init_ms:
 ; ==============================================================================
 ; lapic_timer_init_us
 ;
-; RCX = mikrosekundy
+; WEJŚCIE:
 ;
-; Przykłady:
+;   RCX = mikrosekundy
 ;
-;   500  = 0.5 ms
-;   1000 = 1 ms
-;   5000 = 5 ms
+; PRZYKŁADY:
+;
+;   500   = 0.5 ms
+;   1000  = 1 ms
+;   5000  = 5 ms
+;
+; ZWRACA:
+;
+;   RAX = 1 sukces
+;   RAX = 0 błąd
 ;
 ; ==============================================================================
 
 lapic_timer_init_us:
 
-    push rax
     push rdx
     push r8
 
@@ -697,9 +876,9 @@ lapic_timer_init_us:
     jz .fail
 
 
-    ; --------------------------------------------------------------------------
-    ; Jeśli nie ma kalibracji -> wykonaj ją.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; KALIBRACJA
+    ; ==========================================================================
 
     cmp byte [rel lapic_timer_calibrated], 1
 
@@ -708,12 +887,16 @@ lapic_timer_init_us:
 
     call lapic_timer_calibrate
 
-    test rax, rax
+    test eax, eax
 
     jz .fail
 
 
 .have_calibration:
+
+    ; ==========================================================================
+    ; ticks_per_us
+    ; ==========================================================================
 
     mov eax, [rel lapic_timer_ticks_per_us]
 
@@ -722,16 +905,23 @@ lapic_timer_init_us:
     jz .fail
 
 
-    ; --------------------------------------------------------------------------
-    ; count = ticks_per_us * microseconds
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; 64-bit:
+    ;
+    ; RAX = ticks_per_us
+    ; R8  = microseconds
+    ;
+    ; RDX:RAX = RAX * R8
+    ; ==========================================================================
 
     mov r8, rcx
 
     mul r8
 
 
-    ; Wynik musi zmieścić się w 32 bitach.
+    ; ==========================================================================
+    ; Initial Count musi zmieścić się w 32 bitach.
+    ; ==========================================================================
 
     test rdx, rdx
 
@@ -743,9 +933,22 @@ lapic_timer_init_us:
     jz .fail
 
 
+    ; ==========================================================================
+    ; RCX = Initial Count
+    ; ==========================================================================
+
     mov ecx, eax
 
+
     call lapic_timer_init
+
+
+    ; lapic_timer_init zwrócił:
+    ;
+    ; RAX = 1 / 0
+    ;
+    ; Nie nadpisujemy go.
+    ;
 
     jmp .done
 
@@ -759,7 +962,6 @@ lapic_timer_init_us:
 
     pop r8
     pop rdx
-    pop rax
 
     ret
 
@@ -777,7 +979,26 @@ lapic_timer_stop:
 
     mov rdx, [rel lapic_base]
 
+    test rdx, rdx
+
+    jz .done
+
+
+    ; ==========================================================================
+    ; Najpierw zamaskuj LVT.
+    ; ==========================================================================
+
+    mov eax, LAPIC_TIMER_VECTOR | LAPIC_TIMER_MASK
+
+    mov [rdx + LAPIC_LVT_TIMER], eax
+
+
+    ; ==========================================================================
+    ; Zatrzymaj odliczanie.
+    ; ==========================================================================
+
     mov dword [rdx + LAPIC_INITIAL_COUNT], 0
+
 
     mov byte [rel lapic_timer_running], 0
 
@@ -788,21 +1009,23 @@ lapic_timer_stop:
 
 
 ; ==============================================================================
-; LAPIC TIMER INTERRUPT
+; lapic_timer_handler
+;
+; LAPIC Timer -> vector 0x20
 ;
 ; WAŻNE:
 ;
 ; scheduler_dispatch wykonuje IRETQ.
-; Dlatego NIE robimy tutaj:
+;
+; Dlatego:
+;
+;   call lapic_eoi
+;   jmp scheduler_dispatch
+;
+; a NIE:
 ;
 ;   call scheduler_dispatch
-;   ...
 ;   iretq
-;
-; tylko:
-;
-;   EOI
-;   JMP scheduler_dispatch
 ;
 ; ==============================================================================
 
@@ -821,21 +1044,33 @@ section .data
 
 align 8
 
+
 lapic_base:
+
     dq LAPIC_DEFAULT_BASE
+
 
 align 4
 
+
 lapic_timer_ticks_per_us:
+
     dd 0
+
 
 align 1
 
+
 lapic_present:
+
     db 0
+
 
 lapic_timer_calibrated:
+
     db 0
 
+
 lapic_timer_running:
+
     db 0
