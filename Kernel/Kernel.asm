@@ -3,32 +3,29 @@
 ; =============================================================================
 ; x86-64 / NASM
 ;
-; Boot:
+; BOOT:
 ;   UEFI
 ;
-; Kernel:
+; KERNEL:
 ;   0x00100000
 ;
-; Interrupt architecture:
+; INTERRUPT ARCHITECTURE:
 ;
-;   ACPI
-;     |
-;     +---- LAPIC
-;     |
-;     +---- IOAPIC
-;             |
-;             +---- IRQ0 / PIT
-;                     |
-;                     v
-;                  vector 0x20
-;                     |
-;                     v
-;               pit_irq_handler
-;                     |
-;                     v
-;                  scheduler
+;   CPU Exceptions  -> 0x00 - 0x1F
+;   LAPIC Timer     -> 0x20 -> scheduler_dispatch
+;   xHCI            -> 0x28
+;   INT 0x80        -> scheduler_dispatch
 ;
-; PIC remains as fallback.
+; IMPORTANT:
+;
+;   LAPIC Timer is the ONLY scheduler timer.
+;
+;   PIT is NOT routed through IOAPIC IRQ0.
+;   PIT is used only internally by lapic_timer_calibrate().
+;
+;   PIC is fully masked.
+;
+;   IOAPIC is reserved for real hardware IRQ routing.
 ; =============================================================================
 
 bits 64
@@ -44,8 +41,6 @@ global _start
 
 extern gdt_init
 extern idt_init
-
-extern pit_init
 
 extern bsod_init
 
@@ -79,7 +74,9 @@ extern acpi_get_ioapic_count
 extern lapic_init
 extern lapic_available
 extern lapic_get_id
-extern lapic_eoi
+extern lapic_enable
+extern lapic_timer_init_us
+extern lapic_timer_stop
 
 
 ; =============================================================================
@@ -92,8 +89,6 @@ extern ioapic_get_count
 extern ioapic_get_base
 extern ioapic_get_gsi_base
 extern ioapic_get_max_redir
-extern ioapic_route_irq
-extern ioapic_unmask_irq
 extern ioapic_mask_irq
 
 
@@ -120,9 +115,9 @@ extern gui_pixel_format
 
 extern find_ahci_controller
 extern init_ahci_controller
+extern ahci_get_port
 
 extern vfs_mount_drive
-
 extern tgfs_load_and_map_file
 
 
@@ -182,11 +177,16 @@ BOOTINFO_ACPI_RSDP         equ 0x40
 
 
 ; =============================================================================
-; INTERRUPT CONSTANTS
+; LAPIC TIMER
 ; =============================================================================
 
-IRQ0_PIT                   equ 0
-PIT_VECTOR                 equ 0x20
+; 500 us = 0.5 ms
+;
+; Scheduler gets a 0.5 ms base tick.
+;
+; Later this can be changed dynamically by the adaptive scheduler/tag system.
+;
+DEFAULT_SCHEDULER_TICK_US   equ 500
 
 
 ; =============================================================================
@@ -199,12 +199,15 @@ _start:
 
 
     ; =========================================================================
-    ; Save BootInfo
+    ; SAVE BOOTINFO
     ; =========================================================================
 
     mov rbx, rcx
 
-    mov [bootinfo_ptr], rbx
+    test rbx, rbx
+    jz kernel_fatal_bootinfo
+
+    mov [rel bootinfo_ptr], rbx
 
 
     ; =========================================================================
@@ -212,22 +215,22 @@ _start:
     ; =========================================================================
 
     mov rax, [rbx + BOOTINFO_FRAMEBUFFER]
-    mov [kernel_framebuffer], rax
+    mov [rel kernel_framebuffer], rax
 
     mov rax, [rbx + BOOTINFO_FB_SIZE]
-    mov [kernel_framebuffer_size], rax
+    mov [rel kernel_framebuffer_size], rax
 
     mov eax, [rbx + BOOTINFO_WIDTH]
-    mov [kernel_screen_width], eax
+    mov [rel kernel_screen_width], eax
 
     mov eax, [rbx + BOOTINFO_HEIGHT]
-    mov [kernel_screen_height], eax
+    mov [rel kernel_screen_height], eax
 
     mov eax, [rbx + BOOTINFO_PPS]
-    mov [kernel_screen_pps], eax
+    mov [rel kernel_screen_pps], eax
 
     mov eax, [rbx + BOOTINFO_PIXEL_FORMAT]
-    mov [kernel_pixel_format], eax
+    mov [rel kernel_pixel_format], eax
 
 
     ; =========================================================================
@@ -235,16 +238,16 @@ _start:
     ; =========================================================================
 
     mov rax, [rbx + BOOTINFO_MEMMAP]
-    mov [kernel_memory_map], rax
+    mov [rel kernel_memory_map], rax
 
     mov rax, [rbx + BOOTINFO_MEMMAP_SIZE]
-    mov [kernel_memory_map_size], rax
+    mov [rel kernel_memory_map_size], rax
 
     mov rax, [rbx + BOOTINFO_DESC_SIZE]
-    mov [kernel_memory_desc_size], rax
+    mov [rel kernel_memory_desc_size], rax
 
     mov eax, [rbx + BOOTINFO_DESC_VERSION]
-    mov [kernel_memory_desc_version], eax
+    mov [rel kernel_memory_desc_version], eax
 
 
     ; =========================================================================
@@ -252,7 +255,7 @@ _start:
     ; =========================================================================
 
     mov rax, [rbx + BOOTINFO_ACPI_RSDP]
-    mov [acpi_rsdp], rax
+    mov [rel acpi_rsdp], rax
 
 
     ; =========================================================================
@@ -276,9 +279,9 @@ _start:
     ; PMM
     ; =========================================================================
 
-    mov rdi, [kernel_memory_map]
-    mov rsi, [kernel_memory_map_size]
-    mov rdx, [kernel_memory_desc_size]
+    mov rdi, [rel kernel_memory_map]
+    mov rsi, [rel kernel_memory_map_size]
+    mov rdx, [rel kernel_memory_desc_size]
 
     call pmm_init
 
@@ -319,37 +322,6 @@ _start:
 
 
     ; =========================================================================
-    ; PIT
-    ; =========================================================================
-
-    call pit_init
-
-
-    ; =========================================================================
-    ; CONFIGURE IRQ0 THROUGH IOAPIC
-    ; =========================================================================
-    ;
-    ; IRQ0:
-    ;
-    ;   PIT
-    ;    |
-    ;    v
-    ;   IOAPIC
-    ;    |
-    ;    v
-    ;   LAPIC
-    ;    |
-    ;    v
-    ;   IDT 0x20
-    ;
-    ; PIC is NOT disabled yet.
-    ;
-    ; =========================================================================
-
-    call kernel_route_pit_irq
-
-
-    ; =========================================================================
     ; HID
     ; =========================================================================
 
@@ -360,12 +332,12 @@ _start:
     ; GUI
     ; =========================================================================
 
-    mov rdi, [kernel_framebuffer]
-    mov rsi, [kernel_framebuffer_size]
-    mov edx, [kernel_screen_width]
-    mov ecx, [kernel_screen_height]
-    mov r8d, [kernel_screen_pps]
-    mov r9d, [kernel_pixel_format]
+    mov rdi, [rel kernel_framebuffer]
+    mov rsi, [rel kernel_framebuffer_size]
+    mov edx, [rel kernel_screen_width]
+    mov ecx, [rel kernel_screen_height]
+    mov r8d, [rel kernel_screen_pps]
+    mov r9d, [rel kernel_pixel_format]
 
     call gui_init
 
@@ -381,14 +353,65 @@ _start:
 
     call init_ahci_controller
 
+    test rax, rax
+    jz .no_ahci
+
+    ; -------------------------------------------------------------------------
+    ; Pobierz numer aktywnego portu SATA.
+    ; -------------------------------------------------------------------------
+
+    call ahci_get_port
+
+    cmp rax, 31
+    ja .no_ahci
+
+    mov [rel kernel_sata_port], rax
+
+    mov byte [rel ahci_active], 1
+
+    lea rdi, [rel ahci_ok_msg]
+    call serial_log
+
+    jmp .storage_done
+
+
 .no_ahci:
 
+    mov byte [rel ahci_active], 0
+
+    xor eax, eax
+
+    mov [rel kernel_sata_port], rax
+
+    lea rdi, [rel ahci_fail_msg]
+    call serial_log
+
+
+.storage_done:
+
 
     ; =========================================================================
-    ; VFS
+    ; VFS / TGFS
     ; =========================================================================
+    ;
+    ; vfs_mount_drive:
+    ;
+    ;   RCX = SATA port
+    ;
+    ; Jeżeli AHCI nie działa, nie próbujemy montować TGFS.
+    ; =========================================================================
+
+    cmp byte [rel ahci_active], 1
+    jne .vfs_done
+
+    mov rcx, [rel kernel_sata_port]
 
     call vfs_mount_drive
+
+    mov [rel kernel_fs_type], rax
+
+
+.vfs_done:
 
 
     ; =========================================================================
@@ -429,8 +452,70 @@ _start:
     ; =========================================================================
     ; SCHEDULER
     ; =========================================================================
+    ;
+    ; Scheduler MUSI zostać uruchomiony przed LAPIC Timer.
+    ;
+    ; LAPIC Timer vector 0x20 może wejść natychmiast po STI,
+    ; dlatego scheduler state musi być gotowy wcześniej.
+    ; =========================================================================
 
     call scheduler_init
+
+
+    ; =========================================================================
+    ; LAPIC TIMER
+    ; =========================================================================
+    ;
+    ; 500 us = 0.5 ms.
+    ;
+    ; Timer:
+    ;
+    ;   LAPIC
+    ;      |
+    ;      v
+    ;   vector 0x20
+    ;      |
+    ;      v
+    ;   lapic_timer_handler
+    ;      |
+    ;      v
+    ;   scheduler_dispatch
+    ;      |
+    ;      v
+    ;   IRETQ
+    ;
+    ; PIT NIE jest tutaj używany jako IRQ.
+    ; lapic_timer_init_us() może użyć PIT Channel 2
+    ; wyłącznie do kalibracji częstotliwości LAPIC.
+    ; =========================================================================
+
+    cmp byte [rel lapic_active], 1
+    jne .timer_unavailable
+
+    mov rcx, DEFAULT_SCHEDULER_TICK_US
+
+    call lapic_timer_init_us
+
+    test rax, rax
+    jz .timer_unavailable
+
+    mov byte [rel scheduler_timer_active], 1
+
+    lea rdi, [rel timer_ok_msg]
+    call serial_log
+
+    jmp .timer_done
+
+
+.timer_unavailable:
+
+    mov byte [rel scheduler_timer_active], 0
+
+    lea rdi, [rel timer_fail_msg]
+    call serial_log
+
+
+.timer_done:
 
 
     ; =========================================================================
@@ -469,7 +554,7 @@ _start:
 
 
 ; =============================================================================
-; kernel_init_acpi
+; ACPI INITIALIZATION
 ; =============================================================================
 
 kernel_init_acpi:
@@ -478,14 +563,15 @@ kernel_init_acpi:
     push rcx
     push rdx
 
-    mov rcx, [acpi_rsdp]
+
+    mov rcx, [rel acpi_rsdp]
 
     test rcx, rcx
     jz .skip
 
 
     ; =========================================================================
-    ; Parse RSDP / XSDT / RSDT / MADT
+    ; PARSE RSDP / XSDT / RSDT / MADT
     ; =========================================================================
 
     call acpi_init
@@ -493,7 +579,7 @@ kernel_init_acpi:
     cmp rax, 1
     jne .skip
 
-    mov byte [acpi_active], 1
+    mov byte [rel acpi_active], 1
 
 
     ; =========================================================================
@@ -502,7 +588,7 @@ kernel_init_acpi:
 
     call acpi_get_madt
 
-    mov [acpi_madt], rax
+    mov [rel acpi_madt], rax
 
 
     ; =========================================================================
@@ -511,7 +597,7 @@ kernel_init_acpi:
 
     call acpi_get_lapic_address
 
-    mov [acpi_lapic_address], rax
+    mov [rel acpi_lapic_address], rax
 
 
     ; =========================================================================
@@ -520,7 +606,7 @@ kernel_init_acpi:
 
     call acpi_get_lapic_count
 
-    mov [acpi_cpu_count], eax
+    mov [rel acpi_cpu_count], eax
 
 
     ; =========================================================================
@@ -529,7 +615,7 @@ kernel_init_acpi:
 
     call acpi_get_ioapic_count
 
-    mov [acpi_ioapic_count], eax
+    mov [rel acpi_ioapic_count], eax
 
 
     lea rdi, [rel acpi_ok_msg]
@@ -546,7 +632,7 @@ kernel_init_acpi:
 
 
 ; =============================================================================
-; kernel_init_lapic
+; LAPIC INITIALIZATION
 ; =============================================================================
 
 kernel_init_lapic:
@@ -555,7 +641,7 @@ kernel_init_lapic:
 
 
     ; =========================================================================
-    ; LAPIC initialization
+    ; LAPIC
     ; =========================================================================
 
     call lapic_init
@@ -563,17 +649,26 @@ kernel_init_lapic:
     cmp rax, 1
     jne .fail
 
-
-    mov byte [lapic_active], 1
+    mov byte [rel lapic_active], 1
 
 
     ; =========================================================================
-    ; Boot CPU APIC ID
+    ; Explicit software enable
+    ; =========================================================================
+
+    call lapic_enable
+
+    cmp rax, 1
+    jne .fail_disable
+
+
+    ; =========================================================================
+    ; BOOT CPU APIC ID
     ; =========================================================================
 
     call lapic_get_id
 
-    mov [lapic_boot_cpu_id], eax
+    mov [rel lapic_boot_cpu_id], eax
 
 
     lea rdi, [rel lapic_ok_msg]
@@ -586,9 +681,22 @@ kernel_init_lapic:
     ret
 
 
+.fail_disable:
+
+    mov byte [rel lapic_active], 0
+
+    lea rdi, [rel lapic_fail_msg]
+    call serial_log
+
+    xor eax, eax
+
+    pop rbx
+    ret
+
+
 .fail:
 
-    mov byte [lapic_active], 0
+    mov byte [rel lapic_active], 0
 
     lea rdi, [rel lapic_fail_msg]
     call serial_log
@@ -600,7 +708,7 @@ kernel_init_lapic:
 
 
 ; =============================================================================
-; kernel_init_ioapic
+; IOAPIC INITIALIZATION
 ; =============================================================================
 
 kernel_init_ioapic:
@@ -609,23 +717,23 @@ kernel_init_ioapic:
 
 
     ; =========================================================================
-    ; ACPI required
+    ; ACPI REQUIRED
     ; =========================================================================
 
-    cmp byte [acpi_active], 1
+    cmp byte [rel acpi_active], 1
     jne .fail
 
 
     ; =========================================================================
-    ; LAPIC required
+    ; LAPIC REQUIRED
     ; =========================================================================
 
-    cmp byte [lapic_active], 1
+    cmp byte [rel lapic_active], 1
     jne .fail
 
 
     ; =========================================================================
-    ; Initialize IOAPIC
+    ; IOAPIC
     ; =========================================================================
 
     call ioapic_init
@@ -633,27 +741,42 @@ kernel_init_ioapic:
     cmp rax, 1
     jne .fail
 
-
-    mov byte [ioapic_active], 1
+    mov byte [rel ioapic_active], 1
 
 
     ; =========================================================================
-    ; Save IOAPIC information
+    ; SAVE IOAPIC INFORMATION
     ; =========================================================================
 
     call ioapic_get_base
 
-    mov [ioapic_base], rax
+    mov [rel ioapic_base], rax
 
 
     call ioapic_get_gsi_base
 
-    mov [ioapic_gsi_base], rax
+    mov [rel ioapic_gsi_base], rax
 
 
     call ioapic_get_max_redir
 
-    mov [ioapic_max_redir], eax
+    mov [rel ioapic_max_redir], eax
+
+
+    ; =========================================================================
+    ; IMPORTANT:
+    ;
+    ; Do NOT unmask IRQ0 here.
+    ;
+    ; IRQ0 belongs to PIT.
+    ; LAPIC Timer already owns vector 0x20.
+    ;
+    ; The PIT is only used internally by LAPIC calibration.
+    ; =========================================================================
+
+    mov edi, 0
+
+    call ioapic_mask_irq
 
 
     lea rdi, [rel ioapic_ok_msg]
@@ -668,7 +791,7 @@ kernel_init_ioapic:
 
 .fail:
 
-    mov byte [ioapic_active], 0
+    mov byte [rel ioapic_active], 0
 
     lea rdi, [rel ioapic_fail_msg]
     call serial_log
@@ -680,120 +803,7 @@ kernel_init_ioapic:
 
 
 ; =============================================================================
-; kernel_route_pit_irq
-; =============================================================================
-;
-; Konfiguracja:
-;
-;   IRQ 0
-;   vector 0x20
-;   destination = boot CPU LAPIC ID
-;
-; Następnie IRQ0 zostaje odmaskowane w IOAPIC.
-;
-; PIC pozostaje zamaskowany dla IRQ0.
-;
-; =============================================================================
-
-kernel_route_pit_irq:
-
-    push rbx
-    push rcx
-    push rdx
-
-
-    ; =========================================================================
-    ; IOAPIC must be active
-    ; =========================================================================
-
-    cmp byte [ioapic_active], 1
-    jne .fallback
-
-
-    ; =========================================================================
-    ; LAPIC must be active
-    ; =========================================================================
-
-    cmp byte [lapic_active], 1
-    jne .fallback
-
-
-    ; =========================================================================
-    ; IRQ0 -> vector 0x20 -> boot LAPIC
-    ;
-    ; ioapic_route_irq:
-    ;
-    ;   EDI = IRQ
-    ;   ESI = vector
-    ;   EDX = destination APIC ID
-    ;
-    ; =========================================================================
-
-    mov edi, IRQ0_PIT
-    mov esi, PIT_VECTOR
-    mov edx, [lapic_boot_cpu_id]
-
-    call ioapic_route_irq
-
-    test rax, rax
-    jz .fallback
-
-
-    ; =========================================================================
-    ; Unmask IOAPIC IRQ0
-    ; =========================================================================
-
-    mov edi, IRQ0_PIT
-
-    call ioapic_unmask_irq
-
-    test rax, rax
-    jz .fallback
-
-
-    ; =========================================================================
-    ; Success
-    ; =========================================================================
-
-    mov byte [pit_ioapic_active], 1
-
-    lea rdi, [rel pit_ioapic_msg]
-    call serial_log
-
-    mov eax, 1
-
-    jmp .done
-
-
-.fallback:
-
-    ; -------------------------------------------------------------------------
-    ; IOAPIC routing unavailable.
-    ;
-    ; Do not crash.
-    ;
-    ; PIT/PIC remain available as fallback.
-    ; -------------------------------------------------------------------------
-
-    mov byte [pit_ioapic_active], 0
-
-    lea rdi, [rel pit_ioapic_fail_msg]
-    call serial_log
-
-    xor eax, eax
-
-
-.done:
-
-    pop rdx
-    pop rcx
-    pop rbx
-
-    ret
-
-
-; =============================================================================
-; kernel_draw_initial_gui
+; INITIAL GUI
 ; =============================================================================
 
 kernel_draw_initial_gui:
@@ -802,7 +812,7 @@ kernel_draw_initial_gui:
 
 
     ; =========================================================================
-    ; Basic window
+    ; BASIC WINDOW
     ; =========================================================================
 
     mov edi, 100
@@ -814,7 +824,7 @@ kernel_draw_initial_gui:
 
 
     ; =========================================================================
-    ; Refresh
+    ; REFRESH
     ; =========================================================================
 
     call gui_refresh_screen
@@ -823,6 +833,21 @@ kernel_draw_initial_gui:
     pop rbx
 
     ret
+
+
+; =============================================================================
+; FATAL BOOTINFO
+; =============================================================================
+
+kernel_fatal_bootinfo:
+
+    cli
+
+.fatal_loop:
+
+    hlt
+
+    jmp .fatal_loop
 
 
 ; =============================================================================
@@ -858,12 +883,20 @@ ioapic_fail_msg:
     db "IOAPIC unavailable", 10, 0
 
 
-pit_ioapic_msg:
-    db "PIT IRQ0 routed through IOAPIC -> LAPIC", 10, 0
+ahci_ok_msg:
+    db "AHCI initialized", 10, 0
 
 
-pit_ioapic_fail_msg:
-    db "PIT IOAPIC routing unavailable - fallback active", 10, 0
+ahci_fail_msg:
+    db "AHCI unavailable", 10, 0
+
+
+timer_ok_msg:
+    db "LAPIC scheduler timer: 500 us", 10, 0
+
+
+timer_fail_msg:
+    db "LAPIC scheduler timer unavailable", 10, 0
 
 
 ; =============================================================================
@@ -978,17 +1011,35 @@ ioapic_max_redir:
 
 
 ; =============================================================================
-; PIT STATE
+; SCHEDULER TIMER STATE
 ; =============================================================================
 
 align 4
 
-pit_ioapic_active:
+scheduler_timer_active:
     db 0
 
 
 ; =============================================================================
-; KERNEL STACK
+; AHCI / STORAGE STATE
+; =============================================================================
+
+align 8
+
+ahci_active:
+    db 0
+
+align 8
+
+kernel_sata_port:
+    dq 0
+
+kernel_fs_type:
+    dq 0
+
+
+; =============================================================================
+; BSS
 ; =============================================================================
 
 section .bss
