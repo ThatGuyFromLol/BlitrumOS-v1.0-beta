@@ -1,20 +1,53 @@
 ; ==============================================================================
 ; BLITRUM OS - USB / xHCI INTERRUPT EVENT BUFFER
+; ==============================================================================
 ; x86-64 / NASM
 ;
-; WERSJA BEZPIECZNA DLA v1.0
+; ARCHITEKTURA PRZERWAŃ:
 ;
-; Na tym etapie:
-;   - bufor zdarzeń USB działa,
-;   - ISR xHCI jest gotowy,
-;   - NIE używamy jeszcze na sztywno LAPIC/IOAPIC,
-;   - nie zapisujemy błędnie rejestrów interruptera xHCI,
-;   - routing IRQ zostanie dodany później przez ACPI MADT.
+;   xHCI
+;     |
+;     v
+;   PCI IRQ
+;     |
+;     v
+;   IOAPIC
+;     |
+;     v
+;   LAPIC
+;     |
+;     v
+;   IDT vector 0x28
+;     |
+;     v
+;   isr_xhci_handler
+;     |
+;     +--> scheduler_trigger_event
+;     |
+;     +--> lapic_eoi
+;     |
+;     v
+;   iretq
 ;
-; Dzięki temu USB nie powinno powodować crasha podczas startu kernela.
+;
+; UWAGA:
+;
+; Ten moduł NIE wybiera sam IRQ PCI xHCI.
+;
+; Routing:
+;
+;   PCI -> ACPI/PCI routing -> IOAPIC
+;
+; powinien zostać skonfigurowany przez warstwę PCI/IOAPIC.
+;
 ; ==============================================================================
 
 bits 64
+
+
+; ==============================================================================
+; PUBLIC
+; ==============================================================================
 
 section .text
 
@@ -22,14 +55,21 @@ global usb_interrupts_init
 global isr_xhci_handler
 global usb_pop_event
 
+
+; ==============================================================================
+; EXTERNAL
+; ==============================================================================
+
 extern scheduler_trigger_event
+extern lapic_eoi
 
 
 ; ==============================================================================
-; STAŁE
+; CONSTANTS
 ; ==============================================================================
 
 USB_INTERRUPT_VECTOR equ 0x28
+
 GUI_TASK_ID          equ 5
 
 BUFFER_SIZE          equ 256
@@ -44,25 +84,37 @@ section .data
 
 align 8
 
+
+; Adres MMIO kontrolera xHCI.
+
 xhci_mmio_reg:
+
     dq 0
 
+
+; Ring buffer indices.
+
 buf_head:
+
     dd 0
 
+
 buf_tail:
+
     dd 0
 
 
 ; ==============================================================================
-; BUFOR USB
+; USB EVENT BUFFER
 ; ==============================================================================
 
 section .bss
 
 align 32
 
+
 usb_ring_buffer:
+
     resb BUFFER_SIZE * 8
 
 
@@ -77,17 +129,28 @@ section .text
 ; usb_interrupts_init
 ;
 ; WEJŚCIE:
+;
 ;   RCX = adres MMIO xHCI
 ;
+; RESETUJE:
+;
+;   - adres kontrolera
+;   - head
+;   - tail
+;   - software event buffer
+;
+;
 ; UWAGA:
-;   Nie konfigurujemy tutaj LAPIC/IOAPIC.
 ;
-;   Poprawne mapowanie PCI IRQ -> IOAPIC wymaga:
-;       ACPI MADT
-;       PCI interrupt routing
-;       konfiguracji LAPIC
+; Nie konfigurujemy tutaj IRQ PCI.
 ;
-;   Na tym etapie zostawiamy sprzętowy routing przerwań wyłączony.
+; Nie konfigurujemy tutaj IOAPIC.
+;
+; Nie konfigurujemy tutaj LAPIC.
+;
+; Routing sprzętowego IRQ jest odpowiedzialnością warstwy
+; PCI/ACPI/IOAPIC.
+;
 ; ==============================================================================
 
 usb_interrupts_init:
@@ -96,26 +159,37 @@ usb_interrupts_init:
     push rbx
     push rcx
 
-    ; --------------------------------------------------------------------------
-    ; Zapamiętaj adres kontrolera.
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; ZAPAMIĘTAJ XHCI MMIO
+    ; ==========================================================================
 
     mov [rel xhci_mmio_reg], rcx
 
-    ; --------------------------------------------------------------------------
-    ; Wyzeruj bufor zdarzeń.
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; RESET SOFTWARE EVENT BUFFER
+    ; ==========================================================================
 
     xor eax, eax
 
     mov [rel buf_head], eax
     mov [rel buf_tail], eax
 
-    ; --------------------------------------------------------------------------
-    ; Nie konfigurujemy jeszcze xHCI interruptera.
+
+    ; ==========================================================================
+    ; NIE WŁĄCZAMY JESZCZE INTERRUPTERA xHCI
     ;
-    ; Nie wolno ustawiać IMAN/IMOD bez przygotowanego Event Ring.
-    ; --------------------------------------------------------------------------
+    ; Pełna konfiguracja:
+    ;
+    ;   Event Ring
+    ;   ERST
+    ;   ERDP
+    ;   IMAN
+    ;   IMOD
+    ;
+    ; należy do właściwej inicjalizacji xHCI.
+    ; ==========================================================================
 
     pop rcx
     pop rbx
@@ -127,10 +201,33 @@ usb_interrupts_init:
 ; ==============================================================================
 ; isr_xhci_handler
 ;
-; Handler sprzętowego przerwania xHCI.
+; IDT:
 ;
-; Na obecnym etapie przygotowany do późniejszego podłączenia przez:
-;   ACPI MADT -> IOAPIC -> LAPIC -> IDT 0x28
+;   vector 0x28
+;
+;
+; WEJŚCIE:
+;
+; CPU automatycznie odkłada:
+;
+;   RIP
+;   CS
+;   RFLAGS
+;
+;
+; WYJŚCIE:
+;
+;   iretq
+;
+;
+; WAŻNE:
+;
+; Po obsłużeniu sprzętowego IRQ przez IOAPIC/LAPIC MUSIMY wysłać:
+;
+;   lapic_eoi
+;
+; inaczej LAPIC może pozostać w stanie oczekiwania na EOI
+; i kolejne przerwania mogą zostać zablokowane.
 ;
 ; ==============================================================================
 
@@ -143,30 +240,29 @@ isr_xhci_handler:
     push rdi
     push rsi
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź czy mamy zapisany kontroler xHCI.
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; SPRAWDŹ XHCI
+    ; ==========================================================================
 
     mov rdi, [rel xhci_mmio_reg]
 
     test rdi, rdi
+
     jz .send_eoi
 
 
-    ; --------------------------------------------------------------------------
-    ; Odczytaj RTSOFF.
+    ; ==========================================================================
+    ; XHCI RTSOFF
     ;
-    ; Capability registers:
+    ; Capability Registers:
     ;
-    ;   +0x00 CAPLENGTH
-    ;   +0x04 HCIVERSION
-    ;   ...
-    ;   +0x18 RTSOFF
+    ;   +0x18 = RTSOFF
     ;
     ; Runtime Register Space:
     ;
-    ;   xHCI base + RTSOFF
-    ; --------------------------------------------------------------------------
+    ;   xHCI_base + RTSOFF
+    ; ==========================================================================
 
     mov eax, [rdi + 0x18]
 
@@ -174,27 +270,43 @@ isr_xhci_handler:
 
     add rdi, rax
 
-    ; --------------------------------------------------------------------------
-    ; Interrupter 0:
+
+    ; ==========================================================================
+    ; INTERRUPTER 0
     ;
-    ;   +0x20 IMAN
+    ; Runtime:
     ;
-    ; Wyczyść Interrupt Pending przez zapis 1 w bit 0.
-    ; --------------------------------------------------------------------------
+    ;   +0x20 = IMAN
+    ;
+    ; IMAN:
+    ;
+    ;   bit 0 = IP  (Interrupt Pending)
+    ;   bit 1 = IE  (Interrupt Enable)
+    ;
+    ; IP jest kasowane przez zapis 1.
+    ; ==========================================================================
 
     mov eax, [rdi + 0x20]
 
     test eax, 1
+
     jz .send_eoi
+
+
+    ; ==========================================================================
+    ; CLEAR INTERRUPT PENDING
+    ;
+    ; Zachowujemy pozostałe bity.
+    ; ==========================================================================
 
     or eax, 1
 
     mov [rdi + 0x20], eax
 
 
-    ; --------------------------------------------------------------------------
-    ; Dodaj zdarzenie do naszego bufora.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; DODAJ ZDARZENIE DO SOFTWARE EVENT BUFFER
+    ; ==========================================================================
 
     mov eax, [rel buf_head]
 
@@ -204,6 +316,11 @@ isr_xhci_handler:
 
     and ebx, BUFFER_MASK
 
+
+    ; ==========================================================================
+    ; SPRAWDŹ PEŁNY BUFFER
+    ; ==========================================================================
+
     mov ecx, [rel buf_tail]
 
     cmp ebx, ecx
@@ -211,9 +328,11 @@ isr_xhci_handler:
     je .buffer_full
 
 
-    ; --------------------------------------------------------------------------
-    ; Adres elementu bufora.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; OBLICZ ADRES ELEMENTU
+    ;
+    ; Każde zdarzenie = 8 bajtów.
+    ; ==========================================================================
 
     lea rsi, [rel usb_ring_buffer]
 
@@ -224,25 +343,33 @@ isr_xhci_handler:
     add rsi, rdx
 
 
-    ; --------------------------------------------------------------------------
-    ; Tymczasowy pakiet zdarzenia.
+    ; ==========================================================================
+    ; TYMCZASOWY EVENT
     ;
-    ; 0x00010202:
-    ;   typ = 2
-    ;   źródło = 2
+    ; 0x00010202
     ;
-    ; Później tutaj zostanie zapisany rzeczywisty TRB
-    ; z Event Ring xHCI.
-    ; --------------------------------------------------------------------------
+    ; Obecnie software event placeholder.
+    ;
+    ; Docelowo:
+    ;
+    ;   rzeczywisty Event TRB z Event Ring xHCI.
+    ; ==========================================================================
 
     mov qword [rsi], 0x0000000000010202
+
+
+    ; ==========================================================================
+    ; HEAD = NEXT
+    ; ==========================================================================
 
     mov [rel buf_head], ebx
 
 
-    ; --------------------------------------------------------------------------
-    ; Powiadom scheduler.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; POWIADOM SCHEDULER
+    ;
+    ; RCX = Task ID
+    ; ==========================================================================
 
     mov ecx, GUI_TASK_ID
 
@@ -254,11 +381,24 @@ isr_xhci_handler:
 
 .send_eoi:
 
-    ; --------------------------------------------------------------------------
-    ; Na tym etapie NIE wysyłamy EOI do LAPIC.
+    ; ==========================================================================
+    ; LAPIC EOI
     ;
-    ; Routing APIC nie jest jeszcze aktywny.
-    ; --------------------------------------------------------------------------
+    ; Ten krok jest obowiązkowy przy aktywnym:
+    ;
+    ;   IOAPIC -> LAPIC -> IDT
+    ;
+    ; lapic_eoi:
+    ;
+    ;   zapis 0 do LAPIC EOI register.
+    ; ==========================================================================
+
+    call lapic_eoi
+
+
+    ; ==========================================================================
+    ; RESTORE
+    ; ==========================================================================
 
     pop rsi
     pop rdi
@@ -266,6 +406,11 @@ isr_xhci_handler:
     pop rcx
     pop rbx
     pop rax
+
+
+    ; ==========================================================================
+    ; RETURN FROM INTERRUPT
+    ; ==========================================================================
 
     iretq
 
@@ -275,10 +420,10 @@ isr_xhci_handler:
 ;
 ; WYJŚCIE:
 ;
-;   RAX = 64-bitowe zdarzenie
+;   RAX = 64-bit event
 ;
 ;   RAX = 0
-;       brak zdarzeń
+;       brak eventów
 ;
 ; ==============================================================================
 
@@ -289,9 +434,9 @@ usb_pop_event:
     push rsi
 
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź bufor.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SPRAWDŹ BUFFER
+    ; ==========================================================================
 
     mov eax, [rel buf_tail]
 
@@ -300,9 +445,9 @@ usb_pop_event:
     je .empty
 
 
-    ; --------------------------------------------------------------------------
-    ; Oblicz adres zdarzenia.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ADRES ELEMENTU
+    ; ==========================================================================
 
     lea rsi, [rel usb_ring_buffer]
 
@@ -313,16 +458,16 @@ usb_pop_event:
     add rsi, rbx
 
 
-    ; --------------------------------------------------------------------------
-    ; Pobierz zdarzenie.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ODCZYTAJ EVENT
+    ; ==========================================================================
 
     mov rbx, [rsi]
 
 
-    ; --------------------------------------------------------------------------
-    ; Przesuń tail.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; TAIL++
+    ; ==========================================================================
 
     inc eax
 
@@ -331,9 +476,9 @@ usb_pop_event:
     mov [rel buf_tail], eax
 
 
-    ; --------------------------------------------------------------------------
-    ; Wynik.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; RETURN EVENT
+    ; ==========================================================================
 
     mov rax, rbx
 
