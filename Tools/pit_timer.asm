@@ -1,280 +1,233 @@
-; ==============================================================================
-;        BLITRUM OS - PIT TIMER
-;        Intel 8253/8254 - 1000 Hz
-; ==============================================================================
-; Architektura: x86-64
-; Składnia:     NASM
+; =============================================================================
+; BLITRUM OS - PIT TIMER
+; =============================================================================
+; x86-64 / NASM
 ;
-; PIT IRQ0 -> PIC Master -> IDT vector 0x20
+; Aktualna architektura:
 ;
-; WAŻNE:
-; isr_pit_handler nie zapisuje własnych rejestrów.
-; scheduler_dispatch robi pełny zapis kontekstu i kończy ścieżkę przez iretq.
-; ==============================================================================
+;   PIT
+;     |
+;     v
+;   IOAPIC
+;     |
+;     v
+;   LAPIC
+;     |
+;     v
+;   IDT vector 0x20
+;     |
+;     v
+;   scheduler_dispatch
+;
+; PIC pozostaje tymczasowo jako fallback.
+; =============================================================================
 
 bits 64
 
 section .text
 
 global pit_init
-global pit_get_ticks
 global pit_sleep_ms
-global isr_pit_handler
+global pit_irq_handler
 
 extern scheduler_dispatch
-extern serial_log
+extern lapic_eoi
+extern lapic_available
 
 
-; ==============================================================================
-; PORTY PIT
-; ==============================================================================
+; =============================================================================
+; CONSTANTS
+; =============================================================================
 
-PIT_CHANNEL0    equ 0x40
-PIT_COMMAND     equ 0x43
+PIT_CHANNEL0          equ 0x40
+PIT_COMMAND           equ 0x43
 
+PIT_BASE_FREQUENCY    equ 1193182
 
-; ==============================================================================
-; PIC MASTER
-; ==============================================================================
+; Blitrum uses 1000 Hz = 1 ms tick.
+PIT_FREQUENCY          equ 1000
 
-PIC_MASTER      equ 0x20
-PIC_MASTER_DATA equ 0x21
-PIC_EOI         equ 0x20
+PIT_DIVISOR            equ (PIT_BASE_FREQUENCY / PIT_FREQUENCY)
 
+PIC_MASTER_COMMAND     equ 0x20
+PIC_MASTER_DATA        equ 0x21
 
-; ==============================================================================
-; CZĘSTOTLIWOŚĆ
-; ==============================================================================
+PIC_EOI                equ 0x20
 
-PIT_BASE_FREQ   equ 1193182
-PIT_TARGET_HZ   equ 1000
-PIT_DIVISOR     equ PIT_BASE_FREQ / PIT_TARGET_HZ
+IRQ0_VECTOR            equ 0x20
 
 
-; ==============================================================================
-; DATA
-; ==============================================================================
-
-section .data
-
-align 8
-
-pit_ticks:
-    dq 0
-
-pit_ready:
-    db 0
-
-pit_log_msg:
-    db "PIT Timer: 1000 Hz aktywny (1ms/tick)", 0
-
-
-; ==============================================================================
-; CODE
-; ==============================================================================
-
-section .text
-
-
-; ==============================================================================
+; =============================================================================
 ; pit_init
+; =============================================================================
 ;
-; Konfiguruje PIT:
+; Programs PIT channel 0 to approximately 1000 Hz.
 ;
-;   częstotliwość = 1000 Hz
-;   okres         = 1 ms
+; The IRQ is initially left enabled through the existing interrupt
+; infrastructure. IOAPIC migration is performed separately by the kernel.
 ;
-; Odblokowuje IRQ0 w Master PIC.
-; ==============================================================================
+; =============================================================================
 
 pit_init:
 
     push rax
     push rdx
-    push rsi
 
-
-    ; ==========================================================================
-    ; PIT COMMAND
+    ; -------------------------------------------------------------------------
+    ; PIT command:
     ;
     ; 00 = channel 0
     ; 11 = access low byte + high byte
-    ; 011 = mode 3, square wave
+    ; 010 = mode 2 (rate generator)
     ; 0 = binary
-    ; ==========================================================================
+    ;
+    ; 00110100b = 0x34
+    ; -------------------------------------------------------------------------
 
-    mov al, 0x36
-    out PIT_COMMAND, al
+    mov al, 0x34
+    mov dx, PIT_COMMAND
+    out dx, al
 
+    ; -------------------------------------------------------------------------
+    ; Divisor
+    ; -------------------------------------------------------------------------
 
-    ; ==========================================================================
-    ; DIVISOR
-    ; ==========================================================================
+    mov eax, PIT_DIVISOR
 
-    mov ax, PIT_DIVISOR
+    mov dx, PIT_CHANNEL0
 
-    ; Low byte
-    out PIT_CHANNEL0, al
+    out dx, al
 
-    ; High byte
     mov al, ah
-    out PIT_CHANNEL0, al
+    out dx, al
 
-
-    ; ==========================================================================
-    ; ODBLOKUJ IRQ0 W MASTER PIC
-    ; ==========================================================================
-
-    in al, PIC_MASTER_DATA
-
-    and al, 0xFE
-
-    out PIC_MASTER_DATA, al
-
-
-    ; ==========================================================================
-    ; PIT GOTOWY
-    ; ==========================================================================
-
-    mov byte [rel pit_ready], 1
-
-
-    ; ==========================================================================
-    ; LOG
-    ; ==========================================================================
-
-    lea rsi, [rel pit_log_msg]
-
-    call serial_log
-
-
-    pop rsi
     pop rdx
     pop rax
 
     ret
 
 
-; ==============================================================================
-; isr_pit_handler
+; =============================================================================
+; pit_irq_handler
+; =============================================================================
 ;
-; IRQ0 -> PIT
+; Entry:
+;   IRQ0 / vector 0x20
 ;
-; CPU po wejściu do ISR ma już na stosie:
+; IMPORTANT:
+;   This handler is designed for the APIC path.
 ;
-;   RIP
-;   CS
-;   RFLAGS
+;   LAPIC EOI is sent when LAPIC is available.
 ;
-; Następnie scheduler_dispatch dokłada swój pełny kontekst.
+;   We intentionally do not blindly send PIC EOI here because once IRQ0
+;   is migrated to IOAPIC, the legacy PIC is no longer the interrupt
+;   controller responsible for delivery.
 ;
-; NIE WOLNO tutaj robić push/pop rejestrów przed scheduler_dispatch.
-; ==============================================================================
+; =============================================================================
 
-isr_pit_handler:
+pit_irq_handler:
 
-    ; ==========================================================================
-    ; 1. ZWIĘKSZ LICZNIK
-    ; ==========================================================================
+    ; -------------------------------------------------------------------------
+    ; Preserve volatile registers used by this handler.
+    ; -------------------------------------------------------------------------
 
-    inc qword [rel pit_ticks]
+    push rax
+    push rcx
+    push rdx
 
-
-    ; ==========================================================================
-    ; 2. EOI DO 8259 PIC
+    ; -------------------------------------------------------------------------
+    ; Notify scheduler.
     ;
-    ; PIT działa obecnie przez klasyczny Master PIC,
-    ; dlatego EOI musi zostać wysłane tutaj.
-    ; ==========================================================================
+    ; scheduler_dispatch is responsible for preserving/restoring the task
+    ; execution context according to the scheduler's current ABI.
+    ; -------------------------------------------------------------------------
+
+    call scheduler_dispatch
+
+    ; -------------------------------------------------------------------------
+    ; LAPIC EOI
+    ; -------------------------------------------------------------------------
+
+    call lapic_available
+
+    test rax, rax
+    jz .legacy_eoi
+
+    call lapic_eoi
+    jmp .done
+
+
+.legacy_eoi:
+
+    ; -------------------------------------------------------------------------
+    ; Legacy PIC fallback.
+    ;
+    ; This path is used only while LAPIC is unavailable.
+    ; -------------------------------------------------------------------------
 
     mov al, PIC_EOI
-
-    out PIC_MASTER, al
-
-
-    ; ==========================================================================
-    ; 3. PRZEKAŻ PEŁNY KONTEKST DO SCHEDULERA
-    ;
-    ; scheduler_dispatch:
-    ;
-    ;   push 15 rejestrów
-    ;   zapisuje RSP aktualnego taska
-    ;   wybiera następny task
-    ;   odtwarza 15 rejestrów
-    ;   iretq
-    ;
-    ; Dlatego ta funkcja NIE może wykonywać iretq po powrocie.
-    ; ==========================================================================
-
-    jmp scheduler_dispatch
+    mov dx, PIC_MASTER_COMMAND
+    out dx, al
 
 
-    ; ==========================================================================
-    ; NIEOSIĄGALNE
-    ; scheduler_dispatch kończy się iretq.
-    ; ==========================================================================
+.done:
 
-    cli
+    pop rdx
+    pop rcx
+    pop rax
 
-.pit_fatal:
-
-    hlt
-
-    jmp .pit_fatal
+    iretq
 
 
-; ==============================================================================
-; pit_get_ticks
-;
-; WYJŚCIE:
-;   RAX = liczba ticków
-;
-; 1000 ticków = około 1 sekunda
-; ==============================================================================
-
-pit_get_ticks:
-
-    mov rax, [rel pit_ticks]
-
-    ret
-
-
-; ==============================================================================
+; =============================================================================
 ; pit_sleep_ms
+; =============================================================================
 ;
-; WEJŚCIE:
-;   RCX = liczba milisekund
+; Simple fallback busy-wait.
 ;
-; UWAGA:
-; Jest to obecnie aktywne oczekiwanie.
-; Później można zastąpić je sleep/wakeup schedulera.
-; ==============================================================================
+; In:
+;   RDI = milliseconds
+;
+; NOTE:
+;   This is intentionally kept simple for now.
+;   Later it should be replaced by scheduler sleep/wakeup.
+;
+; =============================================================================
 
 pit_sleep_ms:
 
-    push rax
     push rbx
+    push rcx
+    push rdx
+
+    test rdi, rdi
+    jz .done
+
+    mov rbx, rdi
 
 
-    ; ==========================================================================
-    ; Wyznacz docelowy tick.
-    ; ==========================================================================
+.wait_ms:
 
-    mov rax, [rel pit_ticks]
+    ; Approximately one millisecond delay.
+    ; This is only a fallback delay and is NOT cycle-accurate.
 
-    add rax, rcx
+    mov ecx, 50000
+
+.delay:
+
+    pause
+
+    dec ecx
+    jnz .delay
+
+    dec rbx
+    jnz .wait_ms
 
 
-.wait:
+.done:
 
-    mov rbx, [rel pit_ticks]
-
-    cmp rbx, rax
-
-    jb .wait
-
-
+    pop rdx
+    pop rcx
     pop rbx
-    pop rax
 
     ret
