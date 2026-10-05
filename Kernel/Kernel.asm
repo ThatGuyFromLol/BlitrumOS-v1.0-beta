@@ -545,7 +545,19 @@ _start:
 
     mov rdx, 5
 
-    mov r8, 0x00800000
+    ; --------------------------------------------------------------------------
+    ; TGFS LOAD ADDRESS
+    ;
+    ; 0x00800000 było błędne:
+    ; - znajduje się poniżej bezpiecznego obszaru TGFS,
+    ; - koliduje z obszarem zarezerwowanym przez PMM.
+    ;
+    ; tgfs_vfs.asm dopuszcza zakres:
+    ;     0x04000000 - 0x06000000
+    ;
+    ; --------------------------------------------------------------------------
+
+    mov r8, 0x04000000
 
     call tgfs_load_and_map_file
 
@@ -774,14 +786,3 @@ msg_boot:
 
 ; ==============================================================================
 ; KERNEL STACK
-; ==============================================================================
-
-section .bss
-
-align 16
-
-kernel_stack_bottom:
-
-    resb 16384
-
-stack_top:
