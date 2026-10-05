@@ -2,6 +2,32 @@
 ;          BLITRUM OS - MAIN KERNEL
 ;          x86-64 / NASM
 ; ==============================================================================
+;
+; Aktualny etap:
+;   UEFI
+;   PMM
+;   GDT
+;   IDT / PIC
+;   PIT
+;   ACPI / MADT
+;   Local APIC
+;   AHCI / TGFS
+;   GUI
+;   HID
+;   Scheduler
+;
+; ACPI:
+;   BootInfo + 0x40 = RSDP
+;   acpi_init()     = RSDP -> XSDT/RSDT -> MADT
+;
+; LAPIC:
+;   wykrywany przez CPUID/MSR
+;   ACPI MADT jest źródłem informacji o platformie
+;
+; UWAGA:
+;   PIC + PIT nadal pozostają aktywne.
+;   IOAPIC i routing IRQ zostaną wykonane w następnym etapie.
+; ==============================================================================
 
 bits 64
 
@@ -38,6 +64,26 @@ extern idt_init
 
 extern pmm_init
 extern pmm_alloc_page
+
+
+; ==============================================================================
+; ACPI
+; ==============================================================================
+
+extern acpi_init
+extern acpi_get_madt
+extern acpi_get_lapic_address
+extern acpi_get_lapic_count
+
+
+; ==============================================================================
+; LOCAL APIC
+; ==============================================================================
+
+extern lapic_init
+extern lapic_available
+extern lapic_get_id
+extern lapic_eoi
 
 
 ; ==============================================================================
@@ -138,6 +184,20 @@ _start:
 
     ; ==========================================================================
     ; ZACHOWAJ ADRES BOOTINFO
+    ;
+    ; BootInfo:
+    ;
+    ; +0x00 framebuffer
+    ; +0x08 framebuffer size
+    ; +0x10 width
+    ; +0x14 height
+    ; +0x18 pixels per scanline
+    ; +0x1C pixel format
+    ; +0x20 memory map pointer
+    ; +0x28 memory map size
+    ; +0x30 descriptor size
+    ; +0x38 descriptor version
+    ; +0x40 ACPI RSDP
     ; ==========================================================================
 
     mov rbx, rcx
@@ -267,6 +327,15 @@ _start:
 
 
     ; ==========================================================================
+    ; ACPI RSDP
+    ; ==========================================================================
+
+    mov rax, [rbx + 0x40]
+
+    mov [acpi_rsdp], rax
+
+
+    ; ==========================================================================
     ; WALIDACJA BOOTINFO
     ; ==========================================================================
 
@@ -323,6 +392,106 @@ _start:
 
 
     ; ==========================================================================
+    ; ACPI INIT
+    ;
+    ; RCX = RSDP
+    ;
+    ; Parser:
+    ;   RSDP
+    ;      |
+    ;      +--> XSDT
+    ;      |      |
+    ;      |      +--> MADT
+    ;      |
+    ;      +--> RSDT fallback
+    ;
+    ; MADT:
+    ;   - Local APIC
+    ;   - IOAPIC
+    ;   - ISO
+    ; ==========================================================================
+
+    mov rcx, [acpi_rsdp]
+
+    test rcx, rcx
+
+    jz .skip_acpi
+
+    call acpi_init
+
+    cmp rax, 1
+
+    jne .skip_acpi
+
+
+    ; --------------------------------------------------------------------------
+    ; ACPI wykryte.
+    ; --------------------------------------------------------------------------
+
+    mov byte [acpi_active], 1
+
+
+    ; --------------------------------------------------------------------------
+    ; Zapamiętaj adres MADT.
+    ; --------------------------------------------------------------------------
+
+    call acpi_get_madt
+
+    mov [acpi_madt], rax
+
+
+    ; --------------------------------------------------------------------------
+    ; Zapamiętaj Local APIC address z MADT.
+    ; --------------------------------------------------------------------------
+
+    call acpi_get_lapic_address
+
+    mov [acpi_lapic_address], rax
+
+
+    ; --------------------------------------------------------------------------
+    ; Liczba wykrytych CPU/APIC.
+    ; --------------------------------------------------------------------------
+
+    call acpi_get_lapic_count
+
+    mov [acpi_cpu_count], eax
+
+
+.skip_acpi:
+
+
+    ; ==========================================================================
+    ; LOCAL APIC INIT
+    ;
+    ; Na tym etapie LAPIC jest tylko włączany.
+    ;
+    ; PIC/PIT nadal działają.
+    ; ==========================================================================
+
+    call lapic_init
+
+    cmp rax, 1
+
+    jne .skip_lapic
+
+
+    mov byte [lapic_active], 1
+
+
+    ; --------------------------------------------------------------------------
+    ; Pobierz ID aktualnego CPU.
+    ; --------------------------------------------------------------------------
+
+    call lapic_get_id
+
+    mov [lapic_boot_cpu_id], eax
+
+
+.skip_lapic:
+
+
+    ; ==========================================================================
     ; AHS-TUS
     ; ==========================================================================
 
@@ -332,9 +501,9 @@ _start:
     ; ==========================================================================
     ; IDT
     ;
-    ; Nadal nie włączamy przerwań.
+    ; Nadal używamy PIC.
     ; ==========================================================================
-
+    
     call idt_init
 
 
@@ -509,9 +678,9 @@ _start:
     ; ==========================================================================
     ; PIT
     ;
-    ; Nadal mamy CLI.
-    ; PIT może generować IRQ dopiero po utworzeniu poprawnego
-    ; kontekstu task 0.
+    ; Nadal używamy PIT przez PIC.
+    ;
+    ; IOAPIC zostanie dodany później.
     ; ==========================================================================
 
     call pit_init
@@ -545,16 +714,15 @@ _start:
 
     mov rdx, 5
 
+
     ; --------------------------------------------------------------------------
     ; TGFS LOAD ADDRESS
     ;
-    ; 0x00800000 było błędne:
-    ; - znajduje się poniżej bezpiecznego obszaru TGFS,
-    ; - koliduje z obszarem zarezerwowanym przez PMM.
+    ; Zakres obsługiwany przez tgfs_vfs.asm:
     ;
-    ; tgfs_vfs.asm dopuszcza zakres:
     ;     0x04000000 - 0x06000000
     ;
+    ; 0x00800000 było błędne, ponieważ kolidowało z obszarem PMM.
     ; --------------------------------------------------------------------------
 
     mov r8, 0x04000000
@@ -570,6 +738,7 @@ _start:
 
     je fallback_render
 
+
     cmp rax, -1
 
     je fallback_render
@@ -584,14 +753,6 @@ _start:
 
     ; ==========================================================================
     ; PRZYDZIEL STRONĘ NA STOS NOWEGO ZADANIA
-    ;
-    ; NIE używamy już:
-    ;
-    ;     0x00A00000
-    ;
-    ; ponieważ ten adres nie był zarezerwowany przez PMM.
-    ;
-    ; pmm_alloc_page zwraca fizyczny adres strony.
     ; ==========================================================================
 
     call pmm_alloc_page
@@ -626,10 +787,9 @@ _start:
 
 
     ; --------------------------------------------------------------------------
-    ; Sprawdź ID.
-    ;
-    ; RAX = -1 -> brak miejsca w tablicy tasków.
-    ; ==========================================================================
+    ; RAX = ID taska
+    ; RAX = -1 -> brak miejsca
+    ; --------------------------------------------------------------------------
 
     cmp rax, -1
 
@@ -637,9 +797,7 @@ _start:
 
 
     ; --------------------------------------------------------------------------
-    ; Task został już oznaczony jako ready przez scheduler_create_task.
-    ;
-    ; Nie musimy drugi raz wywoływać scheduler_trigger_event().
+    ; Task został już oznaczony jako READY.
     ; --------------------------------------------------------------------------
 
     jmp system_execute
@@ -674,9 +832,17 @@ system_execute:
     ; Dopiero tutaj włączamy IRQ.
     ;
     ; Scheduler został już zainicjalizowany.
-    ; Task 0 będzie miał zapisany kontekst przy pierwszym PIT IRQ.
+    ;
+    ; Aktualnie:
+    ;
+    ;   PIT -> PIC -> IDT
+    ;
+    ; Docelowo:
+    ;
+    ;   PIT/IRQ -> IOAPIC -> LAPIC -> IDT
+    ;
     ; ==========================================================================
-
+    
     sti
 
 
@@ -761,8 +927,48 @@ mmap_descver:
 
 
 ; ==============================================================================
+; ACPI
+; ==============================================================================
+
+acpi_rsdp:
+    dq 0
+
+
+acpi_madt:
+    dq 0
+
+
+acpi_lapic_address:
+    dq 0
+
+
+acpi_cpu_count:
+    dq 0
+
+
+acpi_active:
+    db 0
+
+
+; ==============================================================================
+; LOCAL APIC
+; ==============================================================================
+
+lapic_active:
+    db 0
+
+
+align 4
+
+lapic_boot_cpu_id:
+    dd 0
+
+
+; ==============================================================================
 ; xHCI
 ; ==============================================================================
+
+align 8
 
 xhci_base_mmio:
     dq 0
@@ -786,3 +992,15 @@ msg_boot:
 
 ; ==============================================================================
 ; KERNEL STACK
+; ==============================================================================
+
+section .bss
+
+align 16
+
+kernel_stack:
+
+    resb 16384
+
+
+stack_top:
