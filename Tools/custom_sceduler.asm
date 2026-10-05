@@ -191,7 +191,7 @@ scheduler_create_task:
     ; Rezerwujemy 256 bajtów.
     ; --------------------------------------------------------------------------
 
-    sub rdx, 256
+    sub rdx, 248
 
     ; --------------------------------------------------------------------------
     ; Sprawdzenie przepełnienia adresu po odejmowaniu.
