@@ -8,21 +8,22 @@
 ;   check_ahci_ports
 ;   ahci_read_sectors
 ;
-; API odczytu:
+; API:
+;
+; ahci_read_sectors:
 ;   RCX = numer portu SATA
 ;   RDX = LBA
 ;   R8  = liczba sektorów
 ;   R9  = adres bufora
 ;
-; Wyjście ahci_read_sectors:
-;   CF = 0  sukces
-;   CF = 1  błąd / timeout
+; Wyjście:
+;   RAX = 1 sukces
+;   RAX = 0 błąd
+;   CF  = 0 sukces
+;   CF  = 1 błąd
 ;
-; Wspólna obsługa PCI:
-;   pci_read_config_dword znajduje się w Tools/pci_dyski.asm
-;
-; UWAGA:
-;   AHCI BAR znajduje się w PCI BAR5, offset 0x24.
+; PCI:
+;   pci_read_config_dword z Tools/pci_dyski.asm
 ; ==============================================================================
 
 bits 64
@@ -38,23 +39,18 @@ extern pci_read_config_dword
 
 
 ; ==============================================================================
-; STAŁE
+; AHCI / PCI CONSTANTS
 ; ==============================================================================
 
 AHCI_CLASS        equ 0x01
 AHCI_SUBCLASS     equ 0x06
 AHCI_PROGIF       equ 0x01
 
-
-; ==============================================================================
-; PCI
-; ==============================================================================
-
-PCI_BAR5 equ 0x24
+PCI_BAR5          equ 0x24
 
 
 ; ==============================================================================
-; AHCI HBA REGISTERS
+; HBA REGISTERS
 ; ==============================================================================
 
 HBA_CAP           equ 0x00
@@ -62,21 +58,24 @@ HBA_GHC           equ 0x04
 HBA_IS            equ 0x08
 HBA_PI            equ 0x0C
 HBA_VS            equ 0x10
-HBA_CCC_CTL       equ 0x14
 HBA_CAP2          equ 0x24
 
 
 ; ==============================================================================
-; AHCI PORT REGISTERS
+; PORT REGISTERS
 ; ==============================================================================
 
 PXCLB             equ 0x00
 PXCLBU            equ 0x04
+
 PXFB              equ 0x08
 PXFBU             equ 0x0C
+
 PXIS              equ 0x10
 PXIE              equ 0x14
+
 PXCMD             equ 0x18
+
 PXTFD             equ 0x20
 PXSIG             equ 0x24
 PXSSTS            equ 0x28
@@ -97,7 +96,7 @@ PXCMD_CR          equ 0x00008000
 
 
 ; ==============================================================================
-; PxIS
+; PxIS ERROR FLAGS
 ; ==============================================================================
 
 PXIS_TFES         equ 0x40000000
@@ -106,6 +105,9 @@ PXIS_HBDS         equ 0x10000000
 PXIS_IFS          equ 0x08000000
 PXIS_INFS         equ 0x04000000
 PXIS_OFS          equ 0x01000000
+
+
+AHCI_ERROR_MASK   equ PXIS_TFES | PXIS_HBFS | PXIS_HBDS | PXIS_IFS | PXIS_INFS | PXIS_OFS
 
 
 ; ==============================================================================
@@ -135,7 +137,7 @@ ATA_READ_DMA_EXT  equ 0x25
 
 
 ; ==============================================================================
-; PAMIĘĆ AHCI
+; AHCI MEMORY
 ;
 ; PMM rezerwuje pierwsze 32 MiB.
 ;
@@ -148,7 +150,7 @@ ATA_READ_DMA_EXT  equ 0x25
 ; Command Table:
 ;   0x00400800
 ;
-; Wszystkie adresy są wyrównane wymaganiami AHCI.
+; Jeden aktywny port jest obecnie wystarczający dla aktualnego VFS/TGFS.
 ; ==============================================================================
 
 AHCI_CLB          equ 0x00400000
@@ -159,7 +161,7 @@ AHCI_PORT_SIZE    equ 0x80
 
 
 ; ==============================================================================
-; LIMIT
+; TIMEOUT
 ; ==============================================================================
 
 AHCI_TIMEOUT      equ 10000000
@@ -179,27 +181,29 @@ ahci_base_mmio:
 ahci_port_index:
     resq 1
 
-ahci_initialized:
-    resb 1
-
-align 8
-
 ahci_port_mmio:
     resq 1
 
+ahci_initialized:
+    resb 1
+
 
 ; ==============================================================================
-; find_ahci_controller
+; FIND AHCI CONTROLLER
 ;
-; Szuka kontrolera:
+; Skan:
+;   Bus      0..255
+;   Device   0..31
+;   Function 0..7
 ;
-;   Class    = 01
-;   Subclass = 06
-;   ProgIF   = 01
+; PCI CONFIG:
+;   BH = bus
+;   BL = device
+;   CH = function
+;   CL = offset
 ;
 ; Wyjście:
-;
-;   RAX = 64-bitowy adres AHCI HBA MMIO
+;   RAX = AHCI HBA MMIO
 ;   CF  = 0 znaleziono
 ;   CF  = 1 brak
 ; ==============================================================================
@@ -209,20 +213,23 @@ section .text
 find_ahci_controller:
 
     push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
 
-    xor ebx, ebx
+    xor r12d, r12d                  ; bus = 0
+
 
 .bus_loop:
 
-    xor esi, esi
+    xor r13d, r13d                  ; device = 0
+
 
 .device_loop:
 
-    xor edi, edi
+    xor r14d, r14d                  ; function = 0
+
 
 .function_loop:
 
@@ -230,21 +237,27 @@ find_ahci_controller:
     ; PCI vendor/device
     ; --------------------------------------------------------------------------
 
-    mov bh, sil
-    mov bl, dil
-    mov ch, dil
-    mov cl, 0x00
+    mov ebx, r12d
+
+    mov bh, bl                      ; BH = bus
+    mov bl, r13b                     ; BL = device
+
+    mov ecx, r14d
+
+    mov ch, cl                      ; CH = function
+    mov cl, 0x00                    ; offset = 0
 
     call pci_read_config_dword
 
     cmp ax, 0xFFFF
+
     je .next_function
 
 
     ; --------------------------------------------------------------------------
-    ; Class/Subclass/ProgIF
+    ; PCI class / subclass / progIF
     ;
-    ; PCI offset 08:
+    ; offset 08:
     ;
     ; 31:24 Revision
     ; 23:16 ProgIF
@@ -252,9 +265,14 @@ find_ahci_controller:
     ; 07:00 Class
     ; --------------------------------------------------------------------------
 
-    mov bh, sil
-    mov bl, dil
-    mov ch, dil
+    mov ebx, r12d
+
+    mov bh, bl
+    mov bl, r13b
+
+    mov ecx, r14d
+
+    mov ch, cl
     mov cl, 0x08
 
     call pci_read_config_dword
@@ -266,98 +284,117 @@ find_ahci_controller:
     and edx, 0x00FFFFFF
 
     cmp edx, 0x00010601
+
     jne .next_function
 
 
     ; --------------------------------------------------------------------------
-    ; Znaleziono AHCI.
-    ; Odczytaj BAR5.
+    ; AHCI FOUND
+    ;
+    ; BAR5 = offset 24h.
+    ;
+    ; BAR5 jest ostatnim standardowym BAR-em PCI, dlatego nie zakładamy
+    ; istnienia BAR6 jako części 64-bitowego BAR-u.
     ; --------------------------------------------------------------------------
 
-    mov bh, sil
-    mov bl, dil
-    mov ch, dil
+    mov ebx, r12d
+
+    mov bh, bl
+    mov bl, r13b
+
+    mov ecx, r14d
+
+    mov ch, cl
     mov cl, PCI_BAR5
 
     call pci_read_config_dword
 
-    mov esi, eax
-
     ; --------------------------------------------------------------------------
-    ; BAR bit 0 = 1 oznacza I/O BAR.
-    ; AHCI musi być MMIO.
+    ; Bit 0 = I/O BAR.
+    ; AHCI wymaga MMIO.
     ; --------------------------------------------------------------------------
 
-    test esi, 1
+    test eax, 1
+
     jnz .next_function
 
-    and esi, 0xFFFFFFF0
-
-    test esi, esi
-    jz .next_function
 
     ; --------------------------------------------------------------------------
-    ; Sprawdź 64-bitowy BAR.
+    ; Typ Memory BAR:
     ;
-    ; PCI BAR5:
-    ;   BAR5 = offset 24h
+    ; bits 2:1
     ;
-    ; Dla BAR typu 64-bit następny DWORD zawiera high 32 bits.
+    ; 00 = 32-bit
+    ; 01 = reserved
+    ; 10 = 64-bit
+    ;
+    ; BAR5 jest ostatnim BAR-em, więc 64-bit BAR rozpoczynający się tutaj
+    ; nie może być poprawnie reprezentowany przez standardowe BAR0..BAR5.
+    ; Dla bezpieczeństwa odrzucamy taki przypadek.
     ; --------------------------------------------------------------------------
 
-    mov bh, sil
-    mov bl, dil
-    mov ch, dil
-    mov cl, PCI_BAR5 + 4
+    mov edx, eax
 
-    call pci_read_config_dword
+    shr edx, 1
 
-    mov rdx, rax
+    and edx, 3
 
-    shl rdx, 32
+    cmp edx, 2
 
-    and rdx, 0xFFFFFFFF00000000
+    je .next_function
 
-    or rdx, rsi
 
-    test rdx, rdx
+    ; --------------------------------------------------------------------------
+    ; Usuń flagi BAR.
+    ; --------------------------------------------------------------------------
+
+    and eax, 0xFFFFFFF0
+
+    test eax, eax
+
     jz .next_function
 
-    mov rax, rdx
+
+    ; --------------------------------------------------------------------------
+    ; Zapisz HBA MMIO.
+    ; --------------------------------------------------------------------------
+
+    movzx rax, eax
 
     mov [rel ahci_base_mmio], rax
 
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
 
     clc
+
     ret
 
 
 .next_function:
 
-    inc edi
+    inc r14d
 
-    cmp edi, 8
+    cmp r14d, 8
+
     jb .function_loop
 
 
-    inc esi
+    inc r13d
 
-    cmp esi, 32
+    cmp r13d, 32
+
     jb .device_loop
 
 
-    ; --------------------------------------------------------------------------
-    ; PCI config mechanism 1 obsługuje 256 magistral.
-    ; --------------------------------------------------------------------------
+    inc r12d
 
-    inc ebx
+    cmp r12d, 256
 
-    cmp ebx, 256
     jb .bus_loop
 
 
@@ -365,10 +402,12 @@ find_ahci_controller:
     ; Nie znaleziono.
     ; --------------------------------------------------------------------------
 
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
+    mov qword [rel ahci_base_mmio], 0
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
 
     xor eax, eax
@@ -379,7 +418,7 @@ find_ahci_controller:
 
 
 ; ==============================================================================
-; init_ahci_controller
+; INIT AHCI CONTROLLER
 ;
 ; Wejście:
 ;   RAX = AHCI HBA MMIO
@@ -389,10 +428,12 @@ find_ahci_controller:
 ;   CF = 1 błąd
 ;
 ; Funkcja:
-;   - zapamiętuje HBA
-;   - wyszukuje pierwszy używalny port SATA
-;   - zatrzymuje port
-;   - ustawia CLB/FIS
+;   - włącza AHCI
+;   - znajduje pierwszy aktywny port SATA
+;   - zatrzymuje command engine
+;   - ustawia Command List
+;   - ustawia Received FIS
+;   - przygotowuje Command Table
 ;   - uruchamia FIS receive
 ;   - uruchamia command engine
 ; ==============================================================================
@@ -410,14 +451,15 @@ init_ahci_controller:
     push r15
 
     test rax, rax
+
     jz .init_error
 
     mov [rel ahci_base_mmio], rax
 
-    ; --------------------------------------------------------------------------
-    ; GHC.AE
-    ; Bit 31 = AHCI Enable
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; AHCI ENABLE
+    ; ==========================================================================
 
     mov edx, [rax + HBA_GHC]
 
@@ -426,14 +468,16 @@ init_ahci_controller:
     mov [rax + HBA_GHC], edx
 
 
-    ; --------------------------------------------------------------------------
-    ; PI = Ports Implemented
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; PORTS IMPLEMENTED
+    ; ==========================================================================
 
     mov edx, [rax + HBA_PI]
 
     test edx, edx
+
     jz .init_error
+
 
     xor r12d, r12d
 
@@ -441,6 +485,7 @@ init_ahci_controller:
 .find_port:
 
     test edx, 1
+
     jnz .candidate_port
 
     shr edx, 1
@@ -448,6 +493,7 @@ init_ahci_controller:
     inc r12d
 
     cmp r12d, 32
+
     jb .find_port
 
     jmp .init_error
@@ -475,11 +521,7 @@ init_ahci_controller:
 
 
     ; --------------------------------------------------------------------------
-    ; Sprawdź SATA status.
-    ;
-    ; PxSSTS:
-    ;   bits 3:0 = DET
-    ;   bits 7:4 = SPD
+    ; DET = 3 -> device present and PHY established.
     ; --------------------------------------------------------------------------
 
     mov edx, [r13 + PXSSTS]
@@ -487,14 +529,18 @@ init_ahci_controller:
     and edx, 0x0F
 
     cmp edx, 0x03
+
     je .device_present
 
-    ; Port istnieje, ale urządzenie nie jest jeszcze aktywne.
-    ; Spróbuj następnego portu.
-    
+
+    ; --------------------------------------------------------------------------
+    ; Spróbuj następnego zaimplementowanego portu.
+    ; --------------------------------------------------------------------------
+
     inc r12d
 
     cmp r12d, 32
+
     jae .init_error
 
     mov edx, [rax + HBA_PI]
@@ -504,6 +550,7 @@ init_ahci_controller:
     shr edx, cl
 
     test edx, 1
+
     jz .find_port
 
     jmp .candidate_port
@@ -511,17 +558,49 @@ init_ahci_controller:
 
 .device_present:
 
-    ; --------------------------------------------------------------------------
-    ; Zatrzymaj command engine.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SPRAWDŹ SIGNATURE
+    ; ==========================================================================
+
+    mov edx, [r13 + PXSIG]
+
+    cmp edx, SATA_SIG_ATA
+
+    je .ata_device
+
+    ; ATAPI nie jest obsługiwane przez obecny sterownik odczytu.
+    cmp edx, SATA_SIG_ATAPI
+
+    je .init_error
+
+    ; Port multiplier / SEMB również nie są obsługiwane.
+    cmp edx, SATA_SIG_SEMB
+
+    je .init_error
+
+    cmp edx, SATA_SIG_PM
+
+    je .init_error
+
+    ; Nieznana sygnatura.
+    jmp .init_error
+
+
+.ata_device:
+
+    ; ==========================================================================
+    ; STOP COMMAND ENGINE
+    ; ==========================================================================
 
     and dword [r13 + PXCMD], ~PXCMD_ST
 
-    ; --------------------------------------------------------------------------
-    ; Czekaj na CR = 0.
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; CZEKAJ CR = 0
+    ; ==========================================================================
 
     mov ecx, AHCI_TIMEOUT
+
 
 .wait_cr_clear:
 
@@ -540,37 +619,69 @@ init_ahci_controller:
 
 .cr_clear:
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść pending errors.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; WYŁĄCZ / ZATRZYMAJ FIS RECEIVE
+    ; ==========================================================================
+
+    and dword [r13 + PXCMD], ~PXCMD_FRE
+
+
+    ; ==========================================================================
+    ; CZEKAJ FR = 0
+    ; ==========================================================================
+
+    mov ecx, AHCI_TIMEOUT
+
+
+.wait_fr_clear:
+
+    test dword [r13 + PXCMD], PXCMD_FR
+
+    jz .fr_clear
+
+    pause
+
+    dec ecx
+
+    jnz .wait_fr_clear
+
+    jmp .init_error
+
+
+.fr_clear:
+
+    ; ==========================================================================
+    ; WYCZYŚĆ BŁĘDY
+    ; ==========================================================================
 
     mov dword [r13 + PXSERR], 0xFFFFFFFF
 
     mov dword [r13 + PXIS], 0xFFFFFFFF
 
 
-    ; --------------------------------------------------------------------------
-    ; Command List Base.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; COMMAND LIST BASE
+    ; ==========================================================================
 
     mov dword [r13 + PXCLB], AHCI_CLB
 
     mov dword [r13 + PXCLBU], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Received FIS Base.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; RECEIVED FIS BASE
+    ; ==========================================================================
 
     mov dword [r13 + PXFB], AHCI_FB
 
     mov dword [r13 + PXFBU], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść Command List.
-    ; 32 sloty * 32 bajty = 1024.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; CLEAR COMMAND LIST
+    ;
+    ; 32 slots * 32 bytes = 1024 bytes.
+    ; ==========================================================================
 
     mov rdi, AHCI_CLB
 
@@ -581,10 +692,11 @@ init_ahci_controller:
     rep stosq
 
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść Received FIS.
-    ; 256 bajtów.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; CLEAR RECEIVED FIS
+    ;
+    ; 256 bytes.
+    ; ==========================================================================
 
     mov rdi, AHCI_FB
 
@@ -595,10 +707,11 @@ init_ahci_controller:
     rep stosq
 
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść Command Table.
-    ; 256 bajtów.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; CLEAR COMMAND TABLE
+    ;
+    ; 256 bytes.
+    ; ==========================================================================
 
     mov rdi, AHCI_CTBA
 
@@ -609,51 +722,46 @@ init_ahci_controller:
     rep stosq
 
 
-    ; --------------------------------------------------------------------------
-    ; Command Header slot 0.
+    ; ==========================================================================
+    ; COMMAND HEADER SLOT 0
     ;
     ; DW0:
-    ;   CFL = 5 DWORD = 20 bajtów
-    ;   A   = 0
-    ;   W   = 0 (read)
+    ;   CFL   = 5 DWORD
+    ;   W     = 0 (READ)
     ;   PRDTL = 1
-    ;
-    ; 0x00010005
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov dword [AHCI_CLB + 0], 0x00010005
 
-    ; PRDBC = 0
     mov dword [AHCI_CLB + 4], 0
 
-    ; CTBA low
     mov dword [AHCI_CLB + 8], AHCI_CTBA
 
-    ; CTBA high
     mov dword [AHCI_CLB + 12], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Włącz FIS Receive.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ENABLE FIS RECEIVE
+    ; ==========================================================================
 
     or dword [r13 + PXCMD], PXCMD_FRE
 
 
-    ; --------------------------------------------------------------------------
-    ; Włącz command engine.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ENABLE COMMAND ENGINE
+    ; ==========================================================================
 
     or dword [r13 + PXCMD], PXCMD_ST
 
 
-    ; --------------------------------------------------------------------------
-    ; Zapamiętaj stan.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; READY
+    ; ==========================================================================
 
     mov byte [rel ahci_initialized], 1
 
     mov rax, [rel ahci_base_mmio]
+
 
     pop r15
     pop r14
@@ -692,10 +800,12 @@ init_ahci_controller:
 
 
 ; ==============================================================================
-; check_ahci_ports
+; CHECK AHCI PORTS
 ;
 ; Wyjście:
-;   RAX = bitmap portów z DET=3
+;   RAX = bitmap aktywnych portów
+;   CF  = 0 jeśli HBA istnieje
+;   CF  = 1 jeśli HBA nie istnieje
 ; ==============================================================================
 
 check_ahci_ports:
@@ -708,31 +818,40 @@ check_ahci_ports:
     mov rbx, [rel ahci_base_mmio]
 
     test rbx, rbx
+
     jz .no_ports
 
     mov edx, [rbx + HBA_PI]
 
     xor eax, eax
+
     xor r12d, r12d
 
 
 .port_loop:
 
     test edx, 1
+
     jz .next_port
+
 
     mov rcx, r12
 
     shl rcx, 7
 
-    lea rcx, [rbx + rcx + 0x100]
+    add rcx, rbx
+
+    add rcx, 0x100
+
 
     mov esi, [rcx + PXSSTS]
 
     and esi, 0x0F
 
     cmp esi, 0x03
+
     jne .next_port
+
 
     bts rax, r12
 
@@ -744,7 +863,9 @@ check_ahci_ports:
     inc r12d
 
     cmp r12d, 32
+
     jb .port_loop
+
 
     pop r12
     pop rdx
@@ -771,26 +892,25 @@ check_ahci_ports:
 
 
 ; ==============================================================================
-; ahci_read_sectors
+; AHCI READ SECTORS
 ;
 ; Wejście:
 ;
 ;   RCX = SATA port
 ;   RDX = LBA 48-bit
 ;   R8  = liczba sektorów
-;   R9  = adres bufora
+;   R9  = bufor
 ;
-; Odczyt:
-;   ATA READ DMA EXT (0x25)
+; Obecny TGFS:
+;   max 4096 sektorów = 2 MiB
 ;
-; Maksymalnie 65535 sektorów w jednym wywołaniu.
-;
-; Dla obecnego TGFS limit 2 MiB oznacza maksymalnie 4096 sektorów.
+; Jeden PRDT entry może obsłużyć do 4 MiB.
 ;
 ; Wyjście:
-;
-;   CF = 0 sukces
-;   CF = 1 błąd
+;   RAX = 1 sukces
+;   RAX = 0 błąd
+;   CF  = 0 sukces
+;   CF  = 1 błąd
 ; ==============================================================================
 
 ahci_read_sectors:
@@ -803,103 +923,134 @@ ahci_read_sectors:
     push r14
     push r15
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź inicjalizację.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SPRAWDŹ INICJALIZACJĘ
+    ; ==========================================================================
 
     cmp byte [rel ahci_initialized], 1
+
     jne .read_error
 
 
-    ; --------------------------------------------------------------------------
-    ; Parametry.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ZACHOWAJ PARAMETRY
+    ; ==========================================================================
 
-    mov r12, rcx                ; port
-    mov r13, rdx                ; LBA
-    mov r14, r8                 ; sectors
-    mov r15, r9                 ; buffer
+    mov r12, rcx                    ; port
+    mov r13, rdx                    ; LBA
+    mov r14, r8                     ; sectors
+    mov r15, r9                     ; buffer
 
 
-    ; --------------------------------------------------------------------------
-    ; Podstawowa walidacja.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; VALIDATION
+    ; ==========================================================================
 
     test r14, r14
+
     jz .read_error
 
     test r15, r15
+
     jz .read_error
 
     cmp r14, 65535
+
     ja .read_error
 
-    ; LBA 48-bit.
+
+    ; ==========================================================================
+    ; LBA 48-BIT
+    ; ==========================================================================
+
     mov rax, r13
 
     shr rax, 48
 
     test rax, rax
+
     jnz .read_error
 
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź port.
-    ; --------------------------------------------------------------------------
-
-    mov rbx, [rel ahci_base_mmio]
-
-    test rbx, rbx
-    jz .read_error
+    ; ==========================================================================
+    ; PORT RANGE
+    ; ==========================================================================
 
     cmp r12, 31
+
     ja .read_error
 
 
-    ; --------------------------------------------------------------------------
-    ; RDI = port MMIO.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; PORT MMIO
+    ;
+    ; WAŻNE:
+    ; R12-R15 pozostają parametrami.
+    ; RDI może być później używany do memset Command Table.
+    ; Adres portu przechowujemy w RBX.
+    ; ==========================================================================
 
-    mov rdi, r12
+    mov rax, [rel ahci_base_mmio]
 
-    shl rdi, 7
+    test rax, rax
 
-    add rdi, rbx
-
-    add rdi, 0x100
+    jz .read_error
 
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź SATA device.
-    ; --------------------------------------------------------------------------
+    mov rbx, r12
 
-    mov eax, [rdi + PXSSTS]
+    shl rbx, 7
+
+    add rbx, rax
+
+    add rbx, 0x100
+
+
+    ; ==========================================================================
+    ; SPRAWDŹ SATA DEVICE
+    ; ==========================================================================
+
+    mov eax, [rbx + PXSSTS]
 
     and eax, 0x0F
 
     cmp eax, 0x03
+
     jne .read_error
 
 
-    ; --------------------------------------------------------------------------
-    ; Command engine musi działać.
-    ; Jeżeli został zatrzymany, uruchom go.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SPRAWDŹ SIGNATURE
+    ; ==========================================================================
 
-    mov eax, [rdi + PXCMD]
+    mov eax, [rbx + PXSIG]
+
+    cmp eax, SATA_SIG_ATA
+
+    jne .read_error
+
+
+    ; ==========================================================================
+    ; COMMAND ENGINE
+    ; ==========================================================================
+
+    mov eax, [rbx + PXCMD]
 
     test eax, PXCMD_ST
+
     jnz .engine_running
 
-    ; --------------------------------------------------------------------------
-    ; ST=0 -> czekaj CR=0.
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; ENGINE STOPPED
+    ; ==========================================================================
 
     mov ecx, AHCI_TIMEOUT
 
+
 .wait_engine_stop:
 
-    test dword [rdi + PXCMD], PXCMD_CR
+    test dword [rbx + PXCMD], PXCMD_CR
 
     jz .engine_stopped
 
@@ -914,28 +1065,25 @@ ahci_read_sectors:
 
 .engine_stopped:
 
-    or dword [rdi + PXCMD], PXCMD_FRE
-    or dword [rdi + PXCMD], PXCMD_ST
+    or dword [rbx + PXCMD], PXCMD_FRE
+
+    or dword [rbx + PXCMD], PXCMD_ST
 
 
 .engine_running:
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść poprzednie błędy.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; WYŚLIJ / WYCZYŚĆ BŁĘDY
+    ; ==========================================================================
 
-    mov dword [rdi + PXSERR], 0xFFFFFFFF
+    mov dword [rbx + PXSERR], 0xFFFFFFFF
 
-    mov dword [rdi + PXIS], 0xFFFFFFFF
+    mov dword [rbx + PXIS], 0xFFFFFFFF
 
 
-    ; --------------------------------------------------------------------------
-    ; Command Header slot 0.
-    ;
-    ; CFL = 5
-    ; W = 0
-    ; PRDTL = 1
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; COMMAND HEADER SLOT 0
+    ; ==========================================================================
 
     mov dword [AHCI_CLB + 0], 0x00010005
 
@@ -946,95 +1094,89 @@ ahci_read_sectors:
     mov dword [AHCI_CLB + 12], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Command Table = 256 B.
-    ; Czyścimy ją przed każdym transferem.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; CLEAR COMMAND TABLE
+    ;
+    ; WAŻNE:
+    ; Nie używamy RDI jako port MMIO.
+    ; Port jest w RBX.
+    ; ==========================================================================
 
-    mov rsi, AHCI_CTBA
+    mov rdi, AHCI_CTBA
 
     xor eax, eax
 
     mov ecx, 32
 
-    mov rdx, rsi
-
-    mov rdi, rdx
-
     rep stosq
 
 
-    ; --------------------------------------------------------------------------
-    ; FIS REG_H2D
-    ;
-    ; Command Table + 0x00
-    ;
-    ; DW0:
-    ;   FIS Type = 0x27
-    ;   C = 1
-    ;
-    ; Byte layout:
-    ;
-    ; +00 = 27h
-    ; +01 = 80h
-    ; +02 = command
-    ; +03 = feature low
-    ; +04 = LBA7:0
-    ; +05 = LBA15:8
-    ; +06 = LBA23:16
-    ; +07 = device
-    ; +08 = LBA31:24
-    ; +09 = LBA39:32
-    ; +0A = LBA47:40
-    ; +0B = feature high
-    ; +0C = count low
-    ; +0D = count high
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; HOST TO DEVICE FIS
+    ; ==========================================================================
 
     mov byte [AHCI_CTBA + 0], 0x27
+
     mov byte [AHCI_CTBA + 1], 0x80
+
     mov byte [AHCI_CTBA + 2], ATA_READ_DMA_EXT
+
     mov byte [AHCI_CTBA + 3], 0
 
 
-    ; LBA bits 0..7
+    ; ==========================================================================
+    ; LBA 0..23
+    ; ==========================================================================
+
     mov rax, r13
+
     mov byte [AHCI_CTBA + 4], al
 
-    ; LBA bits 8..15
     shr rax, 8
+
     mov byte [AHCI_CTBA + 5], al
 
-    ; LBA bits 16..23
     shr rax, 8
+
     mov byte [AHCI_CTBA + 6], al
 
-    ; Device = LBA mode
+
+    ; ==========================================================================
+    ; DEVICE
+    ;
+    ; LBA mode.
+    ; ==========================================================================
+
     mov byte [AHCI_CTBA + 7], 0x40
 
-    ; LBA bits 24..31
+
+    ; ==========================================================================
+    ; LBA 24..47
+    ; ==========================================================================
+
     shr rax, 8
+
     mov byte [AHCI_CTBA + 8], al
 
-    ; LBA bits 32..39
     shr rax, 8
+
     mov byte [AHCI_CTBA + 9], al
 
-    ; LBA bits 40..47
     shr rax, 8
+
     mov byte [AHCI_CTBA + 10], al
 
-    ; Feature high
+
+    ; ==========================================================================
+    ; FEATURES HIGH
+    ; ==========================================================================
+
     mov byte [AHCI_CTBA + 11], 0
 
 
-    ; --------------------------------------------------------------------------
-    ; Sector count 16-bit.
-    ; ATA READ DMA EXT:
-    ;
-    ; count 0 = 65536
-    ; ale wcześniej ograniczyliśmy do <= 65535.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SECTOR COUNT
+    ; ==========================================================================
 
     mov rax, r14
 
@@ -1045,33 +1187,60 @@ ahci_read_sectors:
     mov byte [AHCI_CTBA + 13], al
 
 
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
     ; PRDT
     ;
-    ; Command Table + 0x80
+    ; DBC = bytes - 1
     ;
-    ; DBC = liczba bajtów - 1
-    ; IOC = 0
-    ;
-    ; AHCI PRDT ma maksymalnie 4 MiB w jednym wpisie.
-    ;
-    ; TGFS maksymalnie 2 MiB, więc jeden wpis wystarcza.
-    ; --------------------------------------------------------------------------
+    ; Jeden wpis maksymalnie 4 MiB.
+    ; ==========================================================================
 
     mov rax, r14
 
     shl rax, 9
 
-    ; overflow
     jc .read_error
 
     test rax, rax
+
     jz .read_error
 
     cmp rax, 0x400000
+
     ja .read_error
 
+
+    ; --------------------------------------------------------------------------
+    ; Sprawdź, czy bufor nie przekracza granicy 4 MiB.
+    ;
+    ; AHCI PRDT entry nie może przekroczyć granicy 4 MiB.
+    ; --------------------------------------------------------------------------
+
+    mov rdx, r15
+
+    and rdx, 0x003FFFFF
+
+    add rdx, rax
+
+    cmp rdx, 0x00400000
+
+    ja .read_error
+
+
+    ; --------------------------------------------------------------------------
+    ; Byte Count = size - 1
+    ; --------------------------------------------------------------------------
+
     dec rax
+
+    mov dword [AHCI_CTBA + 0x88], eax
+
+    mov dword [AHCI_CTBA + 0x8C], 0
+
+
+    ; --------------------------------------------------------------------------
+    ; PRDT Data Base Address
+    ; --------------------------------------------------------------------------
 
     mov dword [AHCI_CTBA + 0x80], r15d
 
@@ -1081,34 +1250,30 @@ ahci_read_sectors:
 
     mov dword [AHCI_CTBA + 0x84], edx
 
-    mov dword [AHCI_CTBA + 0x88], eax
 
-    mov dword [AHCI_CTBA + 0x8C], 0
+    ; ==========================================================================
+    ; WYCZYŚĆ STATUS
+    ; ==========================================================================
 
+    mov dword [rbx + PXIS], 0xFFFFFFFF
 
-    ; --------------------------------------------------------------------------
-    ; Wyczyść status i interrupt.
-    ; --------------------------------------------------------------------------
-
-    mov dword [rdi + PXIS], 0xFFFFFFFF
-
-    mov dword [rdi + PXSERR], 0xFFFFFFFF
+    mov dword [rbx + PXSERR], 0xFFFFFFFF
 
 
-    ; --------------------------------------------------------------------------
-    ; Issue Command slot 0.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; ISSUE COMMAND SLOT 0
+    ; ==========================================================================
 
-    mov eax, [rdi + PXCI]
+    mov eax, [rbx + PXCI]
 
     or eax, 1
 
-    mov [rdi + PXCI], eax
+    mov [rbx + PXCI], eax
 
 
-    ; --------------------------------------------------------------------------
-    ; Czekaj aż command slot zostanie wyzerowany.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; WAIT COMMAND
+    ; ==========================================================================
 
     mov ecx, AHCI_TIMEOUT
 
@@ -1116,21 +1281,21 @@ ahci_read_sectors:
 .wait_command:
 
     ; --------------------------------------------------------------------------
-    ; Błąd transportu.
+    ; BŁĘDY AHCI
     ; --------------------------------------------------------------------------
 
-    mov eax, [rdi + PXIS]
+    mov eax, [rbx + PXIS]
 
-    test eax, PXIS_TFES | PXIS_HBFS | PXIS_HBDS | PXIS_IFS | PXIS_INFS | PXIS_OFS
+    test eax, AHCI_ERROR_MASK
 
     jnz .read_error_clear
 
 
     ; --------------------------------------------------------------------------
-    ; Command Complete.
+    ; Command slot 0 zakończony.
     ; --------------------------------------------------------------------------
 
-    mov eax, [rdi + PXCI]
+    mov eax, [rbx + PXCI]
 
     test eax, 1
 
@@ -1143,8 +1308,9 @@ ahci_read_sectors:
 
     jnz .wait_command
 
+
     ; --------------------------------------------------------------------------
-    ; Timeout.
+    ; TIMEOUT
     ; --------------------------------------------------------------------------
 
     jmp .read_error_clear
@@ -1152,21 +1318,24 @@ ahci_read_sectors:
 
 .command_complete:
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź status ATA.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SPRAWDŹ ATA STATUS
+    ; ==========================================================================
 
-    mov eax, [rdi + PXTFD]
+    mov eax, [rbx + PXTFD]
 
     test eax, ATA_STATUS_ERR
+
     jnz .read_error_clear
 
     test eax, ATA_STATUS_BSY
+
     jnz .read_error_clear
 
-    ; --------------------------------------------------------------------------
-    ; Sukces.
-    ; --------------------------------------------------------------------------
+
+    ; ==========================================================================
+    ; SUCCESS
+    ; ==========================================================================
 
     mov eax, 1
 
@@ -1185,8 +1354,9 @@ ahci_read_sectors:
 
 .read_error_clear:
 
-    mov dword [rdi + PXSERR], 0xFFFFFFFF
-    mov dword [rdi + PXIS], 0xFFFFFFFF
+    mov dword [rbx + PXSERR], 0xFFFFFFFF
+
+    mov dword [rbx + PXIS], 0xFFFFFFFF
 
 
 .read_error:
