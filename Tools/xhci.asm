@@ -1,31 +1,21 @@
 ; =============================================================================
-; BLITRUM OS - xHCI CONTROLLER CORE
-; =============================================================================
-; Plik:
-;   Tools/xhci.asm
+; BLITRUM OS - xHCI HOST CONTROLLER
+; Tools/xhci.asm
 ;
-; Architektura:
-;   x86-64 / NASM
+; x86-64 NASM
 ;
 ; Odpowiedzialność:
-;
-;   1. Pobranie kontrolera xHCI z PCI
-;   2. Pobranie adresu MMIO
-;   3. Reset kontrolera
-;   4. Odczyt Capability Registers
-;   5. Odczyt Operational Registers
-;   6. Inicjalizacja DCBAA
-;   7. Inicjalizacja Command Ring
-;   8. Inicjalizacja Event Ring
-;   9. Inicjalizacja ERST
-;  10. Uruchomienie kontrolera
+;   - inicjalizacja podstawowych struktur xHCI
+;   - DCBAA
+;   - Command Ring
+;   - Event Ring
+;   - ERST
+;   - konfiguracja Interrupter 0
+;   - uruchomienie kontrolera
 ;
 ; UWAGA:
-;
-;   Ten etap NIE włącza jeszcze sprzętowych przerwań xHCI.
-;
-;   Najpierw musimy mieć działający Event Ring.
-;
+;   Ten moduł przygotowuje kontroler pod dalszą enumerację USB.
+;   Nie wykonuje jeszcze pełnej enumeracji urządzeń.
 ; =============================================================================
 
 bits 64
@@ -33,1045 +23,916 @@ bits 64
 section .text
 
 global xhci_init
-
-global xhci_get_mmio
-global xhci_get_cap_length
-global xhci_get_version
-global xhci_get_max_slots
-global xhci_get_max_interrupters
-global xhci_get_max_ports
+global xhci_start
+global xhci_stop
+global xhci_get_event
+global xhci_submit_command
 
 extern find_usb_controllers
+extern xhci_get_mmio
+
+extern pmm_alloc_page
 extern usb_interrupts_init
 
 ; =============================================================================
-; xHCI REGISTER OFFSETS
+; xHCI CAPABILITY REGISTERS
 ; =============================================================================
 
-XHCI_CAPLENGTH             equ 0x00
-XHCI_HCIVERSION            equ 0x02
-
-XHCI_HCSPARAMS1            equ 0x04
-XHCI_HCSPARAMS2            equ 0x08
-XHCI_HCSPARAMS3            equ 0x0C
-
-XHCI_HCCPARAMS1            equ 0x10
-XHCI_DBOFF                 equ 0x14
-XHCI_RTSOFF                equ 0x18
-XHCI_HCCPARAMS2            equ 0x1C
+XHCI_CAPLENGTH          equ 0x00
+XHCI_HCSPARAMS1         equ 0x04
+XHCI_HCSPARAMS2         equ 0x08
+XHCI_HCSPARAMS3         equ 0x0C
+XHCI_HCCPARAMS1         equ 0x10
+XHCI_DBOFF              equ 0x14
+XHCI_RTSOFF             equ 0x18
+XHCI_HCCPARAMS2         equ 0x1C
 
 ; =============================================================================
 ; OPERATIONAL REGISTERS
 ; =============================================================================
 
-XHCI_USBCMD                equ 0x00
-XHCI_USBSTS                equ 0x04
-
-XHCI_PAGESIZE              equ 0x08
-
-XHCI_DNCTRL                equ 0x14
-
-XHCI_CRCR                  equ 0x18
-
-XHCI_DCBAAP                equ 0x30
-
-XHCI_CONFIG                equ 0x38
+XHCI_USBCMD             equ 0x00
+XHCI_USBSTS             equ 0x04
+XHCI_PAGESIZE           equ 0x08
+XHCI_DNCTRL             equ 0x14
+XHCI_CRCR               equ 0x18
+XHCI_DCBAAP             equ 0x30
+XHCI_CONFIG             equ 0x38
 
 ; =============================================================================
-; USBCMD BITS
+; USBSTS / USBCMD FLAGS
 ; =============================================================================
 
-USBCMD_RS                  equ 0
-USBCMD_HCRST               equ 1
-USBCMD_INTE                equ 2
-USBCMD_HSEE                equ 3
-USBCMD_EWE                 equ 10
-USBCMD_CME                 equ 13
+XHCI_CMD_RUN            equ 1 << 0
+XHCI_CMD_HCRST          equ 1 << 1
+XHCI_CMD_INTE           equ 1 << 2
+XHCI_CMD_HSEE           equ 1 << 3
+
+XHCI_STS_HCH            equ 1 << 0
+XHCI_STS_HSE            equ 1 << 2
+XHCI_STS_EINT           equ 1 << 3
+XHCI_STS_PCD            equ 1 << 4
+XHCI_STS_CNR            equ 1 << 11
 
 ; =============================================================================
-; USBSTS BITS
+; RUNTIME REGISTERS
 ; =============================================================================
 
-USBSTS_HCH                 equ 0
-USBSTS_HSE                 equ 2
-USBSTS_EINT                equ 3
-USBSTS_PCD                 equ 4
-USBSTS_CNR                 equ 11
+XHCI_IMAN               equ 0x00
+XHCI_IMOD               equ 0x04
+XHCI_ERSTSZ             equ 0x08
+XHCI_ERSTBA             equ 0x10
+XHCI_ERDP               equ 0x18
 
 ; =============================================================================
-; RING CONSTANTS
+; TRB
 ; =============================================================================
 
-XHCI_TRB_SIZE              equ 16
+TRB_TYPE_SHIFT          equ 10
 
-COMMAND_RING_TRBS          equ 256
-EVENT_RING_TRBS            equ 256
+TRB_TYPE_NORMAL         equ 1
+TRB_TYPE_LINK           equ 6
+TRB_TYPE_ENABLE_SLOT    equ 9
+TRB_TYPE_NOOP           equ 23
 
-COMMAND_RING_SIZE          equ COMMAND_RING_TRBS * XHCI_TRB_SIZE
-EVENT_RING_SIZE            equ EVENT_RING_TRBS * XHCI_TRB_SIZE
+TRB_CYCLE               equ 1
+TRB_TC                  equ 1 << 1
 
 ; =============================================================================
-; ERST
+; LIMITS
 ; =============================================================================
 
-ERST_ENTRY_SIZE             equ 16
+XHCI_RING_SIZE          equ 4096
+XHCI_EVENT_RING_SIZE    equ 4096
+
+XHCI_MAX_PORTS          equ 255
+XHCI_MAX_INTERRUPTERS   equ 2047
 
 ; =============================================================================
 ; TIMEOUT
 ; =============================================================================
 
-XHCI_TIMEOUT               equ 1000000
+XHCI_TIMEOUT            equ 1000000
 
 ; =============================================================================
-; xHCI TRB TYPES
+; GLOBAL STATE
 ; =============================================================================
 
-TRB_TYPE_LINK              equ 6
+xhci_mmio               dq 0
+xhci_op_base             dq 0
+xhci_runtime_base        dq 0
+
+xhci_dcbaa               dq 0
+xhci_cmd_ring            dq 0
+
+xhci_event_ring          dq 0
+xhci_event_ring_end      dq 0
+
+xhci_erst                dq 0
+
+xhci_cmd_cycle           db 1
+xhci_event_cycle         db 1
+
+xhci_event_index         dq 0
+
+xhci_max_ports           dd 0
+xhci_max_interrupters    dd 0
+
+xhci_running             db 0
+xhci_initialized         db 0
+
+align 8
 
 ; =============================================================================
 ; xHCI INIT
 ; =============================================================================
-;
-; Return:
-;
-;   RAX = 1  success
-;   RAX = 0  failure
-;
-; =============================================================================
-
-xHci_init_start:
-
-xHCI_init_internal:
-
-xHCI_init_internal_dummy:
-
-ret
-
-; =============================================================================
-; PUBLIC INITIALIZATION
-; =============================================================================
-
-xHCI_init:
-
-ret
-
-; =============================================================================
-; REAL ENTRY POINT
-; =============================================================================
 
 xhci_init:
 
-push rbx
-push rbp
-push r12
-push r13
-push r14
-push r15
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov byte [rel xhci_initialized], 0
+    mov byte [rel xhci_running], 0
+
+    ; -------------------------------------------------------------------------
+    ; Znajdź kontroler USB/xHCI
+    ; -------------------------------------------------------------------------
+
+    call find_usb_controllers
+
+    ; -------------------------------------------------------------------------
+    ; Pobierz bazę MMIO
+    ; -------------------------------------------------------------------------
+
+    call xhci_get_mmio
+
+    test rax, rax
+    jz .fail
+
+    mov [rel xhci_mmio], rax
+
+    ; -------------------------------------------------------------------------
+    ; CAPLENGTH
+    ; -------------------------------------------------------------------------
+
+    mov r12, rax
+
+    movzx eax, byte [r12 + XHCI_CAPLENGTH]
+    add rax, r12
+
+    mov [rel xhci_op_base], rax
+
+    ; -------------------------------------------------------------------------
+    ; RTSOFF
+    ; -------------------------------------------------------------------------
+
+    mov eax, dword [r12 + XHCI_RTSOFF]
+
+    and eax, 0xFFFFFFF0
+
+    add rax, r12
+
+    mov [rel xhci_runtime_base], rax
+
+    ; -------------------------------------------------------------------------
+    ; HCSPARAMS1
+    ;
+    ; MaxPorts      = bits 31:24
+    ; MaxInterrupters = bits 18:8
+    ; -------------------------------------------------------------------------
+
+    mov eax, dword [r12 + XHCI_HCSPARAMS1]
+
+    mov edx, eax
+    shr edx, 24
+    mov [rel xhci_max_ports], edx
+
+    mov edx, eax
+    shr edx, 8
+    and edx, 0x7FF
+    mov [rel xhci_max_interrupters], edx
+
+    ; -------------------------------------------------------------------------
+    ; Zatrzymaj kontroler przed resetem
+    ; -------------------------------------------------------------------------
+
+    call xhci_stop
+
+    ; -------------------------------------------------------------------------
+    ; Reset
+    ; -------------------------------------------------------------------------
+
+    call xhci_reset
+
+    test eax, eax
+    jz .fail
+
+    ; -------------------------------------------------------------------------
+    ; Sprawdź Page Size
+    ; -------------------------------------------------------------------------
+
+    mov r13, [rel xhci_op_base]
+
+    mov eax, dword [r13 + XHCI_PAGESIZE]
+
+    test eax, eax
+    jz .fail
+
+    ; xHCI standardowo używa 4 KiB.
+    ; Jeżeli bit 0 nie jest ustawiony, nie próbujemy budować
+    ; struktur na błędnym założeniu o rozmiarze strony.
+
+    test eax, 1
+    jz .fail
+
+    ; -------------------------------------------------------------------------
+    ; Alokacja DCBAA
+    ; -------------------------------------------------------------------------
+
+    call pmm_alloc_page
+
+    test rax, rax
+    jz .fail
+
+    mov r14, rax
+
+    mov qword [r14], 0
+
+    mov [rel xhci_dcbaa], r14
+
+    mov qword [r13 + XHCI_DCBAAP], r14
+
+    ; -------------------------------------------------------------------------
+    ; Command Ring
+    ; -------------------------------------------------------------------------
+
+    call xhci_allocate_command_ring
+
+    test eax, eax
+    jz .fail
+
+    ; -------------------------------------------------------------------------
+    ; Event Ring + ERST
+    ; -------------------------------------------------------------------------
+
+    call xhci_allocate_event_ring
+
+    test eax, eax
+    jz .fail
+
+    ; -------------------------------------------------------------------------
+    ; CONFIG
+    ; -------------------------------------------------------------------------
+
+    mov eax, [rel xhci_max_ports]
+
+    ; CONFIG.MaxSlotsEn nie może być większe niż 255.
+    ; Na tym etapie pozwalamy kontrolerowi używać maksymalnej wartości
+    ; z HCSPARAMS1 dotyczącej slotów.
+
+    mov eax, dword [r12 + XHCI_HCSPARAMS1]
+
+    and eax, 0xFF
+
+    test eax, eax
+    jnz .config_ok
+
+    mov eax, 1
+
+.config_ok:
+
+    mov dword [r13 + XHCI_CONFIG], eax
+
+    ; -------------------------------------------------------------------------
+    ; Powiadom warstwę USB interrupt
+    ; -------------------------------------------------------------------------
+
+    mov rax, [rel xhci_mmio]
+
+    call usb_interrupts_init
+
+    ; -------------------------------------------------------------------------
+    ; Na razie nie włączamy hardware interrupt.
+    ;
+    ; Event Ring jest przygotowany, ale właściwe IRQ/MSI/MSI-X
+    ; włączymy po ukończeniu ścieżki Event Ring.
+    ; -------------------------------------------------------------------------
+
+    mov rax, [rel xhci_runtime_base]
+
+    mov dword [rax + XHCI_IMAN], 0
+
+    ; -------------------------------------------------------------------------
+    ; Uruchom kontroler
+    ; -------------------------------------------------------------------------
+
+    call xhci_start
+
+    test eax, eax
+    jz .fail
+
+    mov byte [rel xhci_initialized], 1
+
+    mov eax, 1
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+
+    xor eax, eax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    ret
 
 
-; =========================================================================
-; FIND xHCI
-; =========================================================================
+; =============================================================================
+; xHCI RESET
+; =============================================================================
 
-call find_usb_controllers
+xhci_reset:
 
-test rax, rax
-jz .fail
+    push rbx
+    push rcx
 
+    mov rbx, [rel xhci_op_base]
 
-; =========================================================================
-; READ MMIO
-; =========================================================================
+    ; -------------------------------------------------------------------------
+    ; Upewnij się, że HCH=1
+    ; -------------------------------------------------------------------------
 
-mov r12, [rel xhci_mmio_base]
+    mov eax, [rbx + XHCI_USBSTS]
 
-test r12, r12
-jz .fail
+    test eax, XHCI_STS_HCH
+    jnz .halted
 
+    ; zatrzymaj
+    mov eax, [rbx + XHCI_USBCMD]
+    and eax, ~(XHCI_CMD_RUN)
+    mov [rbx + XHCI_USBCMD], eax
 
-; =========================================================================
-; STORE CONTROLLER INFORMATION
-; =========================================================================
+    mov ecx, XHCI_TIMEOUT
 
-mov [rel xhci_mmio_cached], r12
+.wait_halt:
 
+    mov eax, [rbx + XHCI_USBSTS]
 
-; =========================================================================
-; BASIC CAPABILITY INFORMATION
-; =========================================================================
+    test eax, XHCI_STS_HCH
+    jnz .halted
 
-movzx eax, byte [r12 + XHCI_CAPLENGTH]
-mov [rel xhci_cap_length], eax
+    dec ecx
+    jnz .wait_halt
 
+    xor eax, eax
 
-movzx eax, word [r12 + XHCI_HCIVERSION]
-mov [rel xhci_version], eax
-
-
-mov eax, [r12 + XHCI_HCSPARAMS1]
-
-; Max Slots = bits 7:0
-mov edx, eax
-and edx, 0xFF
-
-mov [rel xhci_max_slots], edx
-
-
-; Max Interrupters = bits 18:8
-mov edx, eax
-shr edx, 8
-and edx, 0x7FF
-
-mov [rel xhci_max_interrupters], edx
-
-
-; Max Ports = bits 31:24
-mov edx, eax
-shr edx, 24
-and edx, 0xFF
-
-mov [rel xhci_max_ports], edx
-
-
-; =========================================================================
-; CHECK MAX SLOTS
-; =========================================================================
-
-cmp dword [rel xhci_max_slots], 0
-je .fail
-
-
-; =========================================================================
-; USBSTS / CNR
-; =========================================================================
-
-movzx eax, byte [r12 + XHCI_CAPLENGTH]
-lea r13, [r12 + rax]
-
-
-; =========================================================================
-; STOP CONTROLLER
-; =========================================================================
-
-mov eax, [r13 + XHCI_USBCMD]
-
-and eax, ~(1 << USBCMD_RS)
-
-mov [r13 + XHCI_USBCMD], eax
-
-
-; =========================================================================
-; WAIT FOR HALTED
-; =========================================================================
-
-mov ecx, XHCI_TIMEOUT
-
-.wait_halted:
-
-mov eax, [r13 + XHCI_USBSTS]
-
-test eax, (1 << USBSTS_HCH)
-
-jnz .halted
-
-
-dec ecx
-
-jnz .wait_halted
-
-jmp .fail
+    pop rcx
+    pop rbx
+    ret
 
 .halted:
 
-; =========================================================================
-; CONTROLLER RESET
-; =========================================================================
+    ; -------------------------------------------------------------------------
+    ; Host Controller Reset
+    ; -------------------------------------------------------------------------
 
-mov eax, [r13 + XHCI_USBCMD]
+    mov eax, [rbx + XHCI_USBCMD]
 
-or eax, (1 << USBCMD_HCRST)
+    or eax, XHCI_CMD_HCRST
 
-mov [r13 + XHCI_USBCMD], eax
+    mov [rbx + XHCI_USBCMD], eax
 
-
-; =========================================================================
-; WAIT FOR RESET BIT TO CLEAR
-; =========================================================================
-
-mov ecx, XHCI_TIMEOUT
+    mov ecx, XHCI_TIMEOUT
 
 .wait_reset:
 
-mov eax, [r13 + XHCI_USBCMD]
+    mov eax, [rbx + XHCI_USBCMD]
 
-test eax, (1 << USBCMD_HCRST)
+    test eax, XHCI_CMD_HCRST
+    jz .reset_done
 
-jz .reset_done
+    dec ecx
+    jnz .wait_reset
 
+    xor eax, eax
 
-dec ecx
-
-jnz .wait_reset
-
-jmp .fail
+    pop rcx
+    pop rbx
+    ret
 
 .reset_done:
 
-; =========================================================================
-; WAIT FOR CNR TO CLEAR
-; =========================================================================
+    ; -------------------------------------------------------------------------
+    ; Poczekaj aż CNR zostanie wyzerowane
+    ; -------------------------------------------------------------------------
 
-mov ecx, XHCI_TIMEOUT
+    mov ecx, XHCI_TIMEOUT
 
 .wait_cnr:
 
-mov eax, [r13 + XHCI_USBSTS]
+    mov eax, [rbx + XHCI_USBSTS]
 
-test eax, (1 << USBSTS_CNR)
+    test eax, XHCI_STS_CNR
+    jz .success
 
-jz .controller_ready
+    dec ecx
+    jnz .wait_cnr
 
+    xor eax, eax
 
-dec ecx
+    pop rcx
+    pop rbx
+    ret
 
-jnz .wait_cnr
+.success:
 
-jmp .fail
+    mov eax, 1
 
-.controller_ready:
+    pop rcx
+    pop rbx
 
-; =========================================================================
-; PAGE SIZE
-; =========================================================================
-
-mov eax, [r13 + XHCI_PAGESIZE]
-
-test eax, eax
-jz .fail
-
-
-; =========================================================================
-; SAVE PAGE SIZE
-; =========================================================================
-
-bsf ecx, eax
-
-mov [rel xhci_page_shift], ecx
+    ret
 
 
-; =========================================================================
-; INITIALIZE DCBAA
-; =========================================================================
+; =============================================================================
+; xHCI START
+; =============================================================================
 
-call xhci_init_dcbaa
+xhci_start:
 
-test rax, rax
-jz .fail
+    push rbx
+    push rcx
 
+    mov rbx, [rel xhci_op_base]
 
-; =========================================================================
-; INITIALIZE COMMAND RING
-; =========================================================================
+    mov eax, [rbx + XHCI_USBCMD]
 
-call xhci_init_command_ring
+    or eax, XHCI_CMD_RUN
 
-test rax, rax
-jz .fail
+    mov [rbx + XHCI_USBCMD], eax
 
+    mov ecx, XHCI_TIMEOUT
 
-; =========================================================================
-; INITIALIZE EVENT RING
-; =========================================================================
+.wait:
 
-call xhci_init_event_ring
+    mov eax, [rbx + XHCI_USBSTS]
 
-test rax, rax
-jz .fail
+    test eax, XHCI_STS_HCH
+    jz .running
 
+    dec ecx
+    jnz .wait
 
-; =========================================================================
-; SET DCBAAP
-; =========================================================================
+    xor eax, eax
 
-mov rax, [rel xhci_dcbaa_phys]
+    pop rcx
+    pop rbx
 
-mov [r13 + XHCI_DCBAAP], rax
-
-
-; =========================================================================
-; SET COMMAND RING CONTROL REGISTER
-; =========================================================================
-;
-; CRCR:
-;
-; bits 5:4 reserved
-; bit 0 = RCS
-;
-; Current producer cycle = 1.
-;
-; =========================================================================
-
-mov rax, [rel xhci_command_ring_phys]
-
-or rax, 1
-
-mov [r13 + XHCI_CRCR], rax
-
-
-; =========================================================================
-; CONFIGURE MAX SLOTS
-; =========================================================================
-
-mov eax, [rel xhci_max_slots]
-
-mov [r13 + XHCI_CONFIG], eax
-
-
-; =========================================================================
-; REGISTER EVENT RING WITH INTERRUPTER 0
-; =========================================================================
-
-call xhci_program_interrupter
-
-test rax, rax
-jz .fail
-
-
-; =========================================================================
-; NOTIFY SOFTWARE USB INTERRUPT LAYER
-; =========================================================================
-
-mov rdi, [rel xhci_mmio_cached]
-
-call usb_interrupts_init
-
-
-; =========================================================================
-; START CONTROLLER
-; =========================================================================
-
-mov eax, [r13 + XHCI_USBCMD]
-
-or eax, (1 << USBCMD_RS)
-
-mov [r13 + XHCI_USBCMD], eax
-
-
-; =========================================================================
-; WAIT UNTIL RUNNING
-; =========================================================================
-
-mov ecx, XHCI_TIMEOUT
-
-.wait_running:
-
-mov eax, [r13 + XHCI_USBSTS]
-
-test eax, (1 << USBSTS_HCH)
-
-jz .running
-
-
-dec ecx
-
-jnz .wait_running
-
-jmp .fail
+    ret
 
 .running:
 
-; =========================================================================
-; SUCCESS
-; =========================================================================
+    mov byte [rel xhci_running], 1
 
-mov byte [rel xhci_active], 1
+    mov eax, 1
 
-mov eax, 1
+    pop rcx
+    pop rbx
 
-pop r15
-pop r14
-pop r13
-pop r12
-pop rbp
-pop rbx
+    ret
 
-ret
+
+; =============================================================================
+; xHCI STOP
+; =============================================================================
+
+xhci_stop:
+
+    push rbx
+    push rcx
+
+    mov rbx, [rel xhci_op_base]
+
+    test rbx, rbx
+    jz .already_stopped
+
+    mov eax, [rbx + XHCI_USBCMD]
+
+    and eax, ~(XHCI_CMD_RUN)
+
+    mov [rbx + XHCI_USBCMD], eax
+
+    mov ecx, XHCI_TIMEOUT
+
+.wait:
+
+    mov eax, [rbx + XHCI_USBSTS]
+
+    test eax, XHCI_STS_HCH
+    jnz .stopped
+
+    dec ecx
+    jnz .wait
+
+    xor eax, eax
+
+    pop rcx
+    pop rbx
+
+    ret
+
+.stopped:
+
+    mov byte [rel xhci_running], 0
+
+.already_stopped:
+
+    mov eax, 1
+
+    pop rcx
+    pop rbx
+
+    ret
+
+
+; =============================================================================
+; ALLOCATE COMMAND RING
+; =============================================================================
+
+xhci_allocate_command_ring:
+
+    push rbx
+    push r12
+    push r13
+
+    mov r12, [rel xhci_op_base]
+
+    ; -------------------------------------------------------------------------
+    ; 4 KiB Command Ring
+    ; -------------------------------------------------------------------------
+
+    call pmm_alloc_page
+
+    test rax, rax
+    jz .fail
+
+    mov rbx, rax
+
+    ; wyzeruj stronę
+
+    xor eax, eax
+    mov rcx, XHCI_RING_SIZE / 8
+    mov rdi, rbx
+
+    rep stosq
+
+    ; -------------------------------------------------------------------------
+    ; Link TRB na końcu pierścienia
+    ; -------------------------------------------------------------------------
+
+    lea r13, [rbx + 4080]
+
+    ; Pointer
+    mov rdx, rbx
+
+    mov qword [r13], rdx
+
+    ; Status
+    mov dword [r13 + 8], 0
+
+    ; Control:
+    ; Type = Link TRB
+    ; TC = Toggle Cycle
+    ; Cycle = 1
+    ;
+    ; type = 6 << 10
+    ; TC   = bit 1
+    ; C    = bit 0
+    mov eax, (TRB_TYPE_LINK << TRB_TYPE_SHIFT)
+    or eax, TRB_TC
+    or eax, TRB_CYCLE
+
+    mov dword [r13 + 12], eax
+
+    mov [rel xhci_cmd_ring], rbx
+
+    mov byte [rel xhci_cmd_cycle], 1
+
+    ; CRCR:
+    ; Ring Pointer + RCS
+    mov rax, rbx
+    or rax, 1
+
+    mov qword [r12 + XHCI_CRCR], rax
+
+    mov eax, 1
+
+    pop r13
+    pop r12
+    pop rbx
+
+    ret
 
 .fail:
 
-mov byte [rel xhci_active], 0
+    xor eax, eax
 
-xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
 
-pop r15
-pop r14
-pop r13
-pop r12
-pop rbp
-pop rbx
+    ret
 
-ret
 
 ; =============================================================================
-; DCBAA INITIALIZATION
-; =============================================================================
-;
-; DCBAA = Device Context Base Address Array
-;
-; 256 entries × 8 bytes = 2048 bytes.
-;
-; For now all entries are zero.
-;
-; Entry 0 is the scratchpad pointer array.
-;
-; Device contexts are added later.
-;
+; ALLOCATE EVENT RING
 ; =============================================================================
 
-xhci_init_dcbaa:
+xhci_allocate_event_ring:
 
-push rbx
-push rcx
-push rdi
+    push rbx
+    push r12
+    push r13
+    push r14
 
+    mov r12, [rel xhci_runtime_base]
 
-; =========================================================================
-; Allocate physical pages
-; =========================================================================
-;
-; 2048 bytes requires at least one 4 KiB page.
-;
-; pmm_alloc_page:
-;
-;   RAX = physical page
-;
-; =========================================================================
+    ; -------------------------------------------------------------------------
+    ; Event Ring
+    ; -------------------------------------------------------------------------
 
-call pmm_alloc_page
+    call pmm_alloc_page
 
-test rax, rax
-jz .fail
+    test rax, rax
+    jz .fail
 
+    mov rbx, rax
 
-mov [rel xhci_dcbaa_phys], rax
+    xor eax, eax
+    mov rcx, XHCI_EVENT_RING_SIZE / 8
+    mov rdi, rbx
 
+    rep stosq
 
-; =========================================================================
-; ZERO PAGE
-; =========================================================================
+    mov [rel xhci_event_ring], rbx
 
-mov rdi, rax
+    lea rax, [rbx + XHCI_EVENT_RING_SIZE]
 
-xor eax, eax
+    mov [rel xhci_event_ring_end], rax
 
-mov ecx, 512
+    ; -------------------------------------------------------------------------
+    ; Event Ring Segment Table
+    ; -------------------------------------------------------------------------
 
-rep stosq
+    call pmm_alloc_page
 
+    test rax, rax
+    jz .fail
 
-mov eax, 1
+    mov r13, rax
 
-pop rdi
-pop rcx
-pop rbx
+    xor eax, eax
+    mov rcx, 4096 / 8
+    mov rdi, r13
 
-ret
+    rep stosq
+
+    mov [rel xhci_erst], r13
+
+    ; -------------------------------------------------------------------------
+    ; ERST entry 0
+    ;
+    ; +0  Segment Base Address
+    ; +8  Segment Size + Reserved
+    ; -------------------------------------------------------------------------
+
+    mov rax, [rel xhci_event_ring]
+
+    mov qword [r13], rax
+
+    mov eax, 256
+
+    mov dword [r13 + 8], eax
+
+    ; -------------------------------------------------------------------------
+    ; Interrupter 0
+    ; -------------------------------------------------------------------------
+
+    ; IMAN:
+    ; IP = bit 0
+    ; IE = bit 1
+    ;
+    ; Na razie wyłączone.
+    mov dword [r12 + XHCI_IMAN], 0
+
+    ; IMOD = 0
+    mov dword [r12 + XHCI_IMOD], 0
+
+    ; ERSTSZ = 1
+    mov dword [r12 + XHCI_ERSTSZ], 1
+
+    ; ERSTBA
+    mov rax, r13
+
+    mov qword [r12 + XHCI_ERSTBA], rax
+
+    ; ERDP
+    mov rax, [rel xhci_event_ring]
+
+    mov qword [r12 + XHCI_ERDP], rax
+
+    mov qword [rel xhci_event_index], 0
+
+    mov byte [rel xhci_event_cycle], 1
+
+    mov eax, 1
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    ret
 
 .fail:
 
-xor eax, eax
+    xor eax, eax
 
-pop rdi
-pop rcx
-pop rbx
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
 
-ret
+    ret
+
 
 ; =============================================================================
-; COMMAND RING INITIALIZATION
-; =============================================================================
+; GET EVENT
 ;
-; 256 TRBs = 4096 bytes.
+; Zwraca:
+;   RAX = adres TRB
+;   RDX = 1 jeżeli event istnieje
+;   RDX = 0 jeżeli brak eventu
 ;
-; Last TRB becomes Link TRB.
-;
-; Producer Cycle State:
-;
-;   1
-;
+; Nie przesuwa jeszcze ERDP.
+; To jest celowo osobny etap.
 ; =============================================================================
 
-xhci_init_command_ring:
+xhci_get_event:
 
-push rbx
-push rcx
-push rdx
-push rdi
+    push rbx
+    push rcx
+    push r8
+    push r9
+
+    mov rbx, [rel xhci_event_ring]
+
+    test rbx, rbx
+    jz .none
+
+    mov rcx, [rel xhci_event_index]
+
+    imul rcx, 16
+
+    add rbx, rcx
+
+    mov eax, dword [rbx + 12]
+
+    ; Cycle bit
+    and eax, TRB_CYCLE
+
+    mov r8d, eax
+
+    movzx eax, byte [rel xhci_event_cycle]
+
+    and eax, 1
+
+    cmp r8d, eax
+
+    jne .none
+
+    mov rax, rbx
+    mov edx, 1
+
+    pop r9
+    pop r8
+    pop rcx
+    pop rbx
+
+    ret
+
+.none:
+
+    xor eax, eax
+    xor edx, edx
+
+    pop r9
+    pop r8
+    pop rcx
+    pop rbx
+
+    ret
 
 
-; =========================================================================
-; ALLOCATE PAGE
-; =========================================================================
-
-call pmm_alloc_page
-
-test rax, rax
-jz .fail
-
-
-mov [rel xhci_command_ring_phys], rax
-
-
-; =========================================================================
-; ZERO RING
-; =========================================================================
-
-mov rdi, rax
-
-xor eax, eax
-
-mov ecx, 512
-
-rep stosq
-
-
-; =========================================================================
-; LINK TRB
-; =========================================================================
+; =============================================================================
+; SUBMIT COMMAND
 ;
-; Last TRB:
+; Wejście:
+;   RCX = TRB control
+;   RDX = TRB parameter low 64-bit
+;   R8  = TRB status
 ;
-; offset = 255 * 16 = 4080
+; Na tym etapie funkcja umieszcza pojedynczy command TRB.
 ;
-; TRB parameter:
-;
-;   ring base
-;
-; TRB status:
-;
-;   length = 0
-;   TD size = 0
-;   interrupter = 0
-;
-; TRB control:
-;
-;   cycle = 1
-;   type = LINK (6)
-;   toggle cycle = 1
-;
-; =========================================================================
+; Zwraca:
+;   RAX = adres command TRB
+;   RDX = 1 sukces
+;   RDX = 0 błąd
+; =============================================================================
 
-mov rbx, [rel xhci_command_ring_phys]
+xhci_submit_command:
 
-mov rdx, rbx
+    push rbx
+    push r12
+    push r13
+    push r14
 
-mov [rbx + 4080], rdx
-mov qword [rbx + 4088], 0
+    mov rbx, [rel xhci_cmd_ring]
 
-mov eax, 1
-or eax, (TRB_TYPE_LINK << 10)
-or eax, (1 << 1)
+    test rbx, rbx
+    jz .fail
 
-mov [rbx + 4092], eax
+    ; -------------------------------------------------------------------------
+    ; Obecnie Command Ring używa pierwszego TRB.
+    ;
+    ; Pełna kolejka ring zostanie dodana razem z Command Completion Event.
+    ; -------------------------------------------------------------------------
 
+    mov r12, rbx
 
-; =========================================================================
-; CURRENT COMMAND RING POINTER
-; =========================================================================
+    mov qword [r12], rdx
 
-mov [rel xhci_command_enqueue], rbx
+    mov qword [r12 + 8], r8
 
-mov dword [rel xhci_command_cycle], 1
+    mov eax, ecx
 
+    ; ustaw aktualny Cycle
+    and eax, ~1
 
-mov eax, 1
+    movzx edx, byte [rel xhci_cmd_cycle]
 
-pop rdi
-pop rdx
-pop rcx
-pop rbx
+    or eax, edx
 
-ret
+    mov dword [r12 + 12], eax
+
+    ; -------------------------------------------------------------------------
+    ; Powiadom kontroler doorbellem.
+    ;
+    ; DBOFF wskazuje Doorbell Array.
+    ; Doorbell 0 jest doorbellem Host Controller.
+    ; -------------------------------------------------------------------------
+
+    mov r13, [rel xhci_mmio]
+
+    mov eax, dword [r13 + XHCI_DBOFF]
+
+    and eax, 0xFFFFFFFC
+
+    add r13, rax
+
+    mov dword [r13], 0
+
+    mov rax, r12
+
+    mov edx, 1
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    ret
 
 .fail:
 
-xor eax, eax
-
-pop rdi
-pop rdx
-pop rcx
-pop rbx
-
-ret
-
-; =============================================================================
-; EVENT RING INITIALIZATION
-; =============================================================================
-;
-; Event Ring:
-;
-;   256 TRBs
-;   4096 bytes
-;
-; ERST:
-;
-;   one segment
-;
-; =============================================================================
-
-xhci_init_event_ring:
-
-push rbx
-push rcx
-push rdx
-push rdi
-
-
-; =========================================================================
-; EVENT RING
-; =========================================================================
-
-call pmm_alloc_page
-
-test rax, rax
-jz .fail
-
-
-mov [rel xhci_event_ring_phys], rax
-
-
-; =========================================================================
-; ZERO EVENT RING
-; =========================================================================
-
-mov rdi, rax
-
-xor eax, eax
-
-mov ecx, 512
-
-rep stosq
-
-
-; =========================================================================
-; EVENT RING STATE
-; =========================================================================
-
-mov rbx, [rel xhci_event_ring_phys]
-
-mov [rel xhci_event_dequeue], rbx
-
-mov dword [rel xhci_event_cycle], 1
-
-
-; =========================================================================
-; ERST
-; =========================================================================
-
-call pmm_alloc_page
-
-test rax, rax
-jz .fail
-
-
-mov [rel xhci_erst_phys], rax
-
-
-; =========================================================================
-; ZERO ERST PAGE
-; =========================================================================
-
-mov rdi, rax
-
-xor eax, eax
-
-mov ecx, 512
-
-rep stosq
-
-
-; =========================================================================
-; ERST ENTRY 0
-; =========================================================================
-;
-; ERST entry:
-;
-; +00 = Event Ring Segment Base Address
-; +08 = Segment Size
-; +0C = reserved
-;
-; =========================================================================
-
-mov rbx, [rel xhci_event_ring_phys]
-
-mov rdx, [rel xhci_erst_phys]
-
-mov [rdx + 0], rbx
-
-mov dword [rdx + 8], EVENT_RING_TRBS
-
-mov dword [rdx + 12], 0
-
-
-mov eax, 1
-
-pop rdi
-pop rdx
-pop rcx
-pop rbx
-
-ret
-
-.fail:
-
-xor eax, eax
-
-pop rdi
-pop rdx
-pop rcx
-pop rbx
-
-ret
-
-; =============================================================================
-; PROGRAM INTERRUPTER 0
-; =============================================================================
-;
-; Runtime Register Space Offset:
-;
-;   RTSOFF
-;
-; Interrupter 0:
-;
-;   +00 IMAN
-;   +04 IMOD
-;   +08 ERSTSZ
-;   +10 ERSTBA
-;   +18 ERDP
-;
-; =============================================================================
-
-xhci_program_interrupter:
-
-push rbx
-push rcx
-push rdx
-push rdi
-
-
-; =========================================================================
-; RTSOFF
-; =========================================================================
-
-mov rbx, [rel xhci_mmio_cached]
-
-mov eax, [rbx + XHCI_RTSOFF]
-
-and eax, 0xFFFFFFF0
-
-lea rbx, [rbx + rax]
-
-
-; =========================================================================
-; IMAN
-; =========================================================================
-;
-; Bit 0 = IP
-; Bit 1 = IE
-;
-; Do NOT enable IE yet.
-;
-; Event Ring must be operational before interrupt enable.
-;
-; =========================================================================
-
-mov dword [rbx + 0x00], 0
-
-
-; =========================================================================
-; IMOD
-; =========================================================================
-;
-; Use minimal moderation.
-;
-; =========================================================================
-
-mov dword [rbx + 0x04], 0
-
-
-; =========================================================================
-; ERSTSZ
-; =========================================================================
-
-mov dword [rbx + 0x08], 1
-
-
-; =========================================================================
-; ERSTBA
-; =========================================================================
-
-mov rax, [rel xhci_erst_phys]
-
-mov [rbx + 0x10], rax
-
-
-; =========================================================================
-; ERDP
-; =========================================================================
-
-mov rax, [rel xhci_event_ring_phys]
-
-mov [rbx + 0x18], rax
-
-
-; =========================================================================
-; SAVE SOFTWARE COPY
-; =========================================================================
-
-mov [rel xhci_interrupter0_base], rbx
-
-
-mov eax, 1
-
-pop rdi
-pop rdx
-pop rcx
-pop rbx
-
-ret
-
-; =============================================================================
-; GETTERS
-; =============================================================================
-
-xhci_get_mmio:
-
-mov rax, [rel xhci_mmio_cached]
-
-ret
-
-xhci_get_cap_length:
-
-mov eax, [rel xhci_cap_length]
-
-ret
-
-xhci_get_version:
-
-movzx eax, word [rel xhci_version]
-
-ret
-
-xhci_get_max_slots:
-
-mov eax, [rel xhci_max_slots]
-
-ret
-
-xhci_get_max_interrupters:
-
-mov eax, [rel xhci_max_interrupters]
-
-ret
-
-xhci_get_max_ports:
-
-mov eax, [rel xhci_max_ports]
-
-ret
-
-; =============================================================================
-; DATA
-; =============================================================================
-
-section .data
-
-align 8
-
-xhci_active:
-db 0
-
-align 8
-
-xhci_mmio_base:
-dq 0
-
-xhci_mmio_cached:
-dq 0
-
-xhci_interrupter0_base:
-dq 0
-
-; =============================================================================
-; CAPABILITY INFORMATION
-; =============================================================================
-
-align 4
-
-xhci_cap_length:
-dd 0
-
-xhci_version:
-dw 0
-
-align 4
-
-xhci_max_slots:
-dd 0
-
-xhci_max_interrupters:
-dd 0
-
-xhci_max_ports:
-dd 0
-
-xhci_page_shift:
-dd 0
-
-; =============================================================================
-; DCBAA
-; =============================================================================
-
-align 8
-
-xhci_dcbaa_phys:
-dq 0
-
-; =============================================================================
-; COMMAND RING
-; =============================================================================
-
-align 8
-
-xhci_command_ring_phys:
-dq 0
-
-xhci_command_enqueue:
-dq 0
-
-xhci_command_cycle:
-dd 0
-
-; =============================================================================
-; EVENT RING
-; =============================================================================
-
-align 8
-
-xhci_event_ring_phys:
-dq 0
-
-xhci_event_dequeue:
-dq 0
-
-xhci_event_cycle:
-dd 0
-
-; =============================================================================
-; ERST
-; =============================================================================
-
-align 8
-
-xhci_erst_phys:
-dq 0
+    xor eax, eax
+    xor edx, edx
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    ret
