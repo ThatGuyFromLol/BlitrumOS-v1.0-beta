@@ -111,11 +111,8 @@ XHCI_ERDP               equ 0x18
 ; IMAN FLAGS
 ; ==============================================================================
 
-; IMAN bit 0 = Interrupt Pending
-XHCI_IMAN_IP             equ 1 << 0
-
-; IMAN bit 1 = Interrupt Enable
-XHCI_IMAN_IE             equ 1 << 1
+XHCI_IMAN_IP            equ 1 << 0
+XHCI_IMAN_IE            equ 1 << 1
 
 
 ; ==============================================================================
@@ -197,12 +194,13 @@ xhci_erst:
 ; COMMAND RING STATE
 ; ==============================================================================
 
+align 4
+
 xhci_cmd_enqueue_index:
     dd 0
 
 xhci_cmd_cycle:
     db 1
-
 
 align 8
 
@@ -217,12 +215,12 @@ xhci_event_index:
 xhci_event_cycle:
     db 1
 
+align 8
+
 
 ; ==============================================================================
 ; CONTROLLER INFO
 ; ==============================================================================
-
-align 4
 
 xhci_max_ports:
     dd 0
@@ -244,12 +242,7 @@ xhci_running:
 xhci_initialized:
     db 0
 
-
-; ==============================================================================
-; CODE
-; ==============================================================================
-
-section .text
+align 8
 
 
 ; ==============================================================================
@@ -261,6 +254,8 @@ section .text
 ;   RAX = 0 błąd
 ;
 ; ==============================================================================
+
+section .text
 
 xhci_init:
 
@@ -283,7 +278,6 @@ xhci_init:
     jc .fail
 
     test rax, rax
-
     jz .fail
 
     mov [rel xhci_mmio], rax
@@ -309,6 +303,9 @@ xhci_init:
 
     ; ==========================================================================
     ; RUNTIME BASE
+    ;
+    ; RTSOFF jest względny względem Capability Base.
+    ; Dolne 5 bitów są zarezerwowane.
     ; ==========================================================================
 
     mov eax, dword [r12 + XHCI_RTSOFF]
@@ -322,6 +319,8 @@ xhci_init:
 
     ; ==========================================================================
     ; DOORBELL BASE
+    ;
+    ; DBOFF jest względny względem Capability Base.
     ; ==========================================================================
 
     mov eax, dword [r12 + XHCI_DBOFF]
@@ -345,25 +344,19 @@ xhci_init:
 
 
     mov edx, eax
-
     shr edx, 24
-
     mov [rel xhci_max_ports], edx
 
 
     mov edx, eax
-
     shr edx, 8
-
     and edx, 0x7FF
-
     mov [rel xhci_max_interrupters], edx
 
 
     and eax, 0xFF
 
     test eax, eax
-
     jnz .slots_valid
 
     mov eax, 1
@@ -380,7 +373,6 @@ xhci_init:
     call xhci_stop
 
     test eax, eax
-
     jz .fail
 
 
@@ -391,7 +383,6 @@ xhci_init:
     call xhci_reset
 
     test eax, eax
-
     jz .fail
 
 
@@ -406,7 +397,6 @@ xhci_init:
     mov eax, dword [r13 + XHCI_PAGESIZE]
 
     test eax, 1
-
     jz .fail
 
 
@@ -417,7 +407,6 @@ xhci_init:
     call xhci_allocate_dcbaa
 
     test eax, eax
-
     jz .fail
 
 
@@ -428,7 +417,6 @@ xhci_init:
     call xhci_allocate_command_ring
 
     test eax, eax
-
     jz .fail
 
 
@@ -439,7 +427,6 @@ xhci_init:
     call xhci_allocate_event_ring
 
     test eax, eax
-
     jz .fail
 
 
@@ -450,7 +437,6 @@ xhci_init:
     mov eax, [rel xhci_max_slots]
 
     test eax, eax
-
     jnz .config_slots_valid
 
     mov eax, 1
@@ -473,7 +459,6 @@ xhci_init:
     ; INTERRUPTER 0
     ;
     ; Na tym etapie pozostaje wyłączony.
-    ; Event Ring jest jednak skonfigurowany.
     ; ==========================================================================
 
     mov rax, [rel xhci_runtime_base]
@@ -488,7 +473,6 @@ xhci_init:
     call xhci_start
 
     test eax, eax
-
     jz .fail
 
 
@@ -520,20 +504,26 @@ xhci_init:
 
 ; ==============================================================================
 ; xhci_allocate_dcbaa
+;
+; DCBAA:
+;
+;   256 wpisów x 8 bajtów = 2048 bajtów.
+;
+; Cała strona jest zerowana, dzięki czemu wpisy urządzeń są początkowo NULL.
+;
 ; ==============================================================================
 
 xhci_allocate_dcbaa:
 
     push rbx
     push r12
+    push rdi
 
 
     call pmm_alloc_page
 
     test rax, rax
-
     jz .fail
-
 
     mov rbx, rax
 
@@ -562,11 +552,14 @@ xhci_allocate_dcbaa:
 
     mov rax, rbx
 
+    and rax, ~0x3F
+
     mov qword [r12 + XHCI_DCBAAP], rax
 
 
     mov eax, 1
 
+    pop rdi
     pop r12
     pop rbx
 
@@ -577,6 +570,7 @@ xhci_allocate_dcbaa:
 
     xor eax, eax
 
+    pop rdi
     pop r12
     pop rbx
 
@@ -598,14 +592,13 @@ xhci_allocate_command_ring:
     push rbx
     push r12
     push r13
+    push rdi
 
 
     call pmm_alloc_page
 
     test rax, rax
-
     jz .fail
-
 
     mov rbx, rax
 
@@ -630,12 +623,23 @@ xhci_allocate_command_ring:
     lea r13, [rbx + 4080]
 
 
+    ; Parameter = ring base.
     mov rax, rbx
 
     mov qword [r13], rax
 
+
+    ; Status = 0.
     mov qword [r13 + 8], 0
 
+
+    ; ==========================================================================
+    ; LINK TRB CONTROL
+    ;
+    ; Type = LINK
+    ; Toggle Cycle = 1
+    ; Cycle = 1
+    ; ==========================================================================
 
     mov eax, (TRB_TYPE_LINK << TRB_TYPE_SHIFT)
 
@@ -654,12 +658,15 @@ xhci_allocate_command_ring:
 
     ; ==========================================================================
     ; CRCR
+    ;
+    ; Bit 0 = RCS.
     ; ==========================================================================
 
     mov r12, [rel xhci_op_base]
 
     mov rax, rbx
 
+    and rax, ~0x3F
     or rax, 1
 
     mov qword [r12 + XHCI_CRCR], rax
@@ -667,6 +674,7 @@ xhci_allocate_command_ring:
 
     mov eax, 1
 
+    pop rdi
     pop r13
     pop r12
     pop rbx
@@ -678,6 +686,7 @@ xhci_allocate_command_ring:
 
     xor eax, eax
 
+    pop rdi
     pop r13
     pop r12
     pop rbx
@@ -704,6 +713,7 @@ xhci_allocate_event_ring:
     push rbx
     push r12
     push r13
+    push rdi
 
 
     ; ==========================================================================
@@ -713,7 +723,6 @@ xhci_allocate_event_ring:
     call pmm_alloc_page
 
     test rax, rax
-
     jz .fail
 
     mov rbx, rax
@@ -746,11 +755,14 @@ xhci_allocate_event_ring:
     call pmm_alloc_page
 
     test rax, rax
-
     jz .fail
 
     mov r13, rax
 
+
+    ; ==========================================================================
+    ; ZERO ERST PAGE
+    ; ==========================================================================
 
     xor eax, eax
 
@@ -769,15 +781,21 @@ xhci_allocate_event_ring:
     ;
     ; +00 = Segment Base
     ; +08 = Segment Size
+    ; +0C = Reserved
     ; ==========================================================================
 
     mov rax, [rel xhci_event_ring]
 
+    and rax, ~0x3F
+
     mov qword [r13], rax
+
 
     mov eax, XHCI_EVENT_TRBS
 
     mov dword [r13 + 8], eax
+
+    mov dword [r13 + 12], 0
 
 
     ; ==========================================================================
@@ -814,14 +832,20 @@ xhci_allocate_event_ring:
 
     mov rax, r13
 
+    and rax, ~0x3F
+
     mov qword [r12 + XHCI_ERSTBA], rax
 
 
     ; ==========================================================================
     ; ERDP
+    ;
+    ; Początkowo wskazuje pierwszy TRB segmentu.
     ; ==========================================================================
 
     mov rax, [rel xhci_event_ring]
+
+    and rax, ~0xF
 
     mov qword [r12 + XHCI_ERDP], rax
 
@@ -837,6 +861,7 @@ xhci_allocate_event_ring:
 
     mov eax, 1
 
+    pop rdi
     pop r13
     pop r12
     pop rbx
@@ -848,6 +873,7 @@ xhci_allocate_event_ring:
 
     xor eax, eax
 
+    pop rdi
     pop r13
     pop r12
     pop rbx
@@ -868,7 +894,6 @@ xhci_reset:
     mov rbx, [rel xhci_op_base]
 
     test rbx, rbx
-
     jz .fail
 
 
@@ -998,9 +1023,12 @@ xhci_start:
     mov rbx, [rel xhci_op_base]
 
     test rbx, rbx
-
     jz .fail
 
+
+    ; ==========================================================================
+    ; RUN = 1
+    ; ==========================================================================
 
     mov eax, [rbx + XHCI_USBCMD]
 
@@ -1066,6 +1094,10 @@ xhci_stop:
 
     jz .success
 
+
+    ; ==========================================================================
+    ; RUN = 0
+    ; ==========================================================================
 
     mov eax, [rbx + XHCI_USBCMD]
 
@@ -1143,7 +1175,6 @@ xhci_get_event:
     mov rbx, [rel xhci_event_ring]
 
     test rbx, rbx
-
     jz .none
 
 
@@ -1157,7 +1188,7 @@ xhci_get_event:
 
 .index_ok:
 
-    imul rcx, 16
+    shl rcx, 4
 
     add rbx, rcx
 
@@ -1239,7 +1270,6 @@ xhci_consume_event:
     mov rbx, [rel xhci_event_ring]
 
     test rbx, rbx
-
     jz .done
 
 
@@ -1289,14 +1319,15 @@ xhci_consume_event:
     mov r8, [rel xhci_runtime_base]
 
     test r8, r8
-
     jz .done
 
 
     ; ==========================================================================
     ; ERDP
     ;
-    ; bit 3 = EHB
+    ; bit 3 = EHB.
+    ;
+    ; Ustawienie EHB informuje kontroler, że host obsłużył event.
     ; ==========================================================================
 
     mov rax, rdx
@@ -1325,7 +1356,7 @@ xhci_consume_event:
 ; WEJŚCIE:
 ;
 ;   RCX = TRB Control DWORD
-;   RDX = TRB Parameter
+;   RDX = TRB Parameter QWORD
 ;   R8  = TRB Status DWORD/QWORD
 ;
 ; WYJŚCIE:
@@ -1347,7 +1378,6 @@ xhci_submit_command:
     mov rbx, [rel xhci_cmd_ring]
 
     test rbx, rbx
-
     jz .fail
 
 
@@ -1363,12 +1393,35 @@ xhci_submit_command:
 
 
     ; ==========================================================================
-    ; LINK TRB
+    ; PRZEJŚCIE PRZEZ LINK TRB
+    ;
+    ; Producent zmienia Cycle State po przejściu przez Link TRB.
+    ;
+    ; Link TRB musi mieć aktualny Cycle Bit.
     ; ==========================================================================
 
     xor r12d, r12d
 
     xor byte [rel xhci_cmd_cycle], 1
+
+
+    ; ==========================================================================
+    ; ZAKTUALIZUJ LINK TRB
+    ; ==========================================================================
+
+    lea r13, [rbx + 4080]
+
+    mov eax, dword [r13 + 12]
+
+    and eax, ~TRB_CYCLE
+
+    movzx edx, byte [rel xhci_cmd_cycle]
+
+    and edx, 1
+
+    or eax, edx
+
+    mov dword [r13 + 12], eax
 
 
 .index_valid:
@@ -1394,9 +1447,11 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; STATUS
+    ;
+    ; Tylko dolne 32 bity są polem Status TRB.
     ; ==========================================================================
 
-    mov qword [r13 + 8], r8
+    mov dword [r13 + 8], r8d
 
 
     ; ==========================================================================
@@ -1429,12 +1484,14 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; DOORBELL 0
+    ;
+    ; Doorbell 0 jest doorbellem Host Controller Command Ring.
+    ; Target = 0.
     ; ==========================================================================
 
     mov r14, [rel xhci_doorbell_base]
 
     test r14, r14
-
     jz .fail
 
 
@@ -1501,7 +1558,6 @@ xhci_enable_interrupts:
     mov rbx, [rel xhci_op_base]
 
     test rbx, rbx
-
     jz .fail
 
 
@@ -1512,7 +1568,6 @@ xhci_enable_interrupts:
     mov rax, [rel xhci_runtime_base]
 
     test rax, rax
-
     jz .fail
 
 
