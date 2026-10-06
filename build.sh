@@ -15,18 +15,7 @@ set -euo pipefail
 # Kernel load address:
 #   0x00100000
 #
-# Interrupt architecture:
-#
-#   ACPI
-#     |
-#     +---- LAPIC
-#     |       |
-#     |       +---- LAPIC Timer -> IDT 0x20 -> Scheduler
-#     |
-#     +---- IOAPIC -> device IRQs
-#
-# Legacy BIOS boot is intentionally NOT built.
-# PIT is NOT used as the scheduler timer.
+# Legacy BIOS boot is NOT built.
 #
 # =============================================================================
 
@@ -172,9 +161,6 @@ compile_elf64 \
     "Tools/serial.asm" \
     "$OBJ/serial.o"
 
-# PIT remains compiled only because the source contains legacy fallback
-# support. It is NOT used as the scheduler timer by the kernel.
-
 compile_elf64 \
     "Tools/pit_timer.asm" \
     "$OBJ/pit_timer.o"
@@ -260,10 +246,6 @@ compile_elf64 \
     "$OBJ/gui_hdr.o"
 
 compile_elf64 \
-    "Tools/gui_hdr_core.asm" \
-    "$OBJ/gui_hdr_core.o"
-
-compile_elf64 \
     "Tools/gui_men.asm" \
     "$OBJ/gui_men.o"
 
@@ -280,8 +262,8 @@ compile_elf64 \
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
-    "Tools/audio.asm" \
-    "$OBJ/audio.o"
+    "Tools/audio_hca.asm" \
+    "$OBJ/audio_hca.o"
 
 # -----------------------------------------------------------------------------
 # SHELL / BSOD
@@ -292,16 +274,16 @@ compile_elf64 \
     "$OBJ/shell.o"
 
 compile_elf64 \
-    "Tools/bsod.asm" \
-    "$OBJ/bsod.o"
+    "Tools/bosd.asm" \
+    "$OBJ/bosd.o"
 
 # -----------------------------------------------------------------------------
 # AHS-TUS / SECURITY / UPDATE
 # -----------------------------------------------------------------------------
 
 compile_elf64 \
-    "Tools/ahs_tus.asm" \
-    "$OBJ/ahs_tus.o"
+    "Tools/ahs-tus.asm" \
+    "$OBJ/ahs-tus.o"
 
 compile_elf64 \
     "Tools/malicious_check.asm" \
@@ -355,14 +337,13 @@ echo
     "$OBJ/custom_sceduler.o" \
     "$OBJ/multicore_legacy.o" \
     "$OBJ/gui_hdr.o" \
-    "$OBJ/gui_hdr_core.o" \
     "$OBJ/gui_men.o" \
     "$OBJ/video_gop.o" \
     "$OBJ/simd_argb-64.o" \
-    "$OBJ/audio.o" \
+    "$OBJ/audio_hca.o" \
     "$OBJ/shell.o" \
-    "$OBJ/bsod.o" \
-    "$OBJ/ahs_tus.o" \
+    "$OBJ/bosd.o" \
+    "$OBJ/ahs-tus.o" \
     "$OBJ/malicious_check.o" \
     "$OBJ/update_loader.o"
 
@@ -423,9 +404,8 @@ echo
 echo "Interrupt architecture:"
 echo "  ACPI   : ENABLED"
 echo "  LAPIC  : PRIMARY"
-echo "  LAPIC TIMER : SCHEDULER"
 echo "  IOAPIC : DEVICE IRQ ROUTING"
-echo "  PIC    : DISABLED / LEGACY ONLY"
+echo "  PIC    : LEGACY ONLY"
 echo "  PIT    : FALLBACK ONLY"
 echo
 echo "Scheduler timer:"
