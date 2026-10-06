@@ -7,25 +7,23 @@
 ;   - wyszukiwanie kontrolera USB 3.x / xHCI
 ;   - odczyt BAR0
 ;   - obsługa 32-bitowego i 64-bitowego BAR
+;   - obsługa 64-bitowego BAR
 ;   - przejęcie xHCI od BIOS/UEFI
+;   - zapamiętanie PCI BDF
+;   - zapamiętanie PCI Interrupt Line / Pin
 ;
-; Bezpieczeństwo:
-;   - brak nieskończonej pętli BIOS handshake
-;   - limit Extended Capabilities
-;   - poprawne propagowanie błędu handshake
-;   - odrzucenie nieprawidłowego BAR
+; PCI:
 ;
-; Wspólny dostęp do PCI znajduje się w:
+;   BH = Bus
+;   BL = Device
+;   CH = Function
 ;
-;   Tools/pci_dyski.asm
+; pci_get_interrupt_info:
 ;
-; Funkcja:
+;   RAX = Interrupt Line
+;   RDX = Interrupt Pin
 ;
-;   pci_read_config_dword
-;
-; NIE definiujemy jej tutaj drugi raz.
 ;==============================================================================
-
 bits 64
 
 
@@ -38,37 +36,35 @@ section .text
 
 global find_usb_controllers
 
+global xhci_get_pci_irq
+global xhci_get_pci_pin
+global xhci_get_pci_bus
+global xhci_get_pci_device
+global xhci_get_pci_function
+
 
 ;==============================================================================
 ; EXTERNALS
 ;==============================================================================
 
 extern pci_read_config_dword
+extern pci_get_interrupt_info
 
 
 ;==============================================================================
 ; CONSTANTS
 ;==============================================================================
 
-; Maksymalna liczba iteracji oczekiwania na BIOS Owned Semaphore.
-;
-; Nie jest to czas w milisekundach, ponieważ nie mamy tutaj jeszcze
-; niezależnego timera. Chroni jednak przed nieskończonym zawieszeniem CPU.
-;
-XHCI_BIOS_TIMEOUT equ 10000000
-
-; Maksymalna liczba wpisów Extended Capability.
-XHCI_MAX_EXT_CAPS equ 256
+XHCI_BIOS_TIMEOUT       equ 10000000
+XHCI_MAX_EXT_CAPS       equ 256
 
 
 ;==============================================================================
-; FUNKCJA: find_usb_controllers
-;
-; Przeszukuje magistralę PCI w poszukiwaniu kontrolera USB 3.0 (xHCI).
+; find_usb_controllers
 ;
 ; Zwraca:
 ;
-;   RAX = pełny 64-bitowy adres fizyczny MMIO kontrolera xHCI
+;   RAX = pełny 64-bitowy adres fizyczny MMIO xHCI
 ;
 ;   CF = 0
 ;       znaleziono kontroler i handshake zakończył się poprawnie
@@ -78,7 +74,16 @@ XHCI_MAX_EXT_CAPS equ 256
 ;       LUB
 ;       handshake xHCI nie powiódł się
 ;
+; Dodatkowo zapisuje:
+;
+;   xhci_pci_bus
+;   xhci_pci_device
+;   xhci_pci_function
+;   xhci_pci_irq
+;   xhci_pci_pin
+;
 ;==============================================================================
+
 find_usb_controllers:
 
     push rbx
@@ -90,7 +95,7 @@ find_usb_controllers:
     ; BUS = 0
     ;==========================================================================
 
-    mov bh, 0
+    xor ebx, ebx
 
 
 .loop_bus:
@@ -99,7 +104,7 @@ find_usb_controllers:
     ; DEVICE = 0
     ;==========================================================================
 
-    mov bl, 0
+    xor bl, bl
 
 
 .loop_dev:
@@ -108,7 +113,7 @@ find_usb_controllers:
     ; FUNCTION = 0
     ;==========================================================================
 
-    mov ch, 0
+    xor ch, ch
 
 
 .loop_func:
@@ -215,6 +220,39 @@ find_usb_controllers:
 .found_xhci:
 
     ;==========================================================================
+    ; ZAPISZ PCI BDF
+    ;
+    ; W tym momencie:
+    ;
+    ;   BH = bus
+    ;   BL = device
+    ;   CH = function
+    ;==========================================================================
+
+    movzx eax, bh
+    mov [rel xhci_pci_bus], eax
+
+    movzx eax, bl
+    mov [rel xhci_pci_device], eax
+
+    movzx eax, ch
+    mov [rel xhci_pci_function], eax
+
+
+    ;==========================================================================
+    ; ODCZYTAJ PCI INTERRUPT LINE / PIN
+    ;==========================================================================
+
+    call pci_get_interrupt_info
+
+    ; RAX = Interrupt Line
+    ; RDX = Interrupt Pin
+
+    mov [rel xhci_pci_irq], eax
+    mov [rel xhci_pci_pin], edx
+
+
+    ;==========================================================================
     ; ODCZYTAJ BAR0
     ;
     ; PCI offset 0x10
@@ -234,8 +272,6 @@ find_usb_controllers:
     ;
     ;   0 = Memory Space
     ;   1 = I/O Space
-    ;
-    ; xHCI używa MMIO.
     ;==========================================================================
 
     test edx, 1
@@ -289,8 +325,6 @@ find_usb_controllers:
     mov cl, 0x14
 
     call pci_read_config_dword
-
-    mov rax, rax
 
     shl rax, 32
 
@@ -367,14 +401,6 @@ find_usb_controllers:
 ;
 ;   RAX = adres MMIO xHCI
 ;
-; Działanie:
-;
-;   1. znajduje Extended Capabilities
-;   2. wyszukuje USB Legacy Support
-;   3. ustawia OS Owned Semaphore
-;   4. czeka na zwolnienie BIOS Owned Semaphore
-;   5. wyłącza SMI
-;
 ;==============================================================================
 
 xhci_bios_handshake:
@@ -434,17 +460,9 @@ xhci_bios_handshake:
 
 .search_loop:
 
-    ;--------------------------------------------------------------------------
-    ; Limit ochronny.
-    ;
-    ; Nie pozwalamy, żeby uszkodzony capability pointer stworzył nieskończoną
-    ; pętlę.
-    ;--------------------------------------------------------------------------
-
     cmp ecx, XHCI_MAX_EXT_CAPS
 
     jae .no_legacy_found
-
 
     inc ecx
 
@@ -477,8 +495,6 @@ xhci_bios_handshake:
     ; Next Capability Pointer
     ;
     ; bits 15:8
-    ;
-    ; offset jest podany w DWORD-ach.
     ;==========================================================================
 
     mov eax, ebx
@@ -529,18 +545,6 @@ xhci_bios_handshake:
 
     ;==========================================================================
     ; CZEKAJ NA BIOS
-    ;
-    ; BIOS Owned musi zostać wyzerowane.
-    ;
-    ; WAŻNE:
-    ;
-    ; Wcześniej był tutaj nieskończony:
-    ;
-    ;     jnz .wait_bios
-    ;
-    ; Jeżeli BIOS nigdy nie oddał xHCI, cały kernel zawieszał się na zawsze.
-    ;
-    ; Teraz mamy twardy limit.
     ;==========================================================================
 
     mov ecx, XHCI_BIOS_TIMEOUT
@@ -564,9 +568,6 @@ xhci_bios_handshake:
 
     ;==========================================================================
     ; TIMEOUT
-    ;
-    ; BIOS nie oddał kontrolera.
-    ; Nie próbujemy dalej konfigurować xHCI.
     ;==========================================================================
 
     jmp .handshake_error
@@ -610,11 +611,6 @@ xhci_bios_handshake:
 
 ;==============================================================================
 ; BRAK LEGACY SUPPORT
-;
-; Brak USB Legacy Support nie jest błędem.
-;
-; W wielu współczesnych kontrolerach nie ma tej capability.
-; Możemy kontynuować.
 ;==============================================================================
 
 .no_legacy_found:
@@ -646,3 +642,110 @@ xhci_bios_handshake:
     stc
 
     ret
+
+
+;==============================================================================
+; xhci_get_pci_irq
+;
+; WYJŚCIE:
+;
+;   RAX = PCI Interrupt Line
+;
+;   0..254 = przypisany IRQ
+;   255    = brak przypisania
+;
+;==============================================================================
+
+xhci_get_pci_irq:
+
+    mov eax, [rel xhci_pci_irq]
+
+    ret
+
+
+;==============================================================================
+; xhci_get_pci_pin
+;
+; WYJŚCIE:
+;
+;   RAX = PCI Interrupt Pin
+;
+;   0 = brak
+;   1 = INTA
+;   2 = INTB
+;   3 = INTC
+;   4 = INTD
+;
+;==============================================================================
+
+xhci_get_pci_pin:
+
+    mov eax, [rel xhci_pci_pin]
+
+    ret
+
+
+;==============================================================================
+; xhci_get_pci_bus
+;==============================================================================
+
+xhci_get_pci_bus:
+
+    mov eax, [rel xhci_pci_bus]
+
+    ret
+
+
+;==============================================================================
+; xhci_get_pci_device
+;==============================================================================
+
+xhci_get_pci_device:
+
+    mov eax, [rel xhci_pci_device]
+
+    ret
+
+
+;==============================================================================
+; xhci_get_pci_function
+;==============================================================================
+
+xhci_get_pci_function:
+
+    mov eax, [rel xhci_pci_function]
+
+    ret
+
+
+;==============================================================================
+; DATA
+;==============================================================================
+
+section .data
+
+align 8
+
+;==============================================================================
+; PCI LOCATION
+;==============================================================================
+
+xhci_pci_bus:
+    dd 0
+
+xhci_pci_device:
+    dd 0
+
+xhci_pci_function:
+    dd 0
+
+
+;==============================================================================
+; PCI INTERRUPT INFORMATION
+;==============================================================================
+
+xhci_pci_irq:
+    dd 0xFFFFFFFF
+
+xhci_pci_pin:
+    dd 0
