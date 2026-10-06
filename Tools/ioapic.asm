@@ -3,48 +3,32 @@
 ; ==============================================================================
 ; x86-64 / NASM
 ;
-; ARCHITEKTURA:
+; IOAPIC:
 ;
-;   CPU
-;    |
-;    +-- Exceptions 0x00-0x1F
-;    |
-;    +-- LAPIC Timer 0x20
-;    |
-;    +-- IOAPIC
-;          |
-;          +-- Hardware IRQ
+;   ISA IRQ
+;      |
+;      +-- ACPI ISO
+;      |      |
+;      |      +-- GSI
+;      |      +-- Polarity
+;      |      +-- Trigger
+;      |
+;      +-- standard GSI
+;             |
+;             v
+;          IOAPIC
+;             |
+;             v
+;          LAPIC
+;             |
+;             v
+;          CPU IDT
 ;
-;
-; IRQ0 NIE jest scheduler timerem.
+; Scheduler timer NIE korzysta z IOAPIC.
 ;
 ; Scheduler:
 ;
-;   LAPIC Timer -> vector 0x20 -> scheduler_dispatch
-;
-; PIT:
-;
-;   tylko kalibracja LAPIC Timer.
-;
-;
-; ACPI:
-;
-;   IOAPIC:
-;       acpi_get_ioapic_info
-;
-;       RCX = index
-;       RAX = IOAPIC ID
-;       RDX = MMIO address
-;       R8  = GSI base
-;
-;   ISO:
-;       acpi_get_iso_info
-;
-;       RCX = index
-;       RAX = Bus
-;       RDX = Source IRQ
-;       R8  = GSI
-;       R9  = Flags
+;   LAPIC Timer -> vector 0x20
 ;
 ; ==============================================================================
 
@@ -85,7 +69,7 @@ extern serial_log
 
 
 ; ==============================================================================
-; IOAPIC MMIO REGISTERS
+; IOAPIC MMIO
 ; ==============================================================================
 
 IOAPIC_REGSEL              equ 0x00
@@ -93,7 +77,7 @@ IOAPIC_WINDOW              equ 0x10
 
 
 ; ==============================================================================
-; IOAPIC INTERNAL REGISTERS
+; IOAPIC REGISTERS
 ; ==============================================================================
 
 IOAPIC_REG_ID              equ 0x00
@@ -109,7 +93,7 @@ IOAPIC_REDIR_BASE          equ 0x10
 
 
 ; ==============================================================================
-; REDIRECTION ENTRY BITS
+; REDIRECTION BITS
 ; ==============================================================================
 
 IOAPIC_REDIR_MASK          equ (1 << 16)
@@ -167,16 +151,21 @@ ISA_IRQ_MAX                equ 15
 ;   01 = edge
 ;   11 = level
 ;
+; Dla ISA:
+;
+;   conforming polarity = active high
+;   conforming trigger  = edge
+;
 ; ==============================================================================
 
 ISO_POLARITY_MASK          equ 0x03
-ISO_TRIGGER_MASK          equ 0x0C
+ISO_TRIGGER_MASK           equ 0x0C
 
-ISO_ACTIVE_HIGH           equ 0x01
-ISO_ACTIVE_LOW            equ 0x03
+ISO_ACTIVE_HIGH            equ 0x01
+ISO_ACTIVE_LOW             equ 0x03
 
-ISO_EDGE                  equ 0x04
-ISO_LEVEL                 equ 0x0C
+ISO_EDGE                   equ 0x04
+ISO_LEVEL                  equ 0x0C
 
 
 ; ==============================================================================
@@ -184,7 +173,7 @@ ISO_LEVEL                 equ 0x0C
 ;
 ; Pobiera pierwszy IOAPIC z ACPI/MADT.
 ;
-; Poprawne ABI ACPI:
+; ACPI:
 ;
 ;   RCX = index
 ;
@@ -209,9 +198,7 @@ ioapic_init:
     ; ==========================================================================
 
     mov qword [rel ioapic_count], 0
-
     mov qword [rel ioapic_base], 0
-
     mov qword [rel ioapic_gsi_base], 0
 
     mov dword [rel ioapic_max_redir], 0
@@ -220,22 +207,19 @@ ioapic_init:
 
 
     ; ==========================================================================
-    ; POBIERZ LICZBĘ IOAPIC
+    ; IOAPIC COUNT
     ; ==========================================================================
 
     call acpi_get_ioapic_count
 
     test eax, eax
-
     jz .fail
 
     mov [rel ioapic_count], rax
 
 
     ; ==========================================================================
-    ; PIERWSZY IOAPIC
-    ;
-    ; RCX = 0
+    ; FIRST IOAPIC
     ; ==========================================================================
 
     xor ecx, ecx
@@ -243,42 +227,28 @@ ioapic_init:
     call acpi_get_ioapic_info
 
     cmp rax, -1
-
     je .fail
 
 
-    ; ==========================================================================
-    ; ACPI:
-    ;
-    ; RAX = ID
-    ; RDX = MMIO
-    ; R8  = GSI base
-    ; ==========================================================================
-
     test rdx, rdx
-
     jz .fail
 
 
     mov [rel ioapic_base], rdx
-
     mov [rel ioapic_gsi_base], r8
 
 
     ; ==========================================================================
-    ; ODCZYTAJ IOAPIC VERSION
+    ; IOAPIC VERSION
     ; ==========================================================================
 
     mov edi, IOAPIC_REG_VER
 
     call ioapic_read
 
-    ; bits 23:16 = Maximum Redirection Entry
-
     mov ebx, eax
 
     shr eax, 16
-
     and eax, 0xFF
 
     mov [rel ioapic_max_redir], eax
@@ -286,24 +256,21 @@ ioapic_init:
 
     ; ==========================================================================
     ; SANITY CHECK
-    ;
-    ; Maksymalny redirection entry nie może być większy niż 239.
     ; ==========================================================================
 
     cmp eax, 239
-
     ja .fail
 
 
     ; ==========================================================================
-    ; IOAPIC ACTIVE
+    ; ACTIVE
     ; ==========================================================================
 
     mov byte [rel ioapic_active], 1
 
 
     ; ==========================================================================
-    ; MASKUJ WSZYSTKIE REDIRECTION ENTRIES
+    ; MASK ALL REDIRECTION ENTRIES
     ; ==========================================================================
 
     xor ecx, ecx
@@ -312,14 +279,11 @@ ioapic_init:
 .mask_loop:
 
     cmp ecx, [rel ioapic_max_redir]
-
     ja .mask_done
-
 
     mov edi, ecx
 
     call ioapic_mask_redirection_entry
-
 
     inc ecx
 
@@ -332,7 +296,6 @@ ioapic_init:
 
     call serial_log
 
-
     mov eax, 1
 
     jmp .done
@@ -343,7 +306,6 @@ ioapic_init:
     mov byte [rel ioapic_active], 0
 
     mov qword [rel ioapic_base], 0
-
     mov qword [rel ioapic_gsi_base], 0
 
     mov dword [rel ioapic_max_redir], 0
@@ -375,7 +337,7 @@ ioapic_available:
 
 
 ; ==============================================================================
-; ioapic_get_count
+; GETTERS
 ; ==============================================================================
 
 ioapic_get_count:
@@ -385,10 +347,6 @@ ioapic_get_count:
     ret
 
 
-; ==============================================================================
-; ioapic_get_base
-; ==============================================================================
-
 ioapic_get_base:
 
     mov rax, [rel ioapic_base]
@@ -396,20 +354,12 @@ ioapic_get_base:
     ret
 
 
-; ==============================================================================
-; ioapic_get_gsi_base
-; ==============================================================================
-
 ioapic_get_gsi_base:
 
     mov rax, [rel ioapic_gsi_base]
 
     ret
 
-
-; ==============================================================================
-; ioapic_get_max_redir
-; ==============================================================================
 
 ioapic_get_max_redir:
 
@@ -421,27 +371,19 @@ ioapic_get_max_redir:
 ; ==============================================================================
 ; ioapic_read
 ;
-; IN:
+; EDI = register
 ;
-;   EDI = IOAPIC register
-;
-; OUT:
-;
-;   EAX = value
-;
+; EAX = value
 ; ==============================================================================
 
 ioapic_read:
 
     push rbx
 
-
     mov rbx, [rel ioapic_base]
 
     test rbx, rbx
-
     jz .invalid
-
 
     mov dword [rbx + IOAPIC_REGSEL], edi
 
@@ -465,24 +407,18 @@ ioapic_read:
 ; ==============================================================================
 ; ioapic_write
 ;
-; IN:
-;
-;   EDI = IOAPIC register
-;   ESI = value
-;
+; EDI = register
+; ESI = value
 ; ==============================================================================
 
 ioapic_write:
 
     push rbx
 
-
     mov rbx, [rel ioapic_base]
 
     test rbx, rbx
-
     jz .done
-
 
     mov dword [rbx + IOAPIC_REGSEL], edi
 
@@ -499,13 +435,9 @@ ioapic_write:
 ; ==============================================================================
 ; ioapic_read_redirection
 ;
-; IN:
+; EDI = entry
 ;
-;   EDI = redirection entry
-;
-; OUT:
-;
-;   RAX = 64-bit entry
+; RAX = 64-bit redirection entry
 ; ==============================================================================
 
 ioapic_read_redirection:
@@ -520,7 +452,6 @@ ioapic_read_redirection:
     ; ==========================================================================
 
     mov ebx, edi
-
     shl ebx, 1
 
 
@@ -529,7 +460,6 @@ ioapic_read_redirection:
     ; ==========================================================================
 
     mov edi, IOAPIC_REDIR_BASE
-
     add edi, ebx
 
     call ioapic_read
@@ -542,7 +472,6 @@ ioapic_read_redirection:
     ; ==========================================================================
 
     mov edi, IOAPIC_REDIR_BASE + 1
-
     add edi, ebx
 
     call ioapic_read
@@ -571,11 +500,8 @@ ioapic_read_redirection:
 ; ==============================================================================
 ; ioapic_write_redirection
 ;
-; IN:
-;
-;   EDI = redirection entry
-;   RSI = 64-bit entry
-;
+; EDI = entry
+; RSI = 64-bit entry
 ; ==============================================================================
 
 ioapic_write_redirection:
@@ -586,13 +512,7 @@ ioapic_write_redirection:
 
     mov rbx, rsi
 
-
-    ; ==========================================================================
-    ; entry * 2
-    ; ==========================================================================
-
     mov ecx, edi
-
     shl ecx, 1
 
 
@@ -601,7 +521,6 @@ ioapic_write_redirection:
     ; ==========================================================================
 
     mov edi, IOAPIC_REDIR_BASE
-
     add edi, ecx
 
     mov esi, ebx
@@ -614,11 +533,9 @@ ioapic_write_redirection:
     ; ==========================================================================
 
     mov edi, IOAPIC_REDIR_BASE + 1
-
     add edi, ecx
 
     mov rsi, rbx
-
     shr rsi, 32
 
     call ioapic_write
@@ -633,8 +550,6 @@ ioapic_write_redirection:
 ; ==============================================================================
 ; ioapic_mask_redirection_entry
 ;
-; INTERNAL
-;
 ; EDI = entry
 ; ==============================================================================
 
@@ -642,21 +557,16 @@ ioapic_mask_redirection_entry:
 
     push rbx
 
-
     mov ebx, edi
-
 
     call ioapic_read_redirection
 
     or rax, IOAPIC_REDIR_MASK
 
-
     mov rsi, rax
-
     mov edi, ebx
 
     call ioapic_write_redirection
-
 
     pop rbx
 
@@ -666,42 +576,25 @@ ioapic_mask_redirection_entry:
 ; ==============================================================================
 ; ioapic_irq_to_gsi
 ;
-; WEJŚCIE:
+; EDI = ISA IRQ
 ;
-;   EDI = ISA IRQ
-;
-; WYJŚCIE:
-;
-;   EAX = GSI
-;
-;   CF = 0 success
-;   CF = 1 failure
-;
-; Obsługuje ACPI Interrupt Source Override.
+; EAX = GSI
+; CF  = 0 success
+; CF  = 1 failure
 ;
 ; ==============================================================================
 
 ioapic_irq_to_gsi:
 
-    ; ==========================================================================
-    ; Tylko ISA IRQ 0..15
-    ; ==========================================================================
-
     cmp edi, ISA_IRQ_MAX
-
     ja .fail
 
-
-    ; ==========================================================================
-    ; Najpierw sprawdź ISO.
-    ; ==========================================================================
 
     push rbx
     push rcx
     push rdx
     push r8
     push r9
-
 
     mov ebx, edi
 
@@ -711,23 +604,32 @@ ioapic_irq_to_gsi:
 .iso_loop:
 
     cmp ecx, 24
-
     jae .no_iso
 
 
     call acpi_get_iso_info
 
     cmp rax, -1
-
     je .no_iso
 
 
+    ; ==========================================================================
+    ; ISO Bus = 0 oznacza ISA.
+    ; ==========================================================================
+
+    test eax, eax
+    jnz .next_iso
+
+
+    ; ==========================================================================
     ; RDX = Source IRQ
+    ; ==========================================================================
 
     cmp edx, ebx
-
     je .iso_found
 
+
+.next_iso:
 
     inc ecx
 
@@ -735,8 +637,6 @@ ioapic_irq_to_gsi:
 
 
 .iso_found:
-
-    ; R8 = GSI
 
     mov eax, r8d
 
@@ -754,9 +654,9 @@ ioapic_irq_to_gsi:
 .no_iso:
 
     ; ==========================================================================
-    ; Brak ISO:
+    ; Standard ISA mapping:
     ;
-    ; GSI = GSI_BASE + IRQ
+    ; GSI = IOAPIC GSI base + IRQ
     ; ==========================================================================
 
     mov eax, [rel ioapic_gsi_base]
@@ -785,35 +685,128 @@ ioapic_irq_to_gsi:
 
 
 ; ==============================================================================
-; ioapic_gsi_to_redir
+; ioapic_get_irq_iso_flags
+;
+; INTERNAL
 ;
 ; WEJŚCIE:
 ;
-;   EAX = GSI
+;   EDI = ISA IRQ
 ;
 ; WYJŚCIE:
 ;
-;   EAX = redirection index
+;   EAX = ISO flags
 ;
-;   CF = 0 success
-;   CF = 1 failure
+;   CF = 0 -> znaleziono ISO
+;   CF = 1 -> brak ISO
 ;
+; Jeśli brak ISO, caller powinien użyć:
+;
+;   active high
+;   edge triggered
+;
+; ==============================================================================
+
+ioapic_get_irq_iso_flags:
+
+    cmp edi, ISA_IRQ_MAX
+    ja .fail
+
+
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    mov ebx, edi
+
+    xor ecx, ecx
+
+
+.iso_loop:
+
+    cmp ecx, 24
+    jae .fail_pop
+
+
+    call acpi_get_iso_info
+
+    cmp rax, -1
+    je .fail_pop
+
+
+    ; ==========================================================================
+    ; ISO Bus = 0 -> ISA
+    ; ==========================================================================
+
+    test eax, eax
+    jnz .next
+
+
+    cmp edx, ebx
+    je .found
+
+
+.next:
+
+    inc ecx
+
+    jmp .iso_loop
+
+
+.found:
+
+    mov eax, r9d
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+
+    clc
+
+    ret
+
+
+.fail_pop:
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+
+
+.fail:
+
+    xor eax, eax
+
+    stc
+
+    ret
+
+
+; ==============================================================================
+; ioapic_gsi_to_redir
+;
+; EAX = GSI
+;
+; EAX = redirection entry
+; CF  = 0 success
+; CF  = 1 failure
 ; ==============================================================================
 
 ioapic_gsi_to_redir:
 
     cmp eax, [rel ioapic_gsi_base]
-
     jb .fail
-
 
     sub eax, [rel ioapic_gsi_base]
 
-
     cmp eax, [rel ioapic_max_redir]
-
     ja .fail
-
 
     clc
 
@@ -832,16 +825,11 @@ ioapic_gsi_to_redir:
 ; ==============================================================================
 ; ioapic_irq_to_redir
 ;
-; WEJŚCIE:
+; EDI = IRQ
 ;
-;   EDI = IRQ
-;
-; OUT:
-;
-;   EAX = redirection entry
-;
-;   CF = 0 success
-;   CF = 1 failure
+; EAX = redirection entry
+; CF  = 0 success
+; CF  = 1 failure
 ; ==============================================================================
 
 ioapic_irq_to_redir:
@@ -849,7 +837,6 @@ ioapic_irq_to_redir:
     call ioapic_irq_to_gsi
 
     jc .fail
-
 
     jmp ioapic_gsi_to_redir
 
@@ -867,21 +854,17 @@ ioapic_irq_to_redir:
 ; ioapic_mask_irq
 ;
 ; EDI = IRQ
-;
 ; ==============================================================================
 
 ioapic_mask_irq:
 
     push rbx
 
-
     call ioapic_irq_to_redir
 
     jc .fail
 
-
     mov ebx, eax
-
 
     mov edi, ebx
 
@@ -889,13 +872,10 @@ ioapic_mask_irq:
 
     or rax, IOAPIC_REDIR_MASK
 
-
     mov rsi, rax
-
     mov edi, ebx
 
     call ioapic_write_redirection
-
 
     mov eax, 1
 
@@ -918,21 +898,17 @@ ioapic_mask_irq:
 ; ioapic_unmask_irq
 ;
 ; EDI = IRQ
-;
 ; ==============================================================================
 
 ioapic_unmask_irq:
 
     push rbx
 
-
     call ioapic_irq_to_redir
 
     jc .fail
 
-
     mov ebx, eax
-
 
     mov edi, ebx
 
@@ -940,13 +916,10 @@ ioapic_unmask_irq:
 
     and rax, ~IOAPIC_REDIR_MASK
 
-
     mov rsi, rax
-
     mov edi, ebx
 
     call ioapic_write_redirection
-
 
     mov eax, 1
 
@@ -971,6 +944,7 @@ ioapic_unmask_irq:
 ; EDI = IRQ
 ; ESI = vector
 ;
+; Ta funkcja zachowuje istniejącą polaryzację/trigger.
 ; ==============================================================================
 
 ioapic_set_irq_vector:
@@ -979,34 +953,19 @@ ioapic_set_irq_vector:
     push rcx
 
 
-    ; ==========================================================================
-    ; VECTOR
-    ; ==========================================================================
-
     cmp esi, IRQ_VECTOR_MIN
-
     jb .fail
 
     cmp esi, IRQ_VECTOR_MAX
-
     ja .fail
 
-
-    ; ==========================================================================
-    ; IRQ -> REDIR
-    ; ==========================================================================
 
     call ioapic_irq_to_redir
 
     jc .fail
 
-
     mov ebx, eax
 
-
-    ; ==========================================================================
-    ; READ
-    ; ==========================================================================
 
     mov edi, ebx
 
@@ -1020,7 +979,6 @@ ioapic_set_irq_vector:
     and rax, ~0xFF
 
     mov ecx, esi
-
     and ecx, 0xFF
 
     or rax, rcx
@@ -1035,12 +993,7 @@ ioapic_set_irq_vector:
     or rax, IOAPIC_DELIVERY_FIXED
 
 
-    ; ==========================================================================
-    ; ZAPIS
-    ; ==========================================================================
-
     mov rsi, rax
-
     mov edi, ebx
 
     call ioapic_write_redirection
@@ -1069,7 +1022,7 @@ ioapic_set_irq_vector:
 ;
 ; WEJŚCIE:
 ;
-;   EDI = IRQ
+;   EDI = ISA IRQ
 ;   ESI = vector
 ;   EDX = destination LAPIC APIC ID
 ;
@@ -1079,15 +1032,17 @@ ioapic_set_irq_vector:
 ;   RAX = 0 failure
 ;
 ;
+; DEFAULT:
+;
+;   active high
+;   edge triggered
+;
+; ACPI ISO:
+;
+;   active high / low
+;   edge / level
+;
 ; Wpis ZAWSZE pozostaje MASKED.
-;
-; Najpierw:
-;
-;   ioapic_route_irq
-;
-; następnie po gotowym IDT:
-;
-;   ioapic_unmask_irq
 ;
 ; ==============================================================================
 
@@ -1096,6 +1051,7 @@ ioapic_route_irq:
     push rbx
     push rcx
     push r8
+    push r9
 
 
     ; ==========================================================================
@@ -1103,11 +1059,9 @@ ioapic_route_irq:
     ; ==========================================================================
 
     cmp esi, IRQ_VECTOR_MIN
-
     jb .fail
 
     cmp esi, IRQ_VECTOR_MAX
-
     ja .fail
 
 
@@ -1126,8 +1080,37 @@ ioapic_route_irq:
 
     jc .fail
 
-
     mov ecx, eax
+
+
+    ; ==========================================================================
+    ; DEFAULT ISA:
+    ;
+    ; active high
+    ; edge triggered
+    ; ==========================================================================
+
+    xor r9d, r9d
+
+
+    ; ==========================================================================
+    ; SPRAWDŹ ACPI ISO
+    ; ==========================================================================
+
+    push rcx
+    push rdi
+
+    call ioapic_get_irq_iso_flags
+
+    jc .no_iso_flags
+
+    mov r9d, eax
+
+
+.no_iso_flags:
+
+    pop rdi
+    pop rcx
 
 
     ; ==========================================================================
@@ -1135,6 +1118,8 @@ ioapic_route_irq:
     ;
     ; bits 0..7   = vector
     ; bits 8..10  = Fixed
+    ; bit 13      = polarity
+    ; bit 15      = trigger
     ; bit 16      = MASK
     ; bits 56..63 = destination APIC ID
     ; ==========================================================================
@@ -1149,7 +1134,73 @@ ioapic_route_irq:
 
 
     ; ==========================================================================
-    ; DESTINATION
+    ; POLARITY
+    ;
+    ; ISO:
+    ;
+    ; 00 = conforming -> active high
+    ; 01 = active high
+    ; 11 = active low
+    ; ==========================================================================
+
+    mov edx, r9d
+
+    and edx, ISO_POLARITY_MASK
+
+
+    cmp edx, ISO_ACTIVE_LOW
+    je .active_low
+
+    ; --------------------------------------------------------------------------
+    ; active high
+    ; --------------------------------------------------------------------------
+
+    jmp .polarity_done
+
+
+.active_low:
+
+    or eax, IOAPIC_REDIR_POLARITY
+
+
+.polarity_done:
+
+
+    ; ==========================================================================
+    ; TRIGGER
+    ;
+    ; ISO:
+    ;
+    ; 00 = conforming -> edge
+    ; 01 = edge
+    ; 11 = level
+    ; ==========================================================================
+
+    mov edx, r9d
+
+    and edx, ISO_TRIGGER_MASK
+
+
+    cmp edx, ISO_LEVEL
+    je .level_triggered
+
+    ; --------------------------------------------------------------------------
+    ; edge triggered
+    ; --------------------------------------------------------------------------
+
+    jmp .trigger_done
+
+
+.level_triggered:
+
+    or eax, IOAPIC_REDIR_TRIGGER
+
+
+.trigger_done:
+
+
+    ; ==========================================================================
+    ; DESTINATION LAPIC
     ; ==========================================================================
 
     mov edx, r8d
@@ -1162,7 +1213,7 @@ ioapic_route_irq:
 
 
     ; ==========================================================================
-    ; PROGRAM
+    ; PROGRAM IOAPIC
     ; ==========================================================================
 
     mov rsi, rax
@@ -1184,6 +1235,7 @@ ioapic_route_irq:
 
 .done:
 
+    pop r9
     pop r8
     pop rcx
     pop rbx
@@ -1201,27 +1253,22 @@ align 8
 
 
 ioapic_base:
-
     dq 0
 
 
 ioapic_gsi_base:
-
     dq 0
 
 
 ioapic_count:
-
     dq 0
 
 
 ioapic_max_redir:
-
     dd 0
 
 
 ioapic_active:
-
     db 0
 
 
@@ -1229,5 +1276,4 @@ align 8
 
 
 ioapic_init_msg:
-
-    db "IOAPIC initialized - all redirection entries masked", 10, 0
+    db "IOAPIC initialized - ISO polarity/trigger support enabled", 10, 0
