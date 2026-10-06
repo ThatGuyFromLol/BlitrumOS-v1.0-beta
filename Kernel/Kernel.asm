@@ -308,17 +308,19 @@ _start:
 ; PHYSICAL MEMORY MANAGER
 ; =========================================================================
 ;
-; ABI:
+; POPRAWNE ABI pmm_init:
 ;
-;   RDI = memory map
-;   RSI = memory map size
-;   RDX = descriptor size
+;   RCX = EFI descriptor size
+;   R8  = memory map size
+;   R9  = memory map address
+;
+; Tools/ppm.asm używa dokładnie tych rejestrów.
 ;
 ; =========================================================================
 
-    mov rdi, [rel kernel_memory_map]
-    mov rsi, [rel kernel_memory_map_size]
-    mov rdx, [rel kernel_memory_desc_size]
+    mov rcx, [rel kernel_memory_desc_size]
+    mov r8,  [rel kernel_memory_map_size]
+    mov r9,  [rel kernel_memory_map]
 
     call pmm_init
 
