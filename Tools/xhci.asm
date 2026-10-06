@@ -639,6 +639,8 @@ xhci_allocate_command_ring:
     ; Type = LINK
     ; Toggle Cycle = 1
     ; Cycle = 1
+    ;
+    ; Link TRB rozpoczyna ring z PCS = 1.
     ; ==========================================================================
 
     mov eax, (TRB_TYPE_LINK << TRB_TYPE_SHIFT)
@@ -1357,13 +1359,20 @@ xhci_consume_event:
 ;
 ;   RCX = TRB Control DWORD
 ;   RDX = TRB Parameter QWORD
-;   R8  = TRB Status DWORD/QWORD
+;   R8  = TRB Status DWORD
 ;
 ; WYJŚCIE:
 ;
 ;   RAX = adres wpisanego Command TRB
 ;   RDX = 1 sukces
 ;   RDX = 0 błąd
+;
+; WAŻNE:
+;
+;   RDX jest parametrem komendy.
+;
+;   Nie wolno używać RDX jako tymczasowego rejestru przy obsłudze
+;   Link TRB, ponieważ zniszczyłoby to parametr komendy.
 ;
 ; ==============================================================================
 
@@ -1373,7 +1382,21 @@ xhci_submit_command:
     push r12
     push r13
     push r14
+    push r15
 
+
+    ; ==========================================================================
+    ; Zachowaj parametr komendy.
+    ;
+    ; RDX = TRB Parameter
+    ; ==========================================================================
+
+    mov r15, rdx
+
+
+    ; ==========================================================================
+    ; COMMAND RING
+    ; ==========================================================================
 
     mov rbx, [rel xhci_cmd_ring]
 
@@ -1387,6 +1410,20 @@ xhci_submit_command:
 
     mov r12d, [rel xhci_cmd_enqueue_index]
 
+
+    ; ==========================================================================
+    ; Jeżeli index wskazuje Link TRB, musimy przejść na początek ringa.
+    ;
+    ; Ważne:
+    ;
+    ;   Producer Cycle State zmienia się po przejściu przez Link TRB.
+    ;
+    ;   Parametr komendy pozostaje w R15.
+    ;
+    ; Nie zapisujemy nowego Cycle Bit do Link TRB przed jego użyciem.
+    ; Kontroler musi zobaczyć Link TRB z poprzednim Cycle State.
+    ; ==========================================================================
+
     cmp r12d, XHCI_COMMAND_USABLE_TRBS
 
     jb .index_valid
@@ -1394,34 +1431,11 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; PRZEJŚCIE PRZEZ LINK TRB
-    ;
-    ; Producent zmienia Cycle State po przejściu przez Link TRB.
-    ;
-    ; Link TRB musi mieć aktualny Cycle Bit.
     ; ==========================================================================
 
     xor r12d, r12d
 
     xor byte [rel xhci_cmd_cycle], 1
-
-
-    ; ==========================================================================
-    ; ZAKTUALIZUJ LINK TRB
-    ; ==========================================================================
-
-    lea r13, [rbx + 4080]
-
-    mov eax, dword [r13 + 12]
-
-    and eax, ~TRB_CYCLE
-
-    movzx edx, byte [rel xhci_cmd_cycle]
-
-    and edx, 1
-
-    or eax, edx
-
-    mov dword [r13 + 12], eax
 
 
 .index_valid:
@@ -1440,9 +1454,11 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; PARAMETER
+    ;
+    ; Używamy R15, ponieważ RDX może być potrzebne jako scratch register.
     ; ==========================================================================
 
-    mov qword [r13], rdx
+    mov qword [r13], r15
 
 
     ; ==========================================================================
@@ -1507,6 +1523,7 @@ xhci_submit_command:
     mov edx, 1
 
 
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -1521,6 +1538,7 @@ xhci_submit_command:
     xor edx, edx
 
 
+    pop r15
     pop r14
     pop r13
     pop r12
