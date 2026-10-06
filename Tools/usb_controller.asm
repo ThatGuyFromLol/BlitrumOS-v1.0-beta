@@ -5,9 +5,12 @@
 ;
 ; Funkcje:
 ;   - wyszukiwanie kontrolera USB 3.x / xHCI
+;   - pełny skan PCI:
+;         BUS      = 0..255
+;         DEVICE   = 0..31
+;         FUNCTION = 0..7
 ;   - odczyt BAR0
 ;   - obsługa 32-bitowego i 64-bitowego BAR
-;   - obsługa 64-bitowego BAR
 ;   - przejęcie xHCI od BIOS/UEFI
 ;   - zapamiętanie PCI BDF
 ;   - zapamiętanie PCI Interrupt Line / Pin
@@ -24,6 +27,7 @@
 ;   RDX = Interrupt Pin
 ;
 ;==============================================================================
+
 bits 64
 
 
@@ -82,6 +86,12 @@ XHCI_MAX_EXT_CAPS       equ 256
 ;   xhci_pci_irq
 ;   xhci_pci_pin
 ;
+; Pełny skan PCI:
+;
+;   256 magistral
+;   32 urządzenia na magistralę
+;   8 funkcji na urządzenie
+;
 ;==============================================================================
 
 find_usb_controllers:
@@ -93,6 +103,16 @@ find_usb_controllers:
 
     ;==========================================================================
     ; BUS = 0
+    ;
+    ; BH przechowuje numer magistrali.
+    ; BL przechowuje numer urządzenia.
+    ;
+    ; Ponieważ BH jest 8-bitowe, pełny zakres 0..255 obsługujemy przez
+    ; wykrycie przepełnienia:
+    ;
+    ;   255 + 1 = 0
+    ;
+    ; Po takim przepełnieniu kończymy skan.
     ;==========================================================================
 
     xor ebx, ebx
@@ -169,6 +189,10 @@ find_usb_controllers:
 
     ;==========================================================================
     ; FUNCTION++
+    ;
+    ; Zakres:
+    ;
+    ;   0..7
     ;==========================================================================
 
     inc ch
@@ -180,6 +204,10 @@ find_usb_controllers:
 
     ;==========================================================================
     ; DEVICE++
+    ;
+    ; Zakres:
+    ;
+    ;   0..31
     ;==========================================================================
 
     inc bl
@@ -191,13 +219,28 @@ find_usb_controllers:
 
     ;==========================================================================
     ; BUS++
+    ;
+    ; Zakres:
+    ;
+    ;   0..255
+    ;
+    ; Nie możemy zrobić:
+    ;
+    ;   cmp bh, 256
+    ;
+    ; ponieważ BH ma tylko 8 bitów.
+    ;
+    ; Zamiast tego wykorzystujemy naturalne przepełnienie:
+    ;
+    ;   255 -> 0
+    ;
+    ; Jeżeli po INC BH != 0, przechodzimy do następnej magistrali.
+    ; Jeżeli BH == 0, oznacza to że zakończyliśmy pełny zakres 0..255.
     ;==========================================================================
 
     inc bh
 
-    cmp bh, 32
-
-    jne .loop_bus
+    jnz .loop_bus
 
 
     ;==========================================================================
@@ -343,19 +386,25 @@ find_usb_controllers:
 
 .handshake_start:
 
-    ; RAX = baza MMIO.
+    ;==========================================================================
+    ; RAX = baza MMIO
+    ;==========================================================================
+
     mov rax, rdx
 
     call xhci_bios_handshake
 
     ; CF = 1 oznacza błąd handshake.
+
     jc .controller_error
 
 
     ;==========================================================================
     ; SUKCES
     ;
-    ; xhci_bios_handshake przywraca RAX = baza MMIO.
+    ; xhci_bios_handshake przywraca:
+    ;
+    ;   RAX = baza MMIO
     ;==========================================================================
 
     pop rdx
@@ -725,6 +774,7 @@ xhci_get_pci_function:
 section .data
 
 align 8
+
 
 ;==============================================================================
 ; PCI LOCATION
