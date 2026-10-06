@@ -101,6 +101,13 @@ extern gui_init
 extern gui_draw_window
 extern gui_refresh_screen
 
+; gui_hdr.asm eksportuje tę zmienną.
+;
+;   0 = RGB
+;   1 = BGR
+;
+extern gui_pixel_format
+
 ; =============================================================================
 ; STORAGE
 ; =============================================================================
@@ -147,7 +154,9 @@ extern shell_run
 ; AHS-TUS / UPDATE
 ; =============================================================================
 ;
-; Tools/ahs-tus.asm eksportuje update_system_init.
+; Tools/ahs-tus.asm eksportuje:
+;
+;   update_system_init
 ;
 ; Nie istnieje ahs_tus_init.
 ;
@@ -199,28 +208,6 @@ BOOTINFO_ACPI_RSDP         equ 0x40
 
 ; =============================================================================
 ; LAPIC TIMER
-; =============================================================================
-;
-; 500 us = 0.5 ms.
-;
-; Scheduler base tick:
-;
-;       500 microseconds
-;
-; This is intentionally kept as a single constant for now.
-;
-; Later:
-;
-;       TGFS TAG
-;          |
-;          v
-;   scheduler policy
-;          |
-;          v
-;   lapic_timer_init_us()
-;
-; can dynamically change the quantum.
-;
 ; =============================================================================
 
 DEFAULT_SCHEDULER_TICK_US   equ 500
@@ -308,13 +295,11 @@ _start:
 ; PHYSICAL MEMORY MANAGER
 ; =========================================================================
 ;
-; POPRAWNE ABI pmm_init:
+; ABI pmm_init:
 ;
 ;   RCX = EFI descriptor size
 ;   R8  = memory map size
 ;   R9  = memory map address
-;
-; Tools/ppm.asm używa dokładnie tych rejestrów.
 ;
 ; =========================================================================
 
@@ -364,23 +349,44 @@ _start:
 ; GUI
 ; =========================================================================
 ;
-; gui_init ABI:
+; POPRAWNE ABI gui_init z Tools/gui_hdr.asm:
 ;
-;   RDI = framebuffer
-;   RSI = framebuffer size
-;   EDX = width
-;   ECX = height
-;   R8D = pixels per scanline
-;   R9D = pixel format
+;   RCX  = framebuffer
+;   EDX  = width
+;   R8D  = height
+;   R9D  = pixels per scanline
+;
+; Pixel format NIE jest przekazywany jako argument.
+;
+; Jest ustawiany przez eksportowaną zmienną:
+;
+;   gui_pixel_format
+;
+;   0 = RGB
+;   1 = BGR
+;
+; Framebuffer size jest przechowywany w kernel_framebuffer_size,
+; ale gui_init nie przyjmuje go jako argumentu.
 ;
 ; =========================================================================
 
-    mov rdi, [rel kernel_framebuffer]
-    mov rsi, [rel kernel_framebuffer_size]
+    mov eax, [rel kernel_pixel_format]
+
+    cmp eax, 1
+    jbe .gui_pixel_format_valid
+
+    ; Nieobsługiwany format GOP.
+    ; Domyślnie użyj RGB.
+    xor eax, eax
+
+.gui_pixel_format_valid:
+
+    mov [rel gui_pixel_format], eax
+
+    mov rcx, [rel kernel_framebuffer]
     mov edx, [rel kernel_screen_width]
-    mov ecx, [rel kernel_screen_height]
-    mov r8d, [rel kernel_screen_pps]
-    mov r9d, [rel kernel_pixel_format]
+    mov r8d, [rel kernel_screen_height]
+    mov r9d, [rel kernel_screen_pps]
 
     call gui_init
 
@@ -457,25 +463,6 @@ _start:
 ; =========================================================================
 ; AUDIO
 ; =========================================================================
-;
-; Tools/audio_hca.asm:
-;
-;   find_hda_controller
-;   init_hda_controller
-;
-; API:
-;
-;   RAX = HDA MMIO address
-;   CF  = 0 success
-;   CF  = 1 failure
-;
-; init:
-;
-;   RAX = HDA MMIO address
-;   CF  = 0 success
-;   CF  = 1 failure
-;
-; =========================================================================
 
     call find_hda_controller
 
@@ -503,14 +490,6 @@ _start:
 ; =========================================================================
 ; AHS-TUS / UPDATE
 ; =========================================================================
-;
-; Tools/ahs-tus.asm nie posiada ahs_tus_init.
-;
-; Jedyną funkcją inicjalizującą system jest:
-;
-;   update_system_init
-;
-; =========================================================================
 
     call update_system_init
 
@@ -528,10 +507,6 @@ _start:
 
 ; =========================================================================
 ; LAPIC TIMER
-; =========================================================================
-;
-; 500 us = 0.5 ms.
-;
 ; =========================================================================
 
     cmp byte [rel lapic_active], 1
@@ -760,10 +735,17 @@ kernel_draw_initial_gui:
 
     push rbx
 
-    mov edi, 100
-    mov esi, 80
-    mov edx, 640
-    mov ecx, 420
+    mov ecx, 100
+    mov edx, 80
+    mov r8d, 640
+    mov r9d, 420
+
+    ; gui_draw_window:
+    ;
+    ; ECX = X
+    ; EDX = Y
+    ; R8D = width
+    ; R9D = height
 
     call gui_draw_window
 
