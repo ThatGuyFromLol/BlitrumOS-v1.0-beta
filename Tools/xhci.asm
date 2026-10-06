@@ -196,9 +196,25 @@ xhci_erst:
 
 align 4
 
+; Następny TRB, który zostanie zapisany przez software.
+;
+; Zakres:
+;
+;   0 .. 254 = Command TRB
+;   255       = Link TRB
+;
+; Software nie zapisuje komendy bezpośrednio do TRB 255.
 xhci_cmd_enqueue_index:
     dd 0
 
+; Producer Cycle State.
+;
+; Początkowo = 1.
+;
+; Po przejściu przez Link TRB z Toggle Cycle:
+;
+;   1 -> 0
+;   0 -> 1
 xhci_cmd_cycle:
     db 1
 
@@ -509,7 +525,7 @@ xhci_init:
 ;
 ;   256 wpisów x 8 bajtów = 2048 bajtów.
 ;
-; Cała strona jest zerowana, dzięki czemu wpisy urządzeń są początkowo NULL.
+; Cała strona jest zerowana.
 ;
 ; ==============================================================================
 
@@ -585,6 +601,12 @@ xhci_allocate_dcbaa:
 ;   TRB 0..254 = command
 ;   TRB 255    = Link TRB
 ;
+; Link TRB:
+;
+;   Type = LINK
+;   Toggle Cycle = 1
+;   Cycle = 1
+;
 ; ==============================================================================
 
 xhci_allocate_command_ring:
@@ -623,13 +645,19 @@ xhci_allocate_command_ring:
     lea r13, [rbx + 4080]
 
 
+    ; --------------------------------------------------------------------------
     ; Parameter = ring base.
+    ; --------------------------------------------------------------------------
+
     mov rax, rbx
 
     mov qword [r13], rax
 
 
+    ; --------------------------------------------------------------------------
     ; Status = 0.
+    ; --------------------------------------------------------------------------
+
     mov qword [r13 + 8], 0
 
 
@@ -640,7 +668,7 @@ xhci_allocate_command_ring:
     ; Toggle Cycle = 1
     ; Cycle = 1
     ;
-    ; Link TRB rozpoczyna ring z PCS = 1.
+    ; Pierwszy obieg ringa używa PCS = 1.
     ; ==========================================================================
 
     mov eax, (TRB_TYPE_LINK << TRB_TYPE_SHIFT)
@@ -1328,8 +1356,6 @@ xhci_consume_event:
     ; ERDP
     ;
     ; bit 3 = EHB.
-    ;
-    ; Ustawienie EHB informuje kontroler, że host obsłużył event.
     ; ==========================================================================
 
     mov rax, rdx
@@ -1367,13 +1393,6 @@ xhci_consume_event:
 ;   RDX = 1 sukces
 ;   RDX = 0 błąd
 ;
-; WAŻNE:
-;
-;   RDX jest parametrem komendy.
-;
-;   Nie wolno używać RDX jako tymczasowego rejestru przy obsłudze
-;   Link TRB, ponieważ zniszczyłoby to parametr komendy.
-;
 ; ==============================================================================
 
 xhci_submit_command:
@@ -1386,9 +1405,10 @@ xhci_submit_command:
 
 
     ; ==========================================================================
-    ; Zachowaj parametr komendy.
+    ; ZACHOWAJ PARAMETR KOMENDY
     ;
-    ; RDX = TRB Parameter
+    ; RDX jest parametrem TRB.
+    ; Nie używamy go już jako scratch register.
     ; ==========================================================================
 
     mov r15, rdx
@@ -1412,37 +1432,78 @@ xhci_submit_command:
 
 
     ; ==========================================================================
-    ; Jeżeli index wskazuje Link TRB, musimy przejść na początek ringa.
+    ; JEŻELI DOSZLIŚMY DO LINK TRB
     ;
-    ; Ważne:
+    ; Najpierw przygotowujemy Link TRB dla aktualnego Producer Cycle State.
     ;
-    ;   Producer Cycle State zmienia się po przejściu przez Link TRB.
+    ; Dopiero potem przechodzimy logicznie na początek ringa i wykonujemy
+    ; Toggle Cycle.
     ;
-    ;   Parametr komendy pozostaje w R15.
+    ; To jest kluczowe:
     ;
-    ; Nie zapisujemy nowego Cycle Bit do Link TRB przed jego użyciem.
-    ; Kontroler musi zobaczyć Link TRB z poprzednim Cycle State.
+    ;   Link TRB musi być widziany przez kontroler z aktualnym PCS.
+    ;
+    ; Po przejściu przez Link TRB kontroler wykona Toggle Cycle, a software
+    ; przechodzi na nowy Producer Cycle State.
     ; ==========================================================================
 
     cmp r12d, XHCI_COMMAND_USABLE_TRBS
 
-    jb .index_valid
+    jb .command_index_valid
 
 
     ; ==========================================================================
-    ; PRZEJŚCIE PRZEZ LINK TRB
+    ; ADRES LINK TRB
     ; ==========================================================================
 
-    xor r12d, r12d
+    lea r13, [rbx + (XHCI_COMMAND_USABLE_TRBS * 16)]
+
+
+    ; ==========================================================================
+    ; ODCZYTAJ CONTROL LINK TRB
+    ; ==========================================================================
+
+    mov eax, dword [r13 + 12]
+
+    ; Zachowaj wszystkie bity poza Cycle.
+    and eax, ~TRB_CYCLE
+
+
+    ; ==========================================================================
+    ; USTAW CYCLE LINK TRB = AKTUALNY PCS
+    ; ==========================================================================
+
+    movzx edx, byte [rel xhci_cmd_cycle]
+
+    and edx, 1
+
+    or eax, edx
+
+    mov dword [r13 + 12], eax
+
+
+    ; ==========================================================================
+    ; NOWY PRODUCER CYCLE STATE
+    ;
+    ; Link TRB ma Toggle Cycle = 1.
+    ; Kontroler po przejściu przez Link TRB przełączy własny CCS.
+    ; ==========================================================================
 
     xor byte [rel xhci_cmd_cycle], 1
 
 
-.index_valid:
+    ; ==========================================================================
+    ; WRÓĆ NA POCZĄTEK RINGA
+    ; ==========================================================================
+
+    xor r12d, r12d
+
+
+.command_index_valid:
 
 
     ; ==========================================================================
-    ; TRB ADDRESS
+    ; ADRES COMMAND TRB
     ; ==========================================================================
 
     mov r13, r12
@@ -1454,8 +1515,6 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; PARAMETER
-    ;
-    ; Używamy R15, ponieważ RDX może być potrzebne jako scratch register.
     ; ==========================================================================
 
     mov qword [r13], r15
@@ -1463,8 +1522,6 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; STATUS
-    ;
-    ; Tylko dolne 32 bity są polem Status TRB.
     ; ==========================================================================
 
     mov dword [r13 + 8], r8d
@@ -1472,6 +1529,9 @@ xhci_submit_command:
 
     ; ==========================================================================
     ; CONTROL
+    ;
+    ; Zawsze wymuszamy właściwy Cycle Bit.
+    ; Pozostałe pola Control przekazane przez caller pozostają bez zmian.
     ; ==========================================================================
 
     mov eax, ecx
@@ -1490,7 +1550,7 @@ xhci_submit_command:
 
 
     ; ==========================================================================
-    ; ADVANCE
+    ; ADVANCE ENQUEUE INDEX
     ; ==========================================================================
 
     inc r12d
@@ -1501,7 +1561,7 @@ xhci_submit_command:
     ; ==========================================================================
     ; DOORBELL 0
     ;
-    ; Doorbell 0 jest doorbellem Host Controller Command Ring.
+    ; Doorbell 0 = Host Controller Command Ring.
     ; Target = 0.
     ; ==========================================================================
 
@@ -1552,15 +1612,7 @@ xhci_submit_command:
 ;
 ; Włącza sprzętowe przerwania xHCI dla interruptera 0.
 ;
-; UWAGA:
-;   Funkcja NIE odmaskowuje IOAPIC.
-;
-; Kolejność:
-;
-;   1. wyczyść zalegające EINT
-;   2. wyczyść IMAN.IP
-;   3. ustaw IMAN.IE
-;   4. ustaw USBCMD.INTE
+; Funkcja NIE odmaskowuje IOAPIC.
 ;
 ; ==============================================================================
 
@@ -1591,9 +1643,6 @@ xhci_enable_interrupts:
 
     ; ==========================================================================
     ; CLEAR USBSTS.EINT
-    ;
-    ; USBSTS bit 3 = Event Interrupt
-    ; RW1C
     ; ==========================================================================
 
     mov edx, XHCI_STS_EINT
@@ -1603,9 +1652,6 @@ xhci_enable_interrupts:
 
     ; ==========================================================================
     ; CLEAR IMAN.IP
-    ;
-    ; IMAN bit 0 = Interrupt Pending
-    ; RW1C
     ; ==========================================================================
 
     mov edx, XHCI_IMAN_IP
