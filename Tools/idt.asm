@@ -3,32 +3,21 @@
 ; x86-64 / NASM
 ; ==============================================================================
 ;
-; ARCHITEKTURA:
+; VECTORY:
 ;
-;   CPU Exceptions   0x00 - 0x1F -> BSOD handler
-;   LAPIC Timer      0x20       -> lapic_timer_handler
-;   xHCI             0x28       -> isr_xhci_handler
-;   Scheduler / INT80 0x80      -> scheduler_dispatch
+;   0x00 - 0x1F  CPU Exceptions -> bsod_handler
+;   0x20         LAPIC Timer    -> lapic_timer_handler
+;   0x28         xHCI          -> isr_xhci_handler
+;   0x80         INT 0x80       -> scheduler_dispatch
+;   pozostałe    -> bezpieczny ignore handler
 ;
-; WAŻNE:
+; PIC:
 ;
-;   LAPIC Timer jest właścicielem vector 0x20.
-;   PIT IRQ0 NIE jest routowany do 0x20.
+;   całkowicie zamaskowany
 ;
-;   PIC pozostaje całkowicie zamaskowany.
+; GDT:
 ;
-;   Wszystkie wyjątki CPU są normalizowane do:
-;
-;       [RSP + 0]  = exception vector
-;       [RSP + 8]  = error code
-;       [RSP + 16] = RIP
-;       [RSP + 24] = CS
-;       [RSP + 32] = RFLAGS
-;       [RSP + 40] = RSP
-;       [RSP + 48] = SS (jeśli zmiana privilege level)
-;
-;   Dzięki temu Tools/bosd.asm może obsługiwać wszystkie wyjątki
-;   jednym handlerem.
+;   0x18 = Kernel Code
 ;
 ; ==============================================================================
 
@@ -57,34 +46,16 @@ extern scheduler_dispatch
 ; CONSTANTS
 ; ==============================================================================
 
-IDT_ENTRIES       equ 256
-IDT_ENTRY_SIZE    equ 16
+IDT_ENTRIES     equ 256
+IDT_ENTRY_SIZE  equ 16
 
 KERNEL_CODE_SELECTOR equ 0x18
 
-
-; ==============================================================================
-; INTERRUPT VECTORS
-; ==============================================================================
-
-LAPIC_TIMER_VECTOR  equ 0x20
+LAPIC_TIMER_VECTOR   equ 0x20
 USB_INTERRUPT_VECTOR equ 0x28
-SCHEDULER_VECTOR    equ 0x80
+SCHEDULER_VECTOR     equ 0x80
 
-
-; ==============================================================================
-; IDT GATE ATTRIBUTES
-; ==============================================================================
-
-; Present = 1
-; DPL     = 0
-; Type    = 1110b
-;
-; 1000 1110b = 0x8E
-;
-; 64-bit Interrupt Gate.
-;
-IDT_INTERRUPT_GATE equ 0x8E
+IDT_INTERRUPT_GATE   equ 0x8E
 
 
 ; ==============================================================================
@@ -104,17 +75,17 @@ PIC2_VECTOR equ 0x28
 
 
 ; ==============================================================================
-; SECTION .data
+; DATA
 ; ==============================================================================
 
 section .data
 
-
-; ==============================================================================
-; IDT DESCRIPTOR
-; ==============================================================================
-
 align 16
+
+
+; ==============================================================================
+; IDTR
+; ==============================================================================
 
 idt_descriptor:
 
@@ -123,7 +94,7 @@ idt_descriptor:
 
 
 ; ==============================================================================
-; IDT TABLE
+; IDT
 ; ==============================================================================
 
 align 16
@@ -135,10 +106,6 @@ idt_table:
 
 ; ==============================================================================
 ; EXCEPTION HANDLER TABLE
-;
-; Każdy wpis zawiera 64-bitowy adres odpowiedniego stubu.
-;
-; Dzięki temu nie musimy zakładać, że każdy stub ma identyczną długość.
 ; ==============================================================================
 
 align 8
@@ -180,7 +147,7 @@ exception_handler_table:
 
 
 ; ==============================================================================
-; SECTION .text
+; TEXT
 ; ==============================================================================
 
 section .text
@@ -189,14 +156,8 @@ section .text
 ; ==============================================================================
 ; idt_init
 ;
-; Przygotowuje:
+; Inicializuje pełne IDT.
 ;
-;   0x00 - 0x1F -> CPU exceptions
-;   0x20         -> LAPIC Timer
-;   0x28         -> xHCI
-;   0x80         -> scheduler software interrupt
-;
-; PIC zostaje całkowicie zamaskowany.
 ; ==============================================================================
 
 idt_init:
@@ -207,10 +168,7 @@ idt_init:
     ; ==========================================================================
     ; PIC
     ;
-    ; Remapujemy i natychmiast maskujemy.
-    ;
-    ; LAPIC Timer nadal może używać 0x20.
-    ; PIC IRQ0 nie będzie jednak generował tego vectora.
+    ; Remap + całkowite maskowanie.
     ; ==========================================================================
 
     call pic_remap
@@ -230,6 +188,35 @@ idt_init:
 
 
     ; ==========================================================================
+    ; DOMYŚLNY HANDLER DLA WSZYSTKICH 256 WEKTORÓW
+    ;
+    ; Dzięki temu żaden nieużywany wektor nie prowadzi do pustego IDT.
+    ; ==========================================================================
+
+    xor ecx, ecx
+
+
+.default_vector_loop:
+
+    cmp ecx, IDT_ENTRIES
+
+    jae .default_vectors_done
+
+
+    lea rdx, [rel isr_unhandled]
+
+    call idt_set_gate
+
+
+    inc ecx
+
+    jmp .default_vector_loop
+
+
+.default_vectors_done:
+
+
+    ; ==========================================================================
     ; CPU EXCEPTIONS 0x00 - 0x1F
     ; ==========================================================================
 
@@ -239,28 +226,15 @@ idt_init:
 .exception_loop:
 
     cmp ecx, 32
+
     jae .exceptions_done
 
-
-    ; --------------------------------------------------------------------------
-    ; Pobierz adres stubu:
-    ;
-    ; exception_handler_table[vector]
-    ; --------------------------------------------------------------------------
 
     lea rdx, [rel exception_handler_table]
 
     mov rax, rcx
 
     mov rdx, [rdx + rax * 8]
-
-
-    ; --------------------------------------------------------------------------
-    ; Ustaw gate.
-    ;
-    ; RCX = vector
-    ; RDX = handler
-    ; --------------------------------------------------------------------------
 
     call idt_set_gate
 
@@ -276,14 +250,7 @@ idt_init:
     ; ==========================================================================
     ; LAPIC TIMER
     ;
-    ; 0x20 jest zarezerwowany dla LAPIC Timer.
-    ;
-    ; lapic_timer_handler:
-    ;
-    ;     EOI
-    ;     JMP scheduler_dispatch
-    ;
-    ; scheduler_dispatch kończy się IRETQ.
+    ; vector 0x20
     ; ==========================================================================
 
     mov rcx, LAPIC_TIMER_VECTOR
@@ -296,8 +263,7 @@ idt_init:
     ; ==========================================================================
     ; xHCI
     ;
-    ; Obecny handler jest przygotowany do późniejszego routingu
-    ; przez IOAPIC/MSI/MSI-X.
+    ; vector 0x28
     ; ==========================================================================
 
     mov rcx, USB_INTERRUPT_VECTOR
@@ -310,13 +276,7 @@ idt_init:
     ; ==========================================================================
     ; INT 0x80
     ;
-    ; Aktualnie:
-    ;
-    ;     INT 0x80 -> scheduler_dispatch
-    ;
-    ; Gate ma DPL=0, więc może być używany przez ring 0.
-    ;
-    ; scheduler_dispatch kończy się IRETQ.
+    ; vector 0x80
     ; ==========================================================================
 
     mov rcx, SCHEDULER_VECTOR
@@ -344,16 +304,6 @@ idt_init:
 ;   RCX = vector 0..255
 ;   RDX = handler address
 ;
-; FORMAT 64-BIT INTERRUPT GATE:
-;
-;   +0  WORD       offset[15:0]
-;   +2  WORD       selector
-;   +4  BYTE       IST
-;   +5  BYTE       type/attributes
-;   +6  WORD       offset[31:16]
-;   +8  DWORD      offset[63:32]
-;   +12 DWORD      reserved
-;
 ; ==============================================================================
 
 idt_set_gate:
@@ -363,17 +313,16 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Walidacja vector
+    ; Walidacja
     ; ==========================================================================
 
     cmp rcx, 255
+
     ja .done
 
 
     ; ==========================================================================
-    ; Adres wpisu:
-    ;
-    ; IDT + vector * 16
+    ; Adres wpisu
     ; ==========================================================================
 
     lea rdi, [rel idt_table]
@@ -386,21 +335,21 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; Handler address
+    ; Handler
     ; ==========================================================================
 
     mov rax, rdx
 
 
     ; ==========================================================================
-    ; offset[15:0]
+    ; offset 15:0
     ; ==========================================================================
 
     mov word [rdi + 0], ax
 
 
     ; ==========================================================================
-    ; CODE SEGMENT
+    ; CS
     ; ==========================================================================
 
     mov word [rdi + 2], KERNEL_CODE_SELECTOR
@@ -409,9 +358,7 @@ idt_set_gate:
     ; ==========================================================================
     ; IST
     ;
-    ; 0 = użyj aktualnego RSP.
-    ;
-    ; Dedykowany IST dla Double Fault można dodać później wraz z TSS.
+    ; Na tym etapie brak TSS/IST.
     ; ==========================================================================
 
     mov byte [rdi + 4], 0
@@ -419,13 +366,17 @@ idt_set_gate:
 
     ; ==========================================================================
     ; TYPE / ATTRIBUTES
+    ;
+    ; Present
+    ; DPL 0
+    ; Interrupt Gate
     ; ==========================================================================
 
     mov byte [rdi + 5], IDT_INTERRUPT_GATE
 
 
     ; ==========================================================================
-    ; offset[31:16]
+    ; offset 31:16
     ; ==========================================================================
 
     shr rax, 16
@@ -434,7 +385,7 @@ idt_set_gate:
 
 
     ; ==========================================================================
-    ; offset[63:32]
+    ; offset 63:32
     ; ==========================================================================
 
     shr rax, 16
@@ -460,13 +411,7 @@ idt_set_gate:
 ; ==============================================================================
 ; PIC REMAP
 ;
-; PIC jest:
-;
-;   1. inicjalizowany,
-;   2. remapowany,
-;   3. całkowicie maskowany.
-;
-; Dzięki temu klasyczny PIC nie konkuruje z LAPIC.
+; PIC zostaje po inicjalizacji całkowicie zamaskowany.
 ; ==============================================================================
 
 pic_remap:
@@ -487,9 +432,6 @@ pic_remap:
 
     ; ==========================================================================
     ; ICW2
-    ;
-    ; Master = 0x20
-    ; Slave  = 0x28
     ; ==========================================================================
 
     mov al, PIC1_VECTOR
@@ -504,12 +446,6 @@ pic_remap:
 
     ; ==========================================================================
     ; ICW3
-    ;
-    ; Master:
-    ;   Slave pod IRQ2.
-    ;
-    ; Slave:
-    ;   podłączony jako IRQ2.
     ; ==========================================================================
 
     mov al, 0x04
@@ -524,8 +460,6 @@ pic_remap:
 
     ; ==========================================================================
     ; ICW4
-    ;
-    ; 8086 mode.
     ; ==========================================================================
 
     mov al, 0x01
@@ -535,7 +469,7 @@ pic_remap:
 
 
     ; ==========================================================================
-    ; MASKUJ WSZYSTKIE IRQ
+    ; MASK ALL
     ; ==========================================================================
 
     mov al, 0xFF
@@ -553,14 +487,16 @@ pic_remap:
 ; ==============================================================================
 ; INT 0x80
 ;
-; Scheduler software interrupt.
+; Nie używamy CALL.
 ;
-; WAŻNE:
+; scheduler_dispatch:
 ;
-; JMP, nie CALL.
+;   zapisuje GPR
+;   zapisuje RSP
+;   wybiera task
+;   odtwarza GPR
+;   wykonuje IRETQ
 ;
-; scheduler_dispatch musi dostać bezpośrednio oryginalną ramkę
-; przerwania i sam wykonać IRETQ.
 ; ==============================================================================
 
 isr_int80_handler:
@@ -569,97 +505,134 @@ isr_int80_handler:
 
 
 ; ==============================================================================
-; CPU EXCEPTION STUBS
+; DEFAULT / UNHANDLED INTERRUPT
 ;
-; BSOD oczekuje:
+; Wszystkie nieużywane wektory trafiają tutaj.
 ;
-;   [RSP + 0]  = vector
-;   [RSP + 8]  = error code
-;   [RSP + 16] = RIP
-;   [RSP + 24] = CS
-;   [RSP + 32] = RFLAGS
-;   [RSP + 40] = RSP
-;   [RSP + 48] = SS
+; CPU dla zwykłego interrupt gate odkłada:
 ;
-; CPU automatycznie dokłada error code tylko dla wybranych wyjątków.
+;   RIP
+;   CS
+;   RFLAGS
 ;
-; Dla wyjątków bez error code dokładamy sztuczne:
+; Nie dokładamy niczego na stos.
 ;
-;   push 0
-;
-; Dla wyjątków z error code zostawiamy prawdziwy error code na stosie.
-;
-; Następnie:
-;
-;   push vector
-;
-; i przechodzimy do bsod_handler.
+; IRETQ przywraca dokładnie pierwotny kontekst.
 ;
 ; ==============================================================================
 
+isr_unhandled:
+
+    iretq
+
 
 ; ==============================================================================
-; EXCEPTIONS BEZ ERROR CODE
+; CPU EXCEPTION 0
+; #DE Divide Error
 ; ==============================================================================
 
 isr_exception_0:
 
     push qword 0
     push qword 0
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 1
+; #DB Debug
+; ==============================================================================
 
 isr_exception_1:
 
     push qword 0
     push qword 1
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 2
+; NMI
+; ==============================================================================
 
 isr_exception_2:
 
     push qword 0
     push qword 2
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 3
+; #BP Breakpoint
+; ==============================================================================
 
 isr_exception_3:
 
     push qword 0
     push qword 3
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 4
+; #OF Overflow
+; ==============================================================================
 
 isr_exception_4:
 
     push qword 0
     push qword 4
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 5
+; #BR Bound Range
+; ==============================================================================
 
 isr_exception_5:
 
     push qword 0
     push qword 5
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 6
+; #UD Invalid Opcode
+; ==============================================================================
 
 isr_exception_6:
 
     push qword 0
     push qword 6
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 7
+; #NM Device Not Available
+; ==============================================================================
 
 isr_exception_7:
 
     push qword 0
     push qword 7
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 8 - DOUBLE FAULT
+; CPU EXCEPTION 8
+; #DF Double Fault
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -667,24 +640,26 @@ isr_exception_7:
 isr_exception_8:
 
     push qword 8
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 9 - COPROCESSOR SEGMENT OVERRUN
-;
-; Brak error code.
+; CPU EXCEPTION 9
+; Coprocessor Segment Overrun
 ; ==============================================================================
 
 isr_exception_9:
 
     push qword 0
     push qword 9
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 10 - INVALID TSS
+; CPU EXCEPTION 10
+; #TS Invalid TSS
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -692,11 +667,13 @@ isr_exception_9:
 isr_exception_10:
 
     push qword 10
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 11 - SEGMENT NOT PRESENT
+; CPU EXCEPTION 11
+; #NP Segment Not Present
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -704,11 +681,13 @@ isr_exception_10:
 isr_exception_11:
 
     push qword 11
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 12 - STACK SEGMENT FAULT
+; CPU EXCEPTION 12
+; #SS Stack Segment Fault
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -716,11 +695,13 @@ isr_exception_11:
 isr_exception_12:
 
     push qword 12
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 13 - GENERAL PROTECTION FAULT
+; CPU EXCEPTION 13
+; #GP General Protection Fault
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -728,11 +709,13 @@ isr_exception_12:
 isr_exception_13:
 
     push qword 13
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 14 - PAGE FAULT
+; CPU EXCEPTION 14
+; #PF Page Fault
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -740,37 +723,39 @@ isr_exception_13:
 isr_exception_14:
 
     push qword 14
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 15 - RESERVED
-;
-; Brak error code.
+; CPU EXCEPTION 15
+; RESERVED
 ; ==============================================================================
 
 isr_exception_15:
 
     push qword 0
     push qword 15
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 16 - x87 FLOATING POINT
-;
-; Brak error code.
+; CPU EXCEPTION 16
+; #MF x87 Floating Point
 ; ==============================================================================
 
 isr_exception_16:
 
     push qword 0
     push qword 16
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 17 - ALIGNMENT CHECK
+; CPU EXCEPTION 17
+; #AC Alignment Check
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -778,50 +763,52 @@ isr_exception_16:
 isr_exception_17:
 
     push qword 17
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 18 - MACHINE CHECK
-;
-; Brak error code.
+; CPU EXCEPTION 18
+; #MC Machine Check
 ; ==============================================================================
 
 isr_exception_18:
 
     push qword 0
     push qword 18
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 19 - SIMD FLOATING POINT
-;
-; Brak error code.
+; CPU EXCEPTION 19
+; #XM SIMD Floating Point
 ; ==============================================================================
 
 isr_exception_19:
 
     push qword 0
     push qword 19
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 20 - VIRTUALIZATION
-;
-; Brak error code.
+; CPU EXCEPTION 20
+; #VE Virtualization
 ; ==============================================================================
 
 isr_exception_20:
 
     push qword 0
     push qword 20
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 21 - CONTROL PROTECTION
+; CPU EXCEPTION 21
+; #CP Control Protection
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -829,66 +816,104 @@ isr_exception_20:
 isr_exception_21:
 
     push qword 21
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTIONS 22-28
-;
-; Reserved.
+; CPU EXCEPTION 22
+; RESERVED
 ; ==============================================================================
 
 isr_exception_22:
 
     push qword 0
     push qword 22
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 23
+; RESERVED
+; ==============================================================================
 
 isr_exception_23:
 
     push qword 0
     push qword 23
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 24
+; RESERVED
+; ==============================================================================
 
 isr_exception_24:
 
     push qword 0
     push qword 24
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 25
+; RESERVED
+; ==============================================================================
 
 isr_exception_25:
 
     push qword 0
     push qword 25
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 26
+; RESERVED
+; ==============================================================================
 
 isr_exception_26:
 
     push qword 0
     push qword 26
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 27
+; RESERVED
+; ==============================================================================
 
 isr_exception_27:
 
     push qword 0
     push qword 27
+
     jmp bsod_handler
 
+
+; ==============================================================================
+; CPU EXCEPTION 28
+; RESERVED
+; ==============================================================================
 
 isr_exception_28:
 
     push qword 0
     push qword 28
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 29 - VMM COMMUNICATION EXCEPTION
+; CPU EXCEPTION 29
+; #VC VMM Communication Exception
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -896,11 +921,13 @@ isr_exception_28:
 isr_exception_29:
 
     push qword 29
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 30 - SECURITY EXCEPTION
+; CPU EXCEPTION 30
+; #SX Security Exception
 ;
 ; CPU dostarcza error code.
 ; ==============================================================================
@@ -908,15 +935,18 @@ isr_exception_29:
 isr_exception_30:
 
     push qword 30
+
     jmp bsod_handler
 
 
 ; ==============================================================================
-; EXCEPTION 31 - RESERVED
+; CPU EXCEPTION 31
+; RESERVED
 ; ==============================================================================
 
 isr_exception_31:
 
     push qword 0
     push qword 31
+
     jmp bsod_handler
