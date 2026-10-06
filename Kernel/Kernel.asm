@@ -117,7 +117,18 @@ extern tgfs_load_and_map_file
 ; =============================================================================
 
 extern xhci_init
-extern audio_init
+
+; AUDIO HCA / HD AUDIO
+;
+; Tools/audio_hca.asm eksportuje:
+;
+;   find_hda_controller
+;   init_hda_controller
+;
+; Nie istnieje symbol audio_init.
+;
+extern find_hda_controller
+extern init_hda_controller
 
 ; =============================================================================
 ; SCHEDULER
@@ -135,8 +146,11 @@ extern shell_run
 ; =============================================================================
 ; AHS-TUS / UPDATE
 ; =============================================================================
-
-extern ahs_tus_init
+;
+; Tools/ahs-tus.asm eksportuje update_system_init.
+;
+; Nie istnieje ahs_tus_init.
+;
 extern update_system_init
 
 ; =============================================================================
@@ -217,85 +231,78 @@ DEFAULT_SCHEDULER_TICK_US   equ 500
 
 _start:
 
-cli
-
+    cli
 
 ; =========================================================================
 ; SAVE BOOTINFO
 ; =========================================================================
 
-mov rbx, rcx
+    mov rbx, rcx
 
-test rbx, rbx
-jz kernel_fatal_bootinfo
+    test rbx, rbx
+    jz kernel_fatal_bootinfo
 
-mov [rel bootinfo_ptr], rbx
-
+    mov [rel bootinfo_ptr], rbx
 
 ; =========================================================================
 ; FRAMEBUFFER
 ; =========================================================================
 
-mov rax, [rbx + BOOTINFO_FRAMEBUFFER]
-mov [rel kernel_framebuffer], rax
+    mov rax, [rbx + BOOTINFO_FRAMEBUFFER]
+    mov [rel kernel_framebuffer], rax
 
-mov rax, [rbx + BOOTINFO_FB_SIZE]
-mov [rel kernel_framebuffer_size], rax
+    mov rax, [rbx + BOOTINFO_FB_SIZE]
+    mov [rel kernel_framebuffer_size], rax
 
-mov eax, [rbx + BOOTINFO_WIDTH]
-mov [rel kernel_screen_width], eax
+    mov eax, [rbx + BOOTINFO_WIDTH]
+    mov [rel kernel_screen_width], eax
 
-mov eax, [rbx + BOOTINFO_HEIGHT]
-mov [rel kernel_screen_height], eax
+    mov eax, [rbx + BOOTINFO_HEIGHT]
+    mov [rel kernel_screen_height], eax
 
-mov eax, [rbx + BOOTINFO_PPS]
-mov [rel kernel_screen_pps], eax
+    mov eax, [rbx + BOOTINFO_PPS]
+    mov [rel kernel_screen_pps], eax
 
-mov eax, [rbx + BOOTINFO_PIXEL_FORMAT]
-mov [rel kernel_pixel_format], eax
-
+    mov eax, [rbx + BOOTINFO_PIXEL_FORMAT]
+    mov [rel kernel_pixel_format], eax
 
 ; =========================================================================
 ; MEMORY MAP
 ; =========================================================================
 
-mov rax, [rbx + BOOTINFO_MEMMAP]
-mov [rel kernel_memory_map], rax
+    mov rax, [rbx + BOOTINFO_MEMMAP]
+    mov [rel kernel_memory_map], rax
 
-mov rax, [rbx + BOOTINFO_MEMMAP_SIZE]
-mov [rel kernel_memory_map_size], rax
+    mov rax, [rbx + BOOTINFO_MEMMAP_SIZE]
+    mov [rel kernel_memory_map_size], rax
 
-mov rax, [rbx + BOOTINFO_DESC_SIZE]
-mov [rel kernel_memory_desc_size], rax
+    mov rax, [rbx + BOOTINFO_DESC_SIZE]
+    mov [rel kernel_memory_desc_size], rax
 
-mov eax, [rbx + BOOTINFO_DESC_VERSION]
-mov [rel kernel_memory_desc_version], eax
-
+    mov eax, [rbx + BOOTINFO_DESC_VERSION]
+    mov [rel kernel_memory_desc_version], eax
 
 ; =========================================================================
 ; ACPI RSDP
 ; =========================================================================
 
-mov rax, [rbx + BOOTINFO_ACPI_RSDP]
-mov [rel acpi_rsdp], rax
-
+    mov rax, [rbx + BOOTINFO_ACPI_RSDP]
+    mov [rel acpi_rsdp], rax
 
 ; =========================================================================
 ; SERIAL
 ; =========================================================================
 
-call serial_init
+    call serial_init
 
-lea rdi, [rel kernel_msg]
-call serial_log
-
+    lea rdi, [rel kernel_msg]
+    call serial_log
 
 ; =========================================================================
 ; GDT
 ; =========================================================================
 
-call gdt_init
-
+    call gdt_init
 
 ; =========================================================================
 ; PHYSICAL MEMORY MANAGER
@@ -307,71 +314,49 @@ call gdt_init
 ;   RSI = memory map size
 ;   RDX = descriptor size
 ;
-; PMM is initialized before devices because later subsystems
-; can allocate physical pages from it.
-;
 ; =========================================================================
 
-mov rdi, [rel kernel_memory_map]
-mov rsi, [rel kernel_memory_map_size]
-mov rdx, [rel kernel_memory_desc_size]
+    mov rdi, [rel kernel_memory_map]
+    mov rsi, [rel kernel_memory_map_size]
+    mov rdx, [rel kernel_memory_desc_size]
 
-call pmm_init
-
+    call pmm_init
 
 ; =========================================================================
 ; ACPI
 ; =========================================================================
 
-call kernel_init_acpi
-
+    call kernel_init_acpi
 
 ; =========================================================================
 ; LAPIC
 ; =========================================================================
 
-call kernel_init_lapic
-
+    call kernel_init_lapic
 
 ; =========================================================================
 ; IOAPIC
 ; =========================================================================
 
-call kernel_init_ioapic
-
+    call kernel_init_ioapic
 
 ; =========================================================================
 ; IDT
 ; =========================================================================
-;
-; IDT must exist before any device interrupt is allowed.
-;
-; idt_init() also:
-;
-;   - masks legacy PIC
-;   - installs CPU exception handlers
-;   - installs LAPIC timer vector 0x20
-;   - installs xHCI vector 0x28
-;   - installs INT 0x80 scheduler vector
-;
-; =========================================================================
 
-call idt_init
-
+    call idt_init
 
 ; =========================================================================
 ; BSOD / EXCEPTION ENGINE
 ; =========================================================================
 
-call bsod_init
-
+    call bsod_init
 
 ; =========================================================================
 ; HID
 ; =========================================================================
 
-call hid_init
-
+    call hid_init
 
 ; =========================================================================
 ; GUI
@@ -386,65 +371,57 @@ call hid_init
 ;   R8D = pixels per scanline
 ;   R9D = pixel format
 ;
-; Backbuffer allocation is handled by GUI/PMM.
-;
 ; =========================================================================
 
-mov rdi, [rel kernel_framebuffer]
-mov rsi, [rel kernel_framebuffer_size]
-mov edx, [rel kernel_screen_width]
-mov ecx, [rel kernel_screen_height]
-mov r8d, [rel kernel_screen_pps]
-mov r9d, [rel kernel_pixel_format]
+    mov rdi, [rel kernel_framebuffer]
+    mov rsi, [rel kernel_framebuffer_size]
+    mov edx, [rel kernel_screen_width]
+    mov ecx, [rel kernel_screen_height]
+    mov r8d, [rel kernel_screen_pps]
+    mov r9d, [rel kernel_pixel_format]
 
-call gui_init
-
+    call gui_init
 
 ; =========================================================================
 ; AHCI
 ; =========================================================================
 
-call find_ahci_controller
+    call find_ahci_controller
 
-test rax, rax
-jz .no_ahci
+    test rax, rax
+    jz .no_ahci
 
+    call init_ahci_controller
 
-call init_ahci_controller
-
-test rax, rax
-jz .no_ahci
-
+    test rax, rax
+    jz .no_ahci
 
 ; =========================================================================
 ; GET ACTIVE SATA PORT
 ; =========================================================================
 
-call ahci_get_port
+    call ahci_get_port
 
-cmp rax, 31
-ja .no_ahci
+    cmp rax, 31
+    ja .no_ahci
 
+    mov [rel kernel_sata_port], rax
+    mov byte [rel ahci_active], 1
 
-mov [rel kernel_sata_port], rax
-mov byte [rel ahci_active], 1
+    lea rdi, [rel ahci_ok_msg]
+    call serial_log
 
-
-lea rdi, [rel ahci_ok_msg]
-call serial_log
-
-jmp .storage_done
+    jmp .storage_done
 
 .no_ahci:
 
-mov byte [rel ahci_active], 0
+    mov byte [rel ahci_active], 0
 
-xor eax, eax
-mov [rel kernel_sata_port], rax
+    xor eax, eax
+    mov [rel kernel_sata_port], rax
 
-
-lea rdi, [rel ahci_fail_msg]
-call serial_log
+    lea rdi, [rel ahci_fail_msg]
+    call serial_log
 
 .storage_done:
 
@@ -456,80 +433,96 @@ call serial_log
 ;
 ;   RCX = SATA port
 ;
-; Only attempt mounting when AHCI is functional.
-;
 ; =========================================================================
 
-cmp byte [rel ahci_active], 1
-jne .vfs_done
+    cmp byte [rel ahci_active], 1
+    jne .vfs_done
 
+    mov rcx, [rel kernel_sata_port]
 
-mov rcx, [rel kernel_sata_port]
+    call vfs_mount_drive
 
-call vfs_mount_drive
-
-mov [rel kernel_fs_type], rax
+    mov [rel kernel_fs_type], rax
 
 .vfs_done:
 
 ; =========================================================================
 ; xHCI
 ; =========================================================================
-;
-; IMPORTANT:
-;
-; xhci_init() currently performs controller discovery / basic setup.
-;
-; Real Event Ring + Command Ring + ERST initialization is deliberately
-; performed later before enabling xHCI interrupts.
-;
-; Therefore vector 0x28 is installed but the hardware source remains
-; disabled at this stage.
-;
-; =========================================================================
 
-call xhci_init
-
+    call xhci_init
 
 ; =========================================================================
 ; AUDIO
 ; =========================================================================
+;
+; Tools/audio_hca.asm:
+;
+;   find_hda_controller
+;   init_hda_controller
+;
+; API:
+;
+;   RAX = HDA MMIO address
+;   CF  = 0 success
+;   CF  = 1 failure
+;
+; init:
+;
+;   RAX = HDA MMIO address
+;   CF  = 0 success
+;   CF  = 1 failure
+;
+; =========================================================================
 
-call audio_init
+    call find_hda_controller
 
+    jc .audio_unavailable
+
+    test rax, rax
+    jz .audio_unavailable
+
+    call init_hda_controller
+
+    jc .audio_unavailable
+
+    lea rdi, [rel audio_ok_msg]
+    call serial_log
+
+    jmp .audio_done
+
+.audio_unavailable:
+
+    lea rdi, [rel audio_fail_msg]
+    call serial_log
+
+.audio_done:
 
 ; =========================================================================
-; AHS-TUS
+; AHS-TUS / UPDATE
+; =========================================================================
+;
+; Tools/ahs-tus.asm nie posiada ahs_tus_init.
+;
+; Jedyną funkcją inicjalizującą system jest:
+;
+;   update_system_init
+;
 ; =========================================================================
 
-call ahs_tus_init
-
-
-; =========================================================================
-; UPDATE SYSTEM
-; =========================================================================
-
-call update_system_init
-
+    call update_system_init
 
 ; =========================================================================
 ; MULTICORE
 ; =========================================================================
 
-call init_multicore
-
+    call init_multicore
 
 ; =========================================================================
 ; SCHEDULER
 ; =========================================================================
-;
-; Scheduler state MUST be completely initialized before enabling the
-; LAPIC timer.
-;
-; =========================================================================
 
-call scheduler_init
-
+    call scheduler_init
 
 ; =========================================================================
 ; LAPIC TIMER
@@ -537,55 +530,31 @@ call scheduler_init
 ;
 ; 500 us = 0.5 ms.
 ;
-; Flow:
-;
-;   LAPIC TIMER
-;       |
-;       v
-;   vector 0x20
-;       |
-;       v
-;   lapic_timer_handler
-;       |
-;       v
-;   scheduler_dispatch
-;       |
-;       v
-;   IRETQ
-;
-; PIT is NOT routed as an interrupt.
-;
-; PIT Channel 2 may only be used internally by LAPIC calibration.
-;
 ; =========================================================================
 
-cmp byte [rel lapic_active], 1
-jne .timer_unavailable
+    cmp byte [rel lapic_active], 1
+    jne .timer_unavailable
 
+    mov rcx, DEFAULT_SCHEDULER_TICK_US
 
-mov rcx, DEFAULT_SCHEDULER_TICK_US
+    call lapic_timer_init_us
 
-call lapic_timer_init_us
+    test rax, rax
+    jz .timer_unavailable
 
-test rax, rax
-jz .timer_unavailable
+    mov byte [rel scheduler_timer_active], 1
 
+    lea rdi, [rel timer_ok_msg]
+    call serial_log
 
-mov byte [rel scheduler_timer_active], 1
-
-
-lea rdi, [rel timer_ok_msg]
-call serial_log
-
-jmp .timer_done
+    jmp .timer_done
 
 .timer_unavailable:
 
-mov byte [rel scheduler_timer_active], 0
+    mov byte [rel scheduler_timer_active], 0
 
-
-lea rdi, [rel timer_fail_msg]
-call serial_log
+    lea rdi, [rel timer_fail_msg]
+    call serial_log
 
 .timer_done:
 
@@ -593,46 +562,32 @@ call serial_log
 ; INITIAL GUI
 ; =========================================================================
 
-call kernel_draw_initial_gui
-
+    call kernel_draw_initial_gui
 
 ; =========================================================================
 ; ENABLE INTERRUPTS
 ; =========================================================================
-;
-; At this point:
-;
-;   GDT       ready
-;   IDT       ready
-;   PIC       masked
-;   LAPIC     ready
-;   IOAPIC    ready
-;   Scheduler ready
-;   LAPIC timer ready
-;
-; =========================================================================
 
-sti
-
+    sti
 
 ; =========================================================================
 ; SHELL
 ; =========================================================================
 
-call shell_run
-
+    call shell_run
 
 ; =========================================================================
 ; MAIN EVENT LOOP
 ; =========================================================================
 
-call scheduler_event_loop
+    call scheduler_event_loop
 
 .hang:
 
-cli
-hlt
-jmp .hang
+    cli
+    hlt
+    jmp .hang
+
 
 ; =============================================================================
 ; ACPI INITIALIZATION
@@ -640,76 +595,45 @@ jmp .hang
 
 kernel_init_acpi:
 
-push rbx
-push rcx
-push rdx
+    push rbx
+    push rcx
+    push rdx
 
+    mov rcx, [rel acpi_rsdp]
 
-mov rcx, [rel acpi_rsdp]
+    test rcx, rcx
+    jz .skip
 
-test rcx, rcx
-jz .skip
+    call acpi_init
 
+    cmp rax, 1
+    jne .skip
 
-; =========================================================================
-; PARSE ACPI
-; =========================================================================
+    mov byte [rel acpi_active], 1
 
-call acpi_init
+    call acpi_get_madt
+    mov [rel acpi_madt], rax
 
-cmp rax, 1
-jne .skip
+    call acpi_get_lapic_address
+    mov [rel acpi_lapic_address], rax
 
+    call acpi_get_lapic_count
+    mov [rel acpi_cpu_count], eax
 
-mov byte [rel acpi_active], 1
+    call acpi_get_ioapic_count
+    mov [rel acpi_ioapic_count], eax
 
-
-; =========================================================================
-; MADT
-; =========================================================================
-
-call acpi_get_madt
-
-mov [rel acpi_madt], rax
-
-
-; =========================================================================
-; LAPIC ADDRESS
-; =========================================================================
-
-call acpi_get_lapic_address
-
-mov [rel acpi_lapic_address], rax
-
-
-; =========================================================================
-; CPU COUNT
-; =========================================================================
-
-call acpi_get_lapic_count
-
-mov [rel acpi_cpu_count], eax
-
-
-; =========================================================================
-; IOAPIC COUNT
-; =========================================================================
-
-call acpi_get_ioapic_count
-
-mov [rel acpi_ioapic_count], eax
-
-
-lea rdi, [rel acpi_ok_msg]
-call serial_log
+    lea rdi, [rel acpi_ok_msg]
+    call serial_log
 
 .skip:
 
-pop rdx
-pop rcx
-pop rbx
+    pop rdx
+    pop rcx
+    pop rbx
 
-ret
+    ret
+
 
 ; =============================================================================
 ; LAPIC INITIALIZATION
@@ -717,188 +641,114 @@ ret
 
 kernel_init_lapic:
 
-push rbx
+    push rbx
 
+    call lapic_init
 
-; =========================================================================
-; INITIALIZE LAPIC
-; =========================================================================
+    cmp rax, 1
+    jne .fail
 
-call lapic_init
+    mov byte [rel lapic_active], 1
 
-cmp rax, 1
-jne .fail
+    call lapic_enable
 
+    cmp rax, 1
+    jne .fail_disable
 
-mov byte [rel lapic_active], 1
+    call lapic_get_id
 
+    mov [rel lapic_boot_cpu_id], eax
 
-; =========================================================================
-; SOFTWARE ENABLE
-; =========================================================================
+    lea rdi, [rel lapic_ok_msg]
+    call serial_log
 
-call lapic_enable
+    mov eax, 1
 
-cmp rax, 1
-jne .fail_disable
-
-
-; =========================================================================
-; GET BOOT CPU APIC ID
-; =========================================================================
-
-call lapic_get_id
-
-mov [rel lapic_boot_cpu_id], eax
-
-
-lea rdi, [rel lapic_ok_msg]
-call serial_log
-
-
-mov eax, 1
-
-pop rbx
-ret
+    pop rbx
+    ret
 
 .fail_disable:
 
-mov byte [rel lapic_active], 0
+    mov byte [rel lapic_active], 0
 
-lea rdi, [rel lapic_fail_msg]
-call serial_log
+    lea rdi, [rel lapic_fail_msg]
+    call serial_log
 
-xor eax, eax
+    xor eax, eax
 
-pop rbx
-ret
+    pop rbx
+    ret
 
 .fail:
 
-mov byte [rel lapic_active], 0
+    mov byte [rel lapic_active], 0
 
-lea rdi, [rel lapic_fail_msg]
-call serial_log
+    lea rdi, [rel lapic_fail_msg]
+    call serial_log
 
-xor eax, eax
+    xor eax, eax
 
-pop rbx
-ret
+    pop rbx
+    ret
+
 
 ; =============================================================================
 ; IOAPIC INITIALIZATION
 ; =============================================================================
-;
-; IMPORTANT ABI FIX:
-;
-; ioapic_mask_irq expects:
-;
-;   RCX = IRQ
-;
-; NOT:
-;
-;   EDI = IRQ
-;
-; This is corrected below.
-;
-; =============================================================================
 
 kernel_init_ioapic:
 
-push rbx
+    push rbx
 
+    cmp byte [rel acpi_active], 1
+    jne .fail
 
-; =========================================================================
-; ACPI REQUIRED
-; =========================================================================
+    cmp byte [rel lapic_active], 1
+    jne .fail
 
-cmp byte [rel acpi_active], 1
-jne .fail
+    call ioapic_init
 
+    cmp rax, 1
+    jne .fail
 
-; =========================================================================
-; LAPIC REQUIRED
-; =========================================================================
+    mov byte [rel ioapic_active], 1
 
-cmp byte [rel lapic_active], 1
-jne .fail
+    call ioapic_get_base
+    mov [rel ioapic_base], rax
 
+    call ioapic_get_gsi_base
+    mov [rel ioapic_gsi_base], rax
 
-; =========================================================================
-; INITIALIZE IOAPIC
-; =========================================================================
+    call ioapic_get_max_redir
+    mov [rel ioapic_max_redir], eax
 
-call ioapic_init
+    ; IRQ0 = legacy PIT.
+    ; PIT is NOT the scheduler source.
+    ; Keep IRQ0 masked.
 
-cmp rax, 1
-jne .fail
+    xor ecx, ecx
+    call ioapic_mask_irq
 
+    lea rdi, [rel ioapic_ok_msg]
+    call serial_log
 
-mov byte [rel ioapic_active], 1
+    mov eax, 1
 
-
-; =========================================================================
-; SAVE IOAPIC INFORMATION
-; =========================================================================
-
-call ioapic_get_base
-
-mov [rel ioapic_base], rax
-
-
-call ioapic_get_gsi_base
-
-mov [rel ioapic_gsi_base], rax
-
-
-call ioapic_get_max_redir
-
-mov [rel ioapic_max_redir], eax
-
-
-; =========================================================================
-; MASK IRQ0
-; =========================================================================
-;
-; IRQ0 belongs to the legacy PIT.
-;
-; Blitrum OS does NOT use PIT IRQ0 as the scheduler source.
-;
-; LAPIC Timer vector 0x20 is the scheduler timer.
-;
-; Therefore IRQ0 stays masked.
-;
-; ABI:
-;
-;   RCX = IRQ
-;
-; =========================================================================
-
-xor ecx, ecx
-
-call ioapic_mask_irq
-
-
-lea rdi, [rel ioapic_ok_msg]
-call serial_log
-
-
-mov eax, 1
-
-pop rbx
-ret
+    pop rbx
+    ret
 
 .fail:
 
-mov byte [rel ioapic_active], 0
+    mov byte [rel ioapic_active], 0
 
-lea rdi, [rel ioapic_fail_msg]
-call serial_log
+    lea rdi, [rel ioapic_fail_msg]
+    call serial_log
 
-xor eax, eax
+    xor eax, eax
 
-pop rbx
-ret
+    pop rbx
+    ret
+
 
 ; =============================================================================
 ; INITIAL GUI
@@ -906,31 +756,21 @@ ret
 
 kernel_draw_initial_gui:
 
-push rbx
+    push rbx
 
+    mov edi, 100
+    mov esi, 80
+    mov edx, 640
+    mov ecx, 420
 
-; =========================================================================
-; BASIC WINDOW
-; =========================================================================
+    call gui_draw_window
 
-mov edi, 100
-mov esi, 80
-mov edx, 640
-mov ecx, 420
+    call gui_refresh_screen
 
-call gui_draw_window
+    pop rbx
 
+    ret
 
-; =========================================================================
-; REFRESH
-; =========================================================================
-
-call gui_refresh_screen
-
-
-pop rbx
-
-ret
 
 ; =============================================================================
 ; FATAL BOOTINFO
@@ -938,13 +778,13 @@ ret
 
 kernel_fatal_bootinfo:
 
-cli
+    cli
 
 .fatal_loop:
 
-hlt
+    hlt
+    jmp .fatal_loop
 
-jmp .fatal_loop
 
 ; =============================================================================
 ; DATA
@@ -959,34 +799,41 @@ align 8
 ; =============================================================================
 
 kernel_msg:
-db "BLITRUM OS kernel started", 10, 0
+    db "BLITRUM OS kernel started", 10, 0
 
 acpi_ok_msg:
-db "ACPI initialized", 10, 0
+    db "ACPI initialized", 10, 0
 
 lapic_ok_msg:
-db "LAPIC initialized", 10, 0
+    db "LAPIC initialized", 10, 0
 
 lapic_fail_msg:
-db "LAPIC unavailable", 10, 0
+    db "LAPIC unavailable", 10, 0
 
 ioapic_ok_msg:
-db "IOAPIC initialized", 10, 0
+    db "IOAPIC initialized", 10, 0
 
 ioapic_fail_msg:
-db "IOAPIC unavailable", 10, 0
+    db "IOAPIC unavailable", 10, 0
 
 ahci_ok_msg:
-db "AHCI initialized", 10, 0
+    db "AHCI initialized", 10, 0
 
 ahci_fail_msg:
-db "AHCI unavailable", 10, 0
+    db "AHCI unavailable", 10, 0
+
+audio_ok_msg:
+    db "HDA audio initialized", 10, 0
+
+audio_fail_msg:
+    db "HDA audio unavailable", 10, 0
 
 timer_ok_msg:
-db "LAPIC scheduler timer: 500 us", 10, 0
+    db "LAPIC scheduler timer: 500 us", 10, 0
 
 timer_fail_msg:
-db "LAPIC scheduler timer unavailable", 10, 0
+    db "LAPIC scheduler timer unavailable", 10, 0
+
 
 ; =============================================================================
 ; KERNEL STATE
@@ -995,45 +842,48 @@ db "LAPIC scheduler timer unavailable", 10, 0
 align 8
 
 bootinfo_ptr:
-dq 0
+    dq 0
+
 
 ; =============================================================================
 ; FRAMEBUFFER
 ; =============================================================================
 
 kernel_framebuffer:
-dq 0
+    dq 0
 
 kernel_framebuffer_size:
-dq 0
+    dq 0
 
 kernel_screen_width:
-dd 0
+    dd 0
 
 kernel_screen_height:
-dd 0
+    dd 0
 
 kernel_screen_pps:
-dd 0
+    dd 0
 
 kernel_pixel_format:
-dd 0
+    dd 0
+
 
 ; =============================================================================
 ; MEMORY MAP
 ; =============================================================================
 
 kernel_memory_map:
-dq 0
+    dq 0
 
 kernel_memory_map_size:
-dq 0
+    dq 0
 
 kernel_memory_desc_size:
-dq 0
+    dq 0
 
 kernel_memory_desc_version:
-dd 0
+    dd 0
+
 
 ; =============================================================================
 ; ACPI STATE
@@ -1042,22 +892,23 @@ dd 0
 align 8
 
 acpi_rsdp:
-dq 0
+    dq 0
 
 acpi_madt:
-dq 0
+    dq 0
 
 acpi_lapic_address:
-dq 0
+    dq 0
 
 acpi_cpu_count:
-dd 0
+    dd 0
 
 acpi_ioapic_count:
-dd 0
+    dd 0
 
 acpi_active:
-db 0
+    db 0
+
 
 ; =============================================================================
 ; LAPIC STATE
@@ -1066,12 +917,13 @@ db 0
 align 8
 
 lapic_active:
-db 0
+    db 0
 
 align 4
 
 lapic_boot_cpu_id:
-dd 0
+    dd 0
+
 
 ; =============================================================================
 ; IOAPIC STATE
@@ -1080,18 +932,19 @@ dd 0
 align 8
 
 ioapic_active:
-db 0
+    db 0
 
 align 8
 
 ioapic_base:
-dq 0
+    dq 0
 
 ioapic_gsi_base:
-dq 0
+    dq 0
 
 ioapic_max_redir:
-dd 0
+    dd 0
+
 
 ; =============================================================================
 ; SCHEDULER TIMER STATE
@@ -1100,7 +953,8 @@ dd 0
 align 4
 
 scheduler_timer_active:
-db 0
+    db 0
+
 
 ; =============================================================================
 ; AHCI / STORAGE STATE
@@ -1109,15 +963,16 @@ db 0
 align 8
 
 ahci_active:
-db 0
+    db 0
 
 align 8
 
 kernel_sata_port:
-dq 0
+    dq 0
 
 kernel_fs_type:
-dq 0
+    dq 0
+
 
 ; =============================================================================
 ; BSS
@@ -1128,6 +983,6 @@ section .bss
 align 16
 
 kernel_stack:
-resb 16384
+    resb 16384
 
 stack_top:
