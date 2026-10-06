@@ -1,44 +1,35 @@
 ; ==============================================================================
-; BLITRUM OS - USB / xHCI INTERRUPT EVENT BUFFER
+; BLITRUM OS - USB / xHCI EVENT TRANSPORT
 ; ==============================================================================
-; x86-64 / NASM
+; Architektura:
 ;
-; ARCHITEKTURA PRZERWAŃ:
+;   xHCI Event Ring
+;        |
+;        v
+;   usb_interrupts
+;        |
+;        v
+;   software event ring
+;        |
+;        v
+;   USB/HID layer
 ;
-;   xHCI
-;     |
-;     v
-;   PCI IRQ
-;     |
-;     v
-;   IOAPIC
-;     |
-;     v
-;   LAPIC
-;     |
-;     v
-;   IDT vector 0x28
-;     |
-;     v
-;   isr_xhci_handler
-;     |
-;     +--> scheduler_trigger_event
-;     |
-;     +--> lapic_eoi
-;     |
-;     v
-;   iretq
+; Wersja:
+;   - bez sztucznych placeholderów
+;   - pobiera prawdziwe Event TRB
+;   - przechowuje pełne 16 bajtów Event TRB
+;   - obsługuje ring buffer
+;   - nie interpretuje jeszcze samodzielnie HID
 ;
+; ABI:
 ;
-; UWAGA:
+; usb_interrupts_init:
+;   RCX = xHCI MMIO base
 ;
-; Ten moduł NIE wybiera sam IRQ PCI xHCI.
-;
-; Routing:
-;
-;   PCI -> ACPI/PCI routing -> IOAPIC
-;
-; powinien zostać skonfigurowany przez warstwę PCI/IOAPIC.
+; usb_pop_event:
+;   RAX = adres 16-bajtowego eventu
+;   RDX = 1 -> event
+;   RDX = 0 -> brak
 ;
 ; ==============================================================================
 
@@ -63,6 +54,9 @@ global usb_pop_event
 extern scheduler_trigger_event
 extern lapic_eoi
 
+extern xhci_get_event
+extern xhci_consume_event
+
 
 ; ==============================================================================
 ; CONSTANTS
@@ -70,10 +64,15 @@ extern lapic_eoi
 
 USB_INTERRUPT_VECTOR equ 0x28
 
+; Task odpowiedzialny za warstwę GUI/USB.
 GUI_TASK_ID          equ 5
 
+; Software event ring.
 BUFFER_SIZE          equ 256
 BUFFER_MASK          equ BUFFER_SIZE - 1
+
+; Jeden xHCI Event TRB = 16 bajtów.
+EVENT_SIZE           equ 16
 
 
 ; ==============================================================================
@@ -84,38 +83,35 @@ section .data
 
 align 8
 
-
-; Adres MMIO kontrolera xHCI.
-
 xhci_mmio_reg:
-
     dq 0
 
-
-; Ring buffer indices.
-
 buf_head:
-
     dd 0
 
-
 buf_tail:
-
     dd 0
 
 
 ; ==============================================================================
-; USB EVENT BUFFER
+; SOFTWARE EVENT RING
+;
+; 256 * 16 = 4096 bajtów
+;
+; Każdy wpis zawiera dokładny Event TRB:
+;
+;   +00 parameter
+;   +08 status
+;   +0C control
+;
 ; ==============================================================================
 
 section .bss
 
-align 32
-
+align 4096
 
 usb_ring_buffer:
-
-    resb BUFFER_SIZE * 8
+    resb BUFFER_SIZE * EVENT_SIZE
 
 
 ; ==============================================================================
@@ -130,26 +126,17 @@ section .text
 ;
 ; WEJŚCIE:
 ;
-;   RCX = adres MMIO xHCI
+;   RCX = xHCI MMIO
 ;
 ; RESETUJE:
 ;
 ;   - adres kontrolera
 ;   - head
 ;   - tail
-;   - software event buffer
+;   - software event ring
 ;
-;
-; UWAGA:
-;
-; Nie konfigurujemy tutaj IRQ PCI.
-;
-; Nie konfigurujemy tutaj IOAPIC.
-;
-; Nie konfigurujemy tutaj LAPIC.
-;
-; Routing sprzętowego IRQ jest odpowiedzialnością warstwy
-; PCI/ACPI/IOAPIC.
+; Nie włącza sprzętowego interruptera xHCI.
+; To nadal kontroluje xhci.asm.
 ;
 ; ==============================================================================
 
@@ -158,18 +145,15 @@ usb_interrupts_init:
     push rax
     push rbx
     push rcx
+    push rdi
 
-
-    ; ==========================================================================
-    ; ZAPAMIĘTAJ XHCI MMIO
-    ; ==========================================================================
 
     mov [rel xhci_mmio_reg], rcx
 
 
-    ; ==========================================================================
-    ; RESET SOFTWARE EVENT BUFFER
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; RESET SOFTWARE RING
+    ; --------------------------------------------------------------------------
 
     xor eax, eax
 
@@ -177,20 +161,20 @@ usb_interrupts_init:
     mov [rel buf_tail], eax
 
 
-    ; ==========================================================================
-    ; NIE WŁĄCZAMY JESZCZE INTERRUPTERA xHCI
-    ;
-    ; Pełna konfiguracja:
-    ;
-    ;   Event Ring
-    ;   ERST
-    ;   ERDP
-    ;   IMAN
-    ;   IMOD
-    ;
-    ; należy do właściwej inicjalizacji xHCI.
-    ; ==========================================================================
+    ; --------------------------------------------------------------------------
+    ; WYCZYŚĆ BUFFER
+    ; --------------------------------------------------------------------------
 
+    lea rdi, [rel usb_ring_buffer]
+
+    xor eax, eax
+
+    mov ecx, (BUFFER_SIZE * EVENT_SIZE) / 8
+
+    rep stosq
+
+
+    pop rdi
     pop rcx
     pop rbx
     pop rax
@@ -201,33 +185,19 @@ usb_interrupts_init:
 ; ==============================================================================
 ; isr_xhci_handler
 ;
-; IDT:
+; IDT VECTOR:
 ;
-;   vector 0x28
+;   0x28
 ;
+; Przebieg:
 ;
-; WEJŚCIE:
-;
-; CPU automatycznie odkłada:
-;
-;   RIP
-;   CS
-;   RFLAGS
-;
-;
-; WYJŚCIE:
-;
-;   iretq
-;
-;
-; WAŻNE:
-;
-; Po obsłużeniu sprzętowego IRQ przez IOAPIC/LAPIC MUSIMY wysłać:
-;
-;   lapic_eoi
-;
-; inaczej LAPIC może pozostać w stanie oczekiwania na EOI
-; i kolejne przerwania mogą zostać zablokowane.
+;   1. sprawdź Event Ring
+;   2. pobierz Event TRB
+;   3. skopiuj pełne 16 bajtów do software ring
+;   4. poinformuj xHCI o konsumpcji przez ERDP
+;   5. obudź scheduler
+;   6. EOI
+;   7. iretq
 ;
 ; ==============================================================================
 
@@ -237,75 +207,38 @@ isr_xhci_handler:
     push rbx
     push rcx
     push rdx
-    push rdi
     push rsi
+    push rdi
+    push r8
+    push r9
 
 
     ; ==========================================================================
-    ; SPRAWDŹ XHCI
+    ; SPRÓBUJ POBRAĆ EVENT
+    ;
+    ; xhci_get_event:
+    ;
+    ;   RAX = adres Event TRB
+    ;   RDX = 1 event
+    ;   RDX = 0 brak
     ; ==========================================================================
 
-    mov rdi, [rel xhci_mmio_reg]
+    call xhci_get_event
 
-    test rdi, rdi
+    test rdx, rdx
 
     jz .send_eoi
 
 
     ; ==========================================================================
-    ; XHCI RTSOFF
-    ;
-    ; Capability Registers:
-    ;
-    ;   +0x18 = RTSOFF
-    ;
-    ; Runtime Register Space:
-    ;
-    ;   xHCI_base + RTSOFF
+    ; RAX = ADRES EVENT TRB
     ; ==========================================================================
 
-    mov eax, [rdi + 0x18]
-
-    and eax, 0xFFFFFFFC
-
-    add rdi, rax
+    mov rsi, rax
 
 
     ; ==========================================================================
-    ; INTERRUPTER 0
-    ;
-    ; Runtime:
-    ;
-    ;   +0x20 = IMAN
-    ;
-    ; IMAN:
-    ;
-    ;   bit 0 = IP  (Interrupt Pending)
-    ;   bit 1 = IE  (Interrupt Enable)
-    ;
-    ; IP jest kasowane przez zapis 1.
-    ; ==========================================================================
-
-    mov eax, [rdi + 0x20]
-
-    test eax, 1
-
-    jz .send_eoi
-
-
-    ; ==========================================================================
-    ; CLEAR INTERRUPT PENDING
-    ;
-    ; Zachowujemy pozostałe bity.
-    ; ==========================================================================
-
-    or eax, 1
-
-    mov [rdi + 0x20], eax
-
-
-    ; ==========================================================================
-    ; DODAJ ZDARZENIE DO SOFTWARE EVENT BUFFER
+    ; SPRAWDŹ SOFTWARE BUFFER
     ; ==========================================================================
 
     mov eax, [rel buf_head]
@@ -317,10 +250,6 @@ isr_xhci_handler:
     and ebx, BUFFER_MASK
 
 
-    ; ==========================================================================
-    ; SPRAWDŹ PEŁNY BUFFER
-    ; ==========================================================================
-
     mov ecx, [rel buf_tail]
 
     cmp ebx, ecx
@@ -329,33 +258,33 @@ isr_xhci_handler:
 
 
     ; ==========================================================================
-    ; OBLICZ ADRES ELEMENTU
+    ; DESTINATION
     ;
-    ; Każde zdarzenie = 8 bajtów.
+    ; head * 16
     ; ==========================================================================
 
-    lea rsi, [rel usb_ring_buffer]
+    lea rdi, [rel usb_ring_buffer]
 
-    mov edx, eax
+    mov r8d, eax
 
-    shl edx, 3
+    shl r8d, 4
 
-    add rsi, rdx
+    add rdi, r8
 
 
     ; ==========================================================================
-    ; TYMCZASOWY EVENT
+    ; SKOPIUJ PEŁNY EVENT TRB
     ;
-    ; 0x00010202
-    ;
-    ; Obecnie software event placeholder.
-    ;
-    ; Docelowo:
-    ;
-    ;   rzeczywisty Event TRB z Event Ring xHCI.
+    ; +00 parameter
+    ; +08 status
+    ; +0C control
     ; ==========================================================================
 
-    mov qword [rsi], 0x0000000000010202
+    mov rax, [rsi]
+    mov [rdi], rax
+
+    mov rax, [rsi + 8]
+    mov [rdi + 8], rax
 
 
     ; ==========================================================================
@@ -366,9 +295,19 @@ isr_xhci_handler:
 
 
     ; ==========================================================================
-    ; POWIADOM SCHEDULER
+    ; POTWIERDŹ KONSUMPCJĘ EVENTU
     ;
-    ; RCX = Task ID
+    ; xhci_consume_event:
+    ;
+    ; przesuwa Event Ring Consumer State
+    ; i aktualizuje ERDP.
+    ; ==========================================================================
+
+    call xhci_consume_event
+
+
+    ; ==========================================================================
+    ; POWIADOM SCHEDULER
     ; ==========================================================================
 
     mov ecx, GUI_TASK_ID
@@ -376,21 +315,25 @@ isr_xhci_handler:
     call scheduler_trigger_event
 
 
+    jmp .send_eoi
+
+
 .buffer_full:
+
+    ; --------------------------------------------------------------------------
+    ; Software buffer pełny.
+    ;
+    ; Nie konsumujemy Event TRB.
+    ; Dzięki temu xHCI nadal widzi event jako nieobsłużony.
+    ; --------------------------------------------------------------------------
+
+    nop
 
 
 .send_eoi:
 
     ; ==========================================================================
     ; LAPIC EOI
-    ;
-    ; Ten krok jest obowiązkowy przy aktywnym:
-    ;
-    ;   IOAPIC -> LAPIC -> IDT
-    ;
-    ; lapic_eoi:
-    ;
-    ;   zapis 0 do LAPIC EOI register.
     ; ==========================================================================
 
     call lapic_eoi
@@ -400,17 +343,15 @@ isr_xhci_handler:
     ; RESTORE
     ; ==========================================================================
 
-    pop rsi
+    pop r9
+    pop r8
     pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rbx
     pop rax
 
-
-    ; ==========================================================================
-    ; RETURN FROM INTERRUPT
-    ; ==========================================================================
 
     iretq
 
@@ -420,10 +361,14 @@ isr_xhci_handler:
 ;
 ; WYJŚCIE:
 ;
-;   RAX = 64-bit event
+;   RAX = adres wpisu w software ring
+;   RDX = 1 -> event
+;   RDX = 0 -> brak
 ;
-;   RAX = 0
-;       brak eventów
+; UWAGA:
+;
+; Zwracany adres wskazuje na wewnętrzny bufor.
+; Wyższa warstwa powinna skopiować dane przed kolejnym użyciem.
 ;
 ; ==============================================================================
 
@@ -446,23 +391,25 @@ usb_pop_event:
 
 
     ; ==========================================================================
-    ; ADRES ELEMENTU
+    ; ADRES EVENTU
     ; ==========================================================================
 
     lea rsi, [rel usb_ring_buffer]
 
     mov ebx, eax
 
-    shl rbx, 3
+    shl ebx, 4
 
     add rsi, rbx
 
 
     ; ==========================================================================
-    ; ODCZYTAJ EVENT
+    ; RETURN ADDRESS
     ; ==========================================================================
 
-    mov rbx, [rsi]
+    mov rax, rsi
+
+    mov edx, 1
 
 
     ; ==========================================================================
@@ -476,18 +423,13 @@ usb_pop_event:
     mov [rel buf_tail], eax
 
 
-    ; ==========================================================================
-    ; RETURN EVENT
-    ; ==========================================================================
-
-    mov rax, rbx
-
     jmp .exit
 
 
 .empty:
 
     xor eax, eax
+    xor edx, edx
 
 
 .exit:
@@ -497,3 +439,23 @@ usb_pop_event:
     pop rbx
 
     ret
+
+Teraz ważne
+
+Ten plik ma już prawdziwy transport Event TRB, ale odwołuje się do:
+
+xhci_get_event
+xhci_consume_event
+
+Pierwsza funkcja już istnieje w naszym "xhci.asm".
+
+Druga jeszcze nie istnieje, więc teraz nie próbuj jeszcze budować projektu — inaczej dostaniesz brak symbolu "xhci_consume_event".
+
+Następny krok to dodanie tej funkcji do "Tools/xhci.asm". I właśnie tam zrobimy prawidłowe:
+
+- przesunięcie indeksu Event Ring,
+- zmianę Cycle State po końcu segmentu,
+- aktualizację "ERDP",
+- zachowanie zgodności z jednym segmentem 256 TRB.
+
+Po tym dopiero będziemy mogli przejść do rzeczywistej enumeracji USB → HID keyboard/mouse, zamiast generowania sztucznych eventów.
