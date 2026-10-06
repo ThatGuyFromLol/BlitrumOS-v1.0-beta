@@ -1,27 +1,26 @@
 ; =============================================================================
 ; BLITRUM OS - USB / xHCI INTERRUPT HANDLER
+; =============================================================================
 ; Plik: Tools/usb_interrupts.asm
 ;
 ; Odpowiedzialność:
 ;   - obsługa IRQ xHCI
 ;   - pobieranie Event TRB z Event Ring
 ;   - dekodowanie typu eventu
-;   - buforowanie eventów programowych
+;   - buforowanie pełnych 16-bajtowych TRB
 ;   - statystyki USB
 ;   - backpressure
-;   - bezpieczne wznowienie IRQ po opróżnieniu bufora
+;   - bezpieczne wznowienie IRQ
 ;
-; xHCI:
-;   IRQ vector = 0x28
+; ZGODNOŚĆ Z Tools/xhci.asm:
 ;
-; Interfejs xhci.asm:
 ;   xhci_get_event:
-;       RAX = Event TRB
+;       RAX = adres aktualnego Event TRB
 ;       RDX = 1 jeśli event istnieje
 ;       RDX = 0 jeśli brak eventu
 ;
 ;   xhci_consume_event:
-;       konsumuje aktualny Event TRB
+;       przesuwa software consumer w Event Ring
 ;
 ;   xhci_enable_interrupts:
 ;       EAX = 1 sukces
@@ -30,8 +29,8 @@
 ;   xhci_disable_interrupts:
 ;       EAX = 0
 ;
-; usb_pop_event:
-;       RAX = wskaźnik do eventu
+;   usb_pop_event:
+;       RAX = adres eventu w software buffer
 ;       RDX = 1 jeśli event istnieje
 ;       RDX = 0 jeśli brak
 ;
@@ -39,7 +38,6 @@
 
 bits 64
 
-section .text
 
 ; =============================================================================
 ; EXTERNALS
@@ -53,37 +51,66 @@ extern xhci_disable_interrupts
 extern scheduler_trigger_event
 extern lapic_eoi
 
+
 ; =============================================================================
 ; CONSTANTS
 ; =============================================================================
 
-USB_INTERRUPT_VECTOR        equ 0x28
+USB_INTERRUPT_VECTOR         equ 0x28
 
+; -----------------------------------------------------------------------------
 ; Software event ring
-USB_EVENT_BUFFER_SIZE       equ 256
-USB_EVENT_SIZE              equ 16
-USB_EVENT_BUFFER_BYTES      equ USB_EVENT_BUFFER_SIZE * USB_EVENT_SIZE
+;
+; 256 wpisów x 16 bajtów.
+;
+; Używamy klasycznego ring buffer:
+;
+;   head == tail              -> pusty
+;   next(head) == tail        -> pełny
+;
+; Z tego powodu maksymalna liczba jednocześnie przechowywanych eventów
+; wynosi 255.
+; -----------------------------------------------------------------------------
 
-; Maximum number of hardware events handled during one hardware IRQ.
-; Prevents an IRQ storm from starving the rest of the kernel.
-USB_MAX_EVENTS_PER_IRQ      equ 64
+USB_EVENT_BUFFER_SIZE        equ 256
+USB_EVENT_SIZE               equ 16
+USB_EVENT_BUFFER_BYTES       equ USB_EVENT_BUFFER_SIZE * USB_EVENT_SIZE
 
-; xHCI TRB Type field
-USB_TRB_TYPE_SHIFT          equ 10
-USB_TRB_TYPE_MASK           equ 0x3F
+; Maksymalna liczba eventów obsłużonych podczas jednego IRQ.
+USB_MAX_EVENTS_PER_IRQ       equ 64
 
-USB_EVENT_TYPE_TRANSFER     equ 32
-USB_EVENT_TYPE_CMD_COMPLETE equ 33
-USB_EVENT_TYPE_PORT_STATUS  equ 34
-USB_EVENT_TYPE_BANDWIDTH    equ 35
-USB_EVENT_TYPE_DOORBELL     equ 36
-USB_EVENT_TYPE_HOST_CTRL    equ 37
+
+; =============================================================================
+; xHCI TRB
+; =============================================================================
+
+USB_TRB_TYPE_SHIFT           equ 10
+USB_TRB_TYPE_MASK            equ 0x3F
+
+USB_TRB_CYCLE_BIT            equ 1
+
+
+; =============================================================================
+; xHCI EVENT TYPES
+; =============================================================================
+
+USB_EVENT_TYPE_TRANSFER      equ 32
+USB_EVENT_TYPE_CMD_COMPLETE  equ 33
+USB_EVENT_TYPE_PORT_STATUS   equ 34
+USB_EVENT_TYPE_BANDWIDTH     equ 35
+USB_EVENT_TYPE_DOORBELL      equ 36
+USB_EVENT_TYPE_HOST_CTRL     equ 37
 USB_EVENT_TYPE_DEVICE_NOTIFY equ 38
-USB_EVENT_TYPE_MFINDEX_WRAP equ 39
+USB_EVENT_TYPE_MFINDEX_WRAP  equ 39
 
-; Task notified when USB activity occurs.
-; Kept compatible with the existing scheduler integration.
-GUI_TASK_ID                 equ 5
+
+; =============================================================================
+; SCHEDULER
+; =============================================================================
+
+; Zachowujemy istniejącą integrację.
+GUI_TASK_ID                  equ 5
+
 
 ; =============================================================================
 ; DATA
@@ -93,12 +120,16 @@ section .data
 
 align 8
 
-; -------------------------------------------------------------------------
-; Software event ring
-; -------------------------------------------------------------------------
+
+; =============================================================================
+; SOFTWARE EVENT BUFFER
+; =============================================================================
 
 usb_event_buffer:
     times USB_EVENT_BUFFER_BYTES db 0
+
+
+align 8
 
 usb_event_head:
     dq 0
@@ -106,9 +137,10 @@ usb_event_head:
 usb_event_tail:
     dq 0
 
-; -------------------------------------------------------------------------
-; Statistics
-; -------------------------------------------------------------------------
+
+; =============================================================================
+; STATISTICS
+; =============================================================================
 
 usb_received_events:
     dq 0
@@ -134,48 +166,56 @@ usb_port_events:
 usb_other_events:
     dq 0
 
-; Last decoded event type.
+
+; Ostatni poprawnie rozpoznany typ eventu.
 usb_last_event_type:
     dd 0
 
-; -------------------------------------------------------------------------
-; xHCI MMIO pointer
-; -------------------------------------------------------------------------
+
+; =============================================================================
+; xHCI MMIO
+; =============================================================================
+
+align 8
 
 xhci_mmio_reg:
     dq 0
 
-; -------------------------------------------------------------------------
-; Backpressure state
+
+; =============================================================================
+; BACKPRESSURE
 ;
-; 0 = normal
-; 1 = software ring became full and xHCI IRQ was disabled
-; -------------------------------------------------------------------------
+; 0 = normalna praca
+; 1 = software buffer pełny, IRQ xHCI wyłączone
+; =============================================================================
 
 usb_irq_backpressure:
     db 0
 
-; Number of events waiting for recovery.
-; Diagnostic only.
+
+align 8
+
+
+; Liczba eventów odzyskanych podczas procedury backpressure.
 usb_pending_recovery:
     dq 0
 
+
 ; =============================================================================
-; CODE
+; TEXT
 ; =============================================================================
 
 section .text
 
+
 ; =============================================================================
 ; usb_interrupts_init
 ;
-; Input:
+; WEJŚCIE:
 ;   RCX = xHCI MMIO base
 ;
-; Output:
+; WYJŚCIE:
 ;   EAX = 1
-;
-; Resets software USB event subsystem.
 ; =============================================================================
 
 global usb_interrupts_init
@@ -188,11 +228,19 @@ usb_interrupts_init:
 
     mov [rel xhci_mmio_reg], rcx
 
-    ; Reset ring indices.
+
+    ; -------------------------------------------------------------------------
+    ; RESET SOFTWARE RING
+    ; -------------------------------------------------------------------------
+
     mov qword [rel usb_event_head], 0
     mov qword [rel usb_event_tail], 0
 
-    ; Reset statistics.
+
+    ; -------------------------------------------------------------------------
+    ; RESET STATISTICS
+    ; -------------------------------------------------------------------------
+
     mov qword [rel usb_received_events], 0
     mov qword [rel usb_processed_events], 0
     mov qword [rel usb_dropped_events], 0
@@ -205,16 +253,31 @@ usb_interrupts_init:
 
     mov dword [rel usb_last_event_type], 0
 
+
+    ; -------------------------------------------------------------------------
+    ; RESET BACKPRESSURE
+    ; -------------------------------------------------------------------------
+
     mov byte [rel usb_irq_backpressure], 0
+
     mov qword [rel usb_pending_recovery], 0
 
-    ; Clear software event ring.
+
+    ; -------------------------------------------------------------------------
+    ; CLEAR SOFTWARE BUFFER
+    ; -------------------------------------------------------------------------
+
     lea rdi, [rel usb_event_buffer]
+
     xor eax, eax
+
     mov ecx, USB_EVENT_BUFFER_BYTES
+
     rep stosb
 
+
     mov eax, 1
+
 
     pop rdx
     pop rcx
@@ -223,36 +286,40 @@ usb_interrupts_init:
 
     ret
 
+
 ; =============================================================================
 ; usb_decode_event_type
 ;
-; Input:
-;   RAX = complete xHCI Event TRB
+; WEJŚCIE:
+;   RAX = control DWORD / pełne TRB low qword
 ;
-; Output:
+; WYJŚCIE:
 ;   EAX = event type
 ;
-; Clobbers:
-;   none besides RAX
+; Dla xHCI:
+;
+;   Control bits 15:10 = TRB Type
 ; =============================================================================
 
 global usb_decode_event_type
 usb_decode_event_type:
 
     shr rax, USB_TRB_TYPE_SHIFT
+
     and eax, USB_TRB_TYPE_MASK
 
     ret
 
+
 ; =============================================================================
 ; usb_get_event_type
 ;
-; Alias/helper for external users.
+; Alias.
 ;
-; Input:
-;   RAX = complete xHCI Event TRB
+; WEJŚCIE:
+;   RAX = wartość zawierająca Control DWORD w odpowiednim miejscu
 ;
-; Output:
+; WYJŚCIE:
 ;   EAX = event type
 ; =============================================================================
 
@@ -260,15 +327,15 @@ global usb_get_event_type
 usb_get_event_type:
 
     call usb_decode_event_type
+
     ret
+
 
 ; =============================================================================
 ; usb_update_event_statistics
 ;
-; Input:
-;   EAX = decoded event type
-;
-; Updates event counters.
+; WEJŚCIE:
+;   EAX = event type
 ; =============================================================================
 
 global usb_update_event_statistics
@@ -284,117 +351,165 @@ usb_update_event_statistics:
     je .port
 
     inc qword [rel usb_other_events]
+
     ret
+
 
 .transfer:
+
     inc qword [rel usb_transfer_events]
+
     ret
+
 
 .command:
+
     inc qword [rel usb_command_events]
+
     ret
 
+
 .port:
+
     inc qword [rel usb_port_events]
+
     ret
+
 
 ; =============================================================================
 ; usb_store_event
 ;
-; Input:
-;   RAX = Event TRB (64-bit)
+; WEJŚCIE:
+;   RAX = adres pełnego Event TRB
 ;
-; The current xHCI event is stored as 16 bytes.
+; Event TRB ma dokładnie 16 bajtów:
 ;
-; Output:
-;   EAX = 1  stored
-;   EAX = 0  software ring full
+;   +00 DWORD 0
+;   +04 DWORD 1
+;   +08 DWORD 2
+;   +0C DWORD 3
 ;
-; Clobbers:
-;   RCX, RDX, RSI, RDI
+; WYJŚCIE:
+;   EAX = 1 zapisano
+;   EAX = 0 bufor pełny
+;
+; WAŻNE:
+;   Funkcja kopiuje pełne 16 bajtów.
 ; =============================================================================
 
 global usb_store_event
 usb_store_event:
 
     push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
 
     ; -------------------------------------------------------------------------
-    ; Load indices.
+    ; Zachowaj źródłowy adres TRB.
+    ; -------------------------------------------------------------------------
+
+    mov rsi, rax
+
+
+    ; -------------------------------------------------------------------------
+    ; Pobierz head/tail.
     ; -------------------------------------------------------------------------
 
     mov rcx, [rel usb_event_head]
     mov rdx, [rel usb_event_tail]
 
-    ; Ring is full when:
-    ;   next(head) == tail
-    ;
-    ; With 256 entries and modulo 256 this means:
-    ;   (head + 1) & 255 == tail
-    ;
-    mov rbx, rcx
-    inc rbx
-    and ebx, USB_EVENT_BUFFER_SIZE - 1
-
-    cmp rbx, rdx
-    je .full
 
     ; -------------------------------------------------------------------------
-    ; Destination = buffer + head * 16
+    ; next(head)
+    ; -------------------------------------------------------------------------
+
+    mov rbx, rcx
+
+    inc rbx
+
+    and ebx, USB_EVENT_BUFFER_SIZE - 1
+
+
+    ; -------------------------------------------------------------------------
+    ; Czy ring pełny?
+    ; -------------------------------------------------------------------------
+
+    cmp rbx, rdx
+
+    je .full
+
+
+    ; -------------------------------------------------------------------------
+    ; destination = buffer + head * 16
     ; -------------------------------------------------------------------------
 
     lea rdi, [rel usb_event_buffer]
 
     mov rdx, rcx
+
     shl rdx, 4
+
     add rdi, rdx
 
-    ; RAX contains the first 64 bits of the TRB.
-    mov [rdi], rax
-
-    ; Get second half of TRB.
-    ;
-    ; xHCI get_event returns the complete TRB in RAX/RDX:
-    ;   RAX = DWORD 0 + DWORD 1
-    ;   RDX = DWORD 2 + DWORD 3
-    ;
-    ; Preserve the second half by copying it directly.
-    mov [rdi + 8], rdx
 
     ; -------------------------------------------------------------------------
-    ; Advance head.
+    ; KOPIUJ PEŁNY TRB = 16 BAJTÓW
+    ; -------------------------------------------------------------------------
+
+    mov rdx, [rsi]
+    mov [rdi], rdx
+
+    mov rdx, [rsi + 8]
+    mov [rdi + 8], rdx
+
+
+    ; -------------------------------------------------------------------------
+    ; head = next(head)
     ; -------------------------------------------------------------------------
 
     mov [rel usb_event_head], rbx
 
+
     mov eax, 1
 
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
     pop rbx
+
     ret
+
 
 .full:
 
-    mov eax, 0
+    xor eax, eax
 
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
     pop rbx
+
     ret
+
 
 ; =============================================================================
 ; usb_process_current_event
 ;
-; Common event processing helper.
+; WEJŚCIE:
+;   RAX = adres aktualnego Event TRB
 ;
-; Input:
-;   RAX = Event TRB low 64 bits
-;   RDX = Event TRB high 64 bits
+; WYJŚCIE:
+;   EAX = 1 event poprawnie zapisany
+;   EAX = 0 event nie został zapisany
 ;
-; Output:
-;   EAX = 1 valid event
-;   EAX = 0 invalid event
-;
-; NOTE:
-;   Does NOT consume the hardware event.
-;   Caller decides when to call xhci_consume_event.
+; UWAGA:
+;   Funkcja NIE konsumuje eventu z xHCI.
+;   Caller robi xhci_consume_event dopiero po sukcesie.
 ; =============================================================================
 
 usb_process_current_event:
@@ -403,29 +518,78 @@ usb_process_current_event:
     push r12
     push r13
 
-    ; Preserve complete TRB.
+
+    ; -------------------------------------------------------------------------
+    ; Zachowaj adres TRB.
+    ; -------------------------------------------------------------------------
+
     mov r12, rax
-    mov r13, rdx
 
-    ; Decode type.
-    mov rax, r12
-    call usb_decode_event_type
 
+    ; -------------------------------------------------------------------------
+    ; Odczytaj CONTROL DWORD.
+    ;
+    ; TRB:
+    ;   +00
+    ;   +04
+    ;   +08
+    ;   +0C = Control
+    ; -------------------------------------------------------------------------
+
+    mov eax, dword [r12 + 12]
+
+
+    ; -------------------------------------------------------------------------
+    ; Sprawdź Cycle Bit.
+    ;
+    ; xhci_get_event już sprawdził cycle state, więc tutaj nie musimy
+    ; ponownie walidować cycle.
+    ; -------------------------------------------------------------------------
+
+
+    ; -------------------------------------------------------------------------
+    ; Dekoduj TRB Type.
+    ; -------------------------------------------------------------------------
+
+    shr eax, USB_TRB_TYPE_SHIFT
+
+    and eax, USB_TRB_TYPE_MASK
+
+
+    ; Typ 0 oznacza brak poprawnego eventu.
     test eax, eax
+
     jz .invalid
+
 
     mov ebx, eax
 
+
+    ; -------------------------------------------------------------------------
+    ; Statystyki.
+    ; -------------------------------------------------------------------------
+
     mov [rel usb_last_event_type], eax
+
     call usb_update_event_statistics
 
-    ; Store complete TRB.
+
+    ; -------------------------------------------------------------------------
+    ; Zapisz pełny 16-bajtowy TRB.
+    ; -------------------------------------------------------------------------
+
     mov rax, r12
-    mov rdx, r13
 
     call usb_store_event
+
     test eax, eax
+
     jz .buffer_full
+
+
+    ; -------------------------------------------------------------------------
+    ; Event poprawnie zapisany.
+    ; -------------------------------------------------------------------------
 
     inc qword [rel usb_processed_events]
 
@@ -436,6 +600,7 @@ usb_process_current_event:
     pop rbx
 
     ret
+
 
 .invalid:
 
@@ -449,10 +614,12 @@ usb_process_current_event:
 
     ret
 
+
 .buffer_full:
 
-    ; Do NOT consume the hardware event.
-    ; Caller must disable IRQ and retry later.
+    ; Event NIE jest konsumowany z hardware.
+    ; Pozostaje w xHCI Event Ring do późniejszego odzyskania.
+
     xor eax, eax
 
     pop r13
@@ -461,36 +628,24 @@ usb_process_current_event:
 
     ret
 
+
 ; =============================================================================
 ; usb_drain_pending_events
 ;
-; IMPORTANT:
-; This is the backpressure recovery path.
+; Procedura odzyskiwania eventów po backpressure.
 ;
-; It runs while xHCI interrupts are still disabled.
+; IRQ xHCI musi być nadal wyłączone.
 ;
-; Purpose:
-;   - check whether Event Ring contains pending events
-;   - copy them to software ring
-;   - consume them from xHCI
-;   - repeat while software ring has capacity
+; Algorytm:
 ;
-; This prevents the following deadlock:
+;   1. sprawdź miejsce w software ring
+;   2. pobierz adres Event TRB
+;   3. skopiuj pełny TRB
+;   4. dopiero po sukcesie consume
+;   5. powtarzaj
 ;
-;   software ring full
-;       -> IRQ OFF
-;       -> user pops one event
-;       -> IRQ ON
-;       -> IMAN.IP cleared
-;       -> old Event Ring event remains pending
-;
-; Instead we drain hardware events BEFORE re-enabling IRQ.
-;
-; Output:
-;   EAX = number of events drained
-;
-; Clobbers:
-;   RAX, RCX, RDX, R8-R11
+; WYJŚCIE:
+;   RAX = liczba odzyskanych eventów
 ; =============================================================================
 
 global usb_drain_pending_events
@@ -502,86 +657,98 @@ usb_drain_pending_events:
 
     xor ebx, ebx
 
+
 .drain_loop:
 
     ; -------------------------------------------------------------------------
-    ; Make sure software ring has room BEFORE touching hardware event.
+    ; SPRAWDŹ CZY SOFTWARE RING MA MIEJSCE
     ; -------------------------------------------------------------------------
 
     mov r12, [rel usb_event_head]
     mov r13, [rel usb_event_tail]
 
     mov rax, r12
+
     inc rax
+
     and eax, USB_EVENT_BUFFER_SIZE - 1
 
     cmp rax, r13
+
     je .done
 
+
     ; -------------------------------------------------------------------------
-    ; Get hardware event.
+    ; POBIERZ EVENT Z xHCI
     ; -------------------------------------------------------------------------
 
     call xhci_get_event
 
     test rdx, rdx
+
     jz .done
 
-    ; Preserve complete TRB.
-    mov r8, rax
-    mov r9, rdx
+
+    ; RAX = adres Event TRB.
+    mov r12, rax
+
 
     ; -------------------------------------------------------------------------
-    ; Decode/store.
+    ; PRZETWÓRZ EVENT
     ; -------------------------------------------------------------------------
 
-    mov rax, r8
-    mov rdx, r9
+    mov rax, r12
 
     call usb_process_current_event
 
     test eax, eax
-    jz .stop_full_or_invalid
+
+    jz .processing_failed
+
 
     ; -------------------------------------------------------------------------
-    ; Event successfully stored.
-    ; Now consume it from xHCI.
+    ; TERAZ MOŻEMY BEZPIECZNIE SKONSUMOWAĆ EVENT
     ; -------------------------------------------------------------------------
 
     call xhci_consume_event
 
     inc rbx
 
-    ; Diagnostic count.
     inc qword [rel usb_pending_recovery]
 
     jmp .drain_loop
 
-.stop_full_or_invalid:
 
-    ; If software buffer became full, keep IRQ disabled.
-    ; Invalid events are consumed below so they cannot permanently
-    ; block the Event Ring.
-    ;
-    ; Determine whether the ring is full.
+.processing_failed:
+
+    ; -------------------------------------------------------------------------
+    ; Sprawdź czy problemem był pełny software ring.
+    ; -------------------------------------------------------------------------
+
     mov rax, [rel usb_event_head]
     mov rcx, [rel usb_event_tail]
 
     mov r8, rax
+
     inc r8
+
     and r8d, USB_EVENT_BUFFER_SIZE - 1
 
     cmp r8, rcx
+
     je .done
 
+
     ; -------------------------------------------------------------------------
-    ; The event was invalid rather than a full software ring.
-    ; We can safely consume it so that one malformed event cannot
-    ; permanently block the Event Ring.
+    ; Nie był pełny -> event był niepoprawny.
+    ;
+    ; Konsumujemy go, żeby wadliwy TRB nie zablokował Event Ring.
     ; -------------------------------------------------------------------------
 
     call xhci_consume_event
+
     jmp .drain_loop
+
 
 .done:
 
@@ -593,25 +760,26 @@ usb_drain_pending_events:
 
     ret
 
+
 ; =============================================================================
 ; usb_resume_after_backpressure
 ;
-; Called after usb_pop_event frees a software-ring slot.
+; Wywoływane po zwolnieniu miejsca w software ring.
 ;
-; Sequence:
+; WAŻNE:
 ;
-;   1. IRQ remains disabled.
-;   2. Drain pending xHCI Event Ring events.
-;   3. If Event Ring is empty, clear backpressure.
-;   4. Re-enable xHCI interrupts.
+; Nie włączamy IRQ od razu.
 ;
-; If software buffer fills again during draining:
-;   - keep backpressure enabled
-;   - leave IRQ disabled
+; Najpierw opróżniamy oczekujące eventy sprzętowe.
 ;
-; Output:
-;   EAX = 1 if IRQ was successfully re-enabled
-;   EAX = 0 if still under backpressure / no recovery
+; Dopiero gdy:
+;
+;   software ring ma miejsce
+;   ORAZ
+;   xHCI Event Ring jest pusty
+;
+; można bezpiecznie zrobić xhci_enable_interrupts.
+;
 ; =============================================================================
 
 global usb_resume_after_backpressure
@@ -620,57 +788,75 @@ usb_resume_after_backpressure:
     push rbx
     push r12
 
+
     ; -------------------------------------------------------------------------
-    ; Only recovery if backpressure was active.
+    ; Czy backpressure aktywny?
     ; -------------------------------------------------------------------------
 
     cmp byte [rel usb_irq_backpressure], 1
+
     jne .nothing_to_do
 
+
     ; -------------------------------------------------------------------------
-    ; Drain hardware Event Ring BEFORE enabling interrupts.
+    ; NAJWAŻNIEJSZY KROK:
+    ;
+    ; IRQ nadal OFF.
+    ; Najpierw drain Event Ring.
     ; -------------------------------------------------------------------------
 
     call usb_drain_pending_events
 
+
     ; -------------------------------------------------------------------------
-    ; Check software ring capacity.
+    ; Sprawdź czy software ring ponownie się nie zapełnił.
     ; -------------------------------------------------------------------------
 
     mov rax, [rel usb_event_head]
     mov rdx, [rel usb_event_tail]
 
     mov rbx, rax
+
     inc rbx
+
     and ebx, USB_EVENT_BUFFER_SIZE - 1
 
     cmp rbx, rdx
+
     je .still_full
 
+
     ; -------------------------------------------------------------------------
-    ; Check if another hardware event is still pending.
-    ;
-    ; We intentionally do this BEFORE enabling IRQ.
-    ; If one exists, drain it instead of clearing IMAN.IP.
+    ; Sprawdź ponownie hardware Event Ring.
     ; -------------------------------------------------------------------------
 
     call xhci_get_event
 
     test rdx, rdx
-    jnz .more_hardware_events
+
+    jnz .hardware_still_pending
+
 
     ; -------------------------------------------------------------------------
-    ; Hardware Event Ring is empty and software ring has space.
-    ; Safe to leave backpressure state.
+    ; Hardware Event Ring pusty.
+    ; Software ring ma miejsce.
+    ;
+    ; Możemy zdjąć backpressure.
     ; -------------------------------------------------------------------------
 
     mov byte [rel usb_irq_backpressure], 0
 
-    ; Now it is safe to enable interrupts.
+
+    ; -------------------------------------------------------------------------
+    ; Dopiero teraz włącz IRQ.
+    ; -------------------------------------------------------------------------
+
     call xhci_enable_interrupts
 
     test eax, eax
+
     jz .enable_failed
+
 
     mov eax, 1
 
@@ -679,35 +865,58 @@ usb_resume_after_backpressure:
 
     ret
 
-.more_hardware_events:
 
-    ; There is still an event.
-    ; Do not enable IRQ yet.
+.hardware_still_pending:
+
+    ; -------------------------------------------------------------------------
+    ; Teoretycznie drain powinien już je obsłużyć.
+    ; Robimy jeszcze jeden drain dla bezpieczeństwa.
+    ; -------------------------------------------------------------------------
+
     call usb_drain_pending_events
 
-    ; Check again whether software ring became full.
+
+    ; -------------------------------------------------------------------------
+    ; Sprawdź software ring.
+    ; -------------------------------------------------------------------------
+
     mov rax, [rel usb_event_head]
     mov rdx, [rel usb_event_tail]
 
     mov rbx, rax
+
     inc rbx
+
     and ebx, USB_EVENT_BUFFER_SIZE - 1
 
     cmp rbx, rdx
+
     je .still_full
 
-    ; Hardware should now be empty. Verify.
+
+    ; -------------------------------------------------------------------------
+    ; Sprawdź hardware jeszcze raz.
+    ; -------------------------------------------------------------------------
+
     call xhci_get_event
 
     test rdx, rdx
+
     jnz .still_pending
 
+
+    ; -------------------------------------------------------------------------
+    ; Wszystko opróżnione.
+    ; -------------------------------------------------------------------------
+
     mov byte [rel usb_irq_backpressure], 0
 
     call xhci_enable_interrupts
 
     test eax, eax
+
     jz .enable_failed
+
 
     mov eax, 1
 
@@ -716,9 +925,12 @@ usb_resume_after_backpressure:
 
     ret
 
+
 .still_full:
+
 .still_pending:
 
+    ; Nadal nie możemy włączyć IRQ.
     mov byte [rel usb_irq_backpressure], 1
 
     xor eax, eax
@@ -727,10 +939,11 @@ usb_resume_after_backpressure:
     pop rbx
 
     ret
+
 
 .enable_failed:
 
-    ; Keep backpressure state so a later pop can retry.
+    ; Zachowujemy backpressure.
     mov byte [rel usb_irq_backpressure], 1
 
     xor eax, eax
@@ -739,6 +952,7 @@ usb_resume_after_backpressure:
     pop rbx
 
     ret
+
 
 .nothing_to_do:
 
@@ -749,32 +963,19 @@ usb_resume_after_backpressure:
 
     ret
 
+
 ; =============================================================================
 ; isr_xhci_handler
 ;
-; Hardware IRQ handler.
+; IRQ handler xHCI.
 ;
-; Responsibilities:
-;   - consume as many xHCI events as fit
-;   - stop at 64 events per IRQ
-;   - apply software-ring backpressure
-;   - notify scheduler
-;   - send LAPIC EOI
-;
-; IMPORTANT:
-; When software ring becomes full:
-;   - current hardware event is NOT consumed
-;   - xHCI interrupts are disabled
-;   - backpressure is enabled
-;
-; The event will be drained after usb_pop_event frees space.
 ; =============================================================================
 
 global isr_xhci_handler
 isr_xhci_handler:
 
     ; -------------------------------------------------------------------------
-    ; Save volatile registers.
+    ; SAVE VOLATILE REGISTERS
     ; -------------------------------------------------------------------------
 
     push rax
@@ -788,123 +989,154 @@ isr_xhci_handler:
     push r10
     push r11
 
+
     xor r10d, r10d
+
 
 .event_loop:
 
+    ; -------------------------------------------------------------------------
+    ; LIMIT EVENTÓW NA JEDNO IRQ
+    ; -------------------------------------------------------------------------
+
     cmp r10d, USB_MAX_EVENTS_PER_IRQ
+
     jae .irq_limit
 
+
     ; -------------------------------------------------------------------------
-    ; Get next xHCI event.
+    ; POBIERZ EVENT
     ; -------------------------------------------------------------------------
 
     call xhci_get_event
 
     test rdx, rdx
+
     jz .events_done
 
-    ; -------------------------------------------------------------------------
-    ; Preserve complete TRB while processing.
-    ; -------------------------------------------------------------------------
 
+    ; RAX = adres Event TRB.
     mov r8, rax
-    mov r9, rdx
+
+
+    ; -------------------------------------------------------------------------
+    ; PROCESUJ
+    ; -------------------------------------------------------------------------
 
     mov rax, r8
-    mov rdx, r9
-
-    ; -------------------------------------------------------------------------
-    ; Decode/store event.
-    ; -------------------------------------------------------------------------
 
     call usb_process_current_event
 
     test eax, eax
+
     jz .event_store_failed
 
+
     ; -------------------------------------------------------------------------
-    ; Only consume hardware event after successful software buffering.
+    ; EVENT JEST W SOFTWARE BUFFER.
+    ;
+    ; TERAZ dopiero consume hardware event.
     ; -------------------------------------------------------------------------
 
     call xhci_consume_event
 
+
     inc r10d
 
+    inc qword [rel usb_received_events]
+
     jmp .event_loop
+
 
 .event_store_failed:
 
     ; -------------------------------------------------------------------------
-    ; Determine whether software ring is full.
+    ; Sprawdź czy software ring jest pełny.
     ; -------------------------------------------------------------------------
 
     mov rax, [rel usb_event_head]
     mov rcx, [rel usb_event_tail]
 
     mov rbx, rax
+
     inc rbx
+
     and ebx, USB_EVENT_BUFFER_SIZE - 1
 
     cmp rbx, rcx
-    jne .invalid_event
+
+    je .buffer_full
+
 
     ; -------------------------------------------------------------------------
-    ; SOFTWARE RING FULL
+    ; Event niepoprawny.
     ;
-    ; Keep the hardware event pending.
-    ; Disable xHCI interrupts so the controller cannot continuously
-    ; interrupt while software is unable to accept more events.
-    ; -------------------------------------------------------------------------
-
-    mov byte [rel usb_irq_backpressure], 1
-
-    call xhci_disable_interrupts
-
-    jmp .events_done
-
-.invalid_event:
-
-    ; -------------------------------------------------------------------------
-    ; Invalid event:
-    ; consume it so it cannot permanently block Event Ring.
+    ; Nie może zablokować Event Ring.
     ; -------------------------------------------------------------------------
 
     call xhci_consume_event
 
     inc r10d
 
+    inc qword [rel usb_received_events]
+
     jmp .event_loop
+
+
+.buffer_full:
+
+    ; -------------------------------------------------------------------------
+    ; SOFTWARE BUFFER FULL
+    ;
+    ; NIE konsumujemy aktualnego hardware eventu.
+    ;
+    ; Wyłączamy IRQ xHCI.
+    ; Event pozostaje w Event Ring.
+    ; -------------------------------------------------------------------------
+
+    mov byte [rel usb_irq_backpressure], 1
+
+    inc qword [rel usb_dropped_events]
+
+    call xhci_disable_interrupts
+
+    jmp .events_done
+
 
 .irq_limit:
 
     ; -------------------------------------------------------------------------
-    ; We intentionally stop after USB_MAX_EVENTS_PER_IRQ.
+    ; Ograniczenie 64 eventów na IRQ.
     ;
-    ; The Event Ring may still contain events.
-    ; Normal xHCI interrupt signaling will cause another pass.
+    ; Jeśli hardware Event Ring nadal zawiera eventy, normalne IRQ xHCI
+    ; będzie kontynuowane.
     ; -------------------------------------------------------------------------
 
     jmp .events_done
 
+
 .events_done:
 
     ; -------------------------------------------------------------------------
-    ; If we processed at least one event, notify scheduler.
+    ; Jeśli obsłużyliśmy przynajmniej jeden event, powiadom scheduler.
     ; -------------------------------------------------------------------------
 
     test r10d, r10d
+
     jz .send_eoi
 
     mov ecx, GUI_TASK_ID
+
     call scheduler_trigger_event
+
 
 .send_eoi:
 
     call lapic_eoi
 
+
     ; -------------------------------------------------------------------------
-    ; Restore registers.
+    ; RESTORE REGISTERS
     ; -------------------------------------------------------------------------
 
     pop r11
@@ -920,22 +1152,16 @@ isr_xhci_handler:
 
     iretq
 
+
 ; =============================================================================
 ; usb_pop_event
 ;
-; Removes one event from the software ring.
+; WYJŚCIE:
+;   RAX = adres eventu
+;   RDX = 1 event istnieje
 ;
-; Output:
-;   RAX = pointer to event
-;   RDX = 1 if event exists
-;   RDX = 0 if empty
+;   RDX = 0 jeśli software ring pusty
 ;
-; IMPORTANT:
-; After freeing an entry, if backpressure was active:
-;   - pending xHCI events are drained first
-;   - only then are xHCI interrupts re-enabled
-;
-; This prevents the IMAN.IP race described above.
 ; =============================================================================
 
 global usb_pop_event
@@ -944,53 +1170,71 @@ usb_pop_event:
     push rbx
     push rcx
 
+
     mov rbx, [rel usb_event_tail]
     mov rcx, [rel usb_event_head]
 
-    ; Empty?
-    cmp rbx, rcx
-    je .empty
 
     ; -------------------------------------------------------------------------
-    ; Return pointer to current event.
+    ; EMPTY?
+    ; -------------------------------------------------------------------------
+
+    cmp rbx, rcx
+
+    je .empty
+
+
+    ; -------------------------------------------------------------------------
+    ; RAX = adres aktualnego eventu
     ; -------------------------------------------------------------------------
 
     lea rax, [rel usb_event_buffer]
 
     mov rcx, rbx
+
     shl rcx, 4
+
     add rax, rcx
 
+
     ; -------------------------------------------------------------------------
-    ; Advance tail.
+    ; ADVANCE TAIL
     ; -------------------------------------------------------------------------
 
     inc rbx
+
     and ebx, USB_EVENT_BUFFER_SIZE - 1
 
     mov [rel usb_event_tail], rbx
 
+
     mov edx, 1
 
+
     ; -------------------------------------------------------------------------
-    ; If backpressure was active, recover now.
+    ; Jeśli backpressure był aktywny:
     ;
-    ; The event pointer returned in RAX must remain valid until the caller
-    ; finishes reading it. Recovery may write into another slot, but the
-    ; current slot is now the old tail and is no longer part of the active
-    ; ring.
+    ;   1. wolne miejsce już istnieje
+    ;   2. opróżnij Event Ring
+    ;   3. dopiero potem włącz IRQ
     ; -------------------------------------------------------------------------
 
     cmp byte [rel usb_irq_backpressure], 1
+
     jne .return_event
 
+
+    ; Zachowaj wynik usb_pop_event.
     push rax
     push rdx
 
+
     call usb_resume_after_backpressure
+
 
     pop rdx
     pop rax
+
 
 .return_event:
 
@@ -998,6 +1242,7 @@ usb_pop_event:
     pop rbx
 
     ret
+
 
 .empty:
 
@@ -1009,11 +1254,12 @@ usb_pop_event:
 
     ret
 
+
 ; =============================================================================
 ; usb_get_buffer_count
 ;
-; Output:
-;   RAX = number of events currently buffered
+; WYJŚCIE:
+;   RAX = liczba eventów w software ring
 ; =============================================================================
 
 global usb_get_buffer_count
@@ -1023,9 +1269,11 @@ usb_get_buffer_count:
     mov rdx, [rel usb_event_tail]
 
     sub rax, rdx
+
     and eax, USB_EVENT_BUFFER_SIZE - 1
 
     ret
+
 
 ; =============================================================================
 ; usb_get_received_events
@@ -1035,7 +1283,9 @@ global usb_get_received_events
 usb_get_received_events:
 
     mov rax, [rel usb_received_events]
+
     ret
+
 
 ; =============================================================================
 ; usb_get_processed_events
@@ -1045,7 +1295,9 @@ global usb_get_processed_events
 usb_get_processed_events:
 
     mov rax, [rel usb_processed_events]
+
     ret
+
 
 ; =============================================================================
 ; usb_get_dropped_events
@@ -1055,7 +1307,9 @@ global usb_get_dropped_events
 usb_get_dropped_events:
 
     mov rax, [rel usb_dropped_events]
+
     ret
+
 
 ; =============================================================================
 ; usb_get_invalid_events
@@ -1065,7 +1319,9 @@ global usb_get_invalid_events
 usb_get_invalid_events:
 
     mov rax, [rel usb_invalid_events]
+
     ret
+
 
 ; =============================================================================
 ; usb_get_last_event_type
@@ -1075,21 +1331,25 @@ global usb_get_last_event_type
 usb_get_last_event_type:
 
     mov eax, [rel usb_last_event_type]
+
     ret
+
 
 ; =============================================================================
 ; usb_get_backpressure_state
 ;
-; Output:
-;   EAX = 1 backpressure active
-;   EAX = 0 normal
+; WYJŚCIE:
+;   EAX = 1 backpressure aktywny
+;   EAX = 0 normalna praca
 ; =============================================================================
 
 global usb_get_backpressure_state
 usb_get_backpressure_state:
 
     movzx eax, byte [rel usb_irq_backpressure]
+
     ret
+
 
 ; =============================================================================
 ; usb_get_pending_recovery_count
@@ -1099,8 +1359,10 @@ global usb_get_pending_recovery_count
 usb_get_pending_recovery_count:
 
     mov rax, [rel usb_pending_recovery]
+
     ret
 
+
 ; =============================================================================
-; END
+; END OF FILE
 ; =============================================================================
