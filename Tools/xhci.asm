@@ -15,6 +15,7 @@
 ;   - ERST
 ;   - Interrupter 0
 ;   - Event Ring consumer
+;   - kontrolowane włączanie/wyłączanie przerwań
 ;   - uruchomienie kontrolera
 ;
 ; ==============================================================================
@@ -34,6 +35,8 @@ global xhci_stop
 global xhci_get_event
 global xhci_consume_event
 global xhci_submit_command
+global xhci_enable_interrupts
+global xhci_disable_interrupts
 
 
 ; ==============================================================================
@@ -102,6 +105,17 @@ XHCI_IMOD               equ 0x04
 XHCI_ERSTSZ             equ 0x08
 XHCI_ERSTBA             equ 0x10
 XHCI_ERDP               equ 0x18
+
+
+; ==============================================================================
+; IMAN FLAGS
+; ==============================================================================
+
+; IMAN bit 0 = Interrupt Pending
+XHCI_IMAN_IP             equ 1 << 0
+
+; IMAN bit 1 = Interrupt Enable
+XHCI_IMAN_IE             equ 1 << 1
 
 
 ; ==============================================================================
@@ -456,10 +470,10 @@ xhci_init:
 
 
     ; ==========================================================================
-    ; INTERRUPTER 0:
+    ; INTERRUPTER 0
     ;
     ; Na tym etapie pozostaje wyłączony.
-    ; Event Ring jest jednak w pełni skonfigurowany.
+    ; Event Ring jest jednak skonfigurowany.
     ; ==========================================================================
 
     mov rax, [rel xhci_runtime_base]
@@ -1457,6 +1471,183 @@ xhci_submit_command:
 
     ret
 
-Ten plik zastępuje cały obecny "Tools/xhci.asm".
 
-Po wklejeniu napisz tylko „gotowe”. Następny krok będzie już ważniejszy: włączenie rzeczywistego interruptera xHCI + obsługa typów Event TRB, a potem przejdziemy do enumeracji USB/HID.
+; ==============================================================================
+; xhci_enable_interrupts
+;
+; Włącza sprzętowe przerwania xHCI dla interruptera 0.
+;
+; UWAGA:
+;   Funkcja NIE odmaskowuje IOAPIC.
+;
+; Kolejność:
+;
+;   1. wyczyść zalegające EINT
+;   2. wyczyść IMAN.IP
+;   3. ustaw IMAN.IE
+;   4. ustaw USBCMD.INTE
+;
+; ==============================================================================
+
+xhci_enable_interrupts:
+
+    push rbx
+
+
+    ; ==========================================================================
+    ; OPERATIONAL BASE
+    ; ==========================================================================
+
+    mov rbx, [rel xhci_op_base]
+
+    test rbx, rbx
+
+    jz .fail
+
+
+    ; ==========================================================================
+    ; RUNTIME BASE
+    ; ==========================================================================
+
+    mov rax, [rel xhci_runtime_base]
+
+    test rax, rax
+
+    jz .fail
+
+
+    ; ==========================================================================
+    ; CLEAR USBSTS.EINT
+    ;
+    ; USBSTS bit 3 = Event Interrupt
+    ; RW1C
+    ; ==========================================================================
+
+    mov edx, XHCI_STS_EINT
+
+    mov dword [rbx + XHCI_USBSTS], edx
+
+
+    ; ==========================================================================
+    ; CLEAR IMAN.IP
+    ;
+    ; IMAN bit 0 = Interrupt Pending
+    ; RW1C
+    ; ==========================================================================
+
+    mov edx, XHCI_IMAN_IP
+
+    mov dword [rax + XHCI_IMAN], edx
+
+
+    ; ==========================================================================
+    ; IMAN.IE = 1
+    ; ==========================================================================
+
+    mov edx, dword [rax + XHCI_IMAN]
+
+    or edx, XHCI_IMAN_IE
+
+    mov dword [rax + XHCI_IMAN], edx
+
+
+    ; ==========================================================================
+    ; USBCMD.INTE = 1
+    ; ==========================================================================
+
+    mov edx, dword [rbx + XHCI_USBCMD]
+
+    or edx, XHCI_CMD_INTE
+
+    mov dword [rbx + XHCI_USBCMD], edx
+
+
+    ; ==========================================================================
+    ; SUCCESS
+    ; ==========================================================================
+
+    mov eax, 1
+
+    pop rbx
+
+    ret
+
+
+.fail:
+
+    xor eax, eax
+
+    pop rbx
+
+    ret
+
+
+; ==============================================================================
+; xhci_disable_interrupts
+;
+; Wyłącza sprzętowe przerwania xHCI.
+;
+; Nie zatrzymuje kontrolera.
+; Nie zmienia Event Ring.
+; Nie zmienia IOAPIC.
+;
+; ==============================================================================
+
+xhci_disable_interrupts:
+
+    push rbx
+
+
+    ; ==========================================================================
+    ; OPERATIONAL BASE
+    ; ==========================================================================
+
+    mov rbx, [rel xhci_op_base]
+
+    test rbx, rbx
+
+    jz .done
+
+
+    ; ==========================================================================
+    ; RUNTIME BASE
+    ; ==========================================================================
+
+    mov rax, [rel xhci_runtime_base]
+
+    test rax, rax
+
+    jz .disable_controller
+
+
+    ; ==========================================================================
+    ; IMAN.IE = 0
+    ; ==========================================================================
+
+    mov edx, dword [rax + XHCI_IMAN]
+
+    and edx, ~XHCI_IMAN_IE
+
+    mov dword [rax + XHCI_IMAN], edx
+
+
+.disable_controller:
+
+    ; ==========================================================================
+    ; USBCMD.INTE = 0
+    ; ==========================================================================
+
+    mov edx, dword [rbx + XHCI_USBCMD]
+
+    and edx, ~XHCI_CMD_INTE
+
+    mov dword [rbx + XHCI_USBCMD], edx
+
+
+.done:
+
+    xor eax, eax
+
+    pop rbx
+
+    ret
