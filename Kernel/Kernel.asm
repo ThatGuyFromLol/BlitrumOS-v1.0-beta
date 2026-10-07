@@ -13,38 +13,6 @@
 ; BootInfo:
 ;   RCX
 ;
-; Kolejność inicjalizacji:
-;
-;   GDT
-;    |
-;   PMM
-;    |
-;   ACPI
-;    |
-;   LAPIC
-;    |
-;   IOAPIC
-;    |
-;   IDT
-;    |
-;   HID / GUI / Storage
-;    |
-;   AHS-TUS / Multicore
-;    |
-;   Scheduler
-;    |
-;   LAPIC Timer
-;    |
-;   xHCI
-;    |
-;   xHCI MSI -> LAPIC vector 0x28
-;       lub
-;   xHCI legacy IRQ -> IOAPIC -> LAPIC vector 0x28
-;    |
-;   xHCI interrupts
-;    |
-;   STI
-;
 ; =============================================================================
 
 bits 64
@@ -99,6 +67,7 @@ extern hid_init
 extern gui_init
 extern gui_draw_window
 extern gui_refresh_screen
+extern gui_pixel_format
 
 
 ; -----------------------------------------------------------------------------
@@ -109,7 +78,6 @@ extern find_ahci_controller
 extern init_ahci_controller
 
 extern vfs_mount_drive
-
 extern tgfs_load_and_map_file
 
 
@@ -218,11 +186,11 @@ _start:
 
 
     ; -------------------------------------------------------------------------
-    ; UEFI bootloader passes:
+    ; UEFI bootloader:
     ;
     ;   RCX = BootInfo
     ;
-    ; Save it immediately.
+    ; Save immediately.
     ; -------------------------------------------------------------------------
 
     mov [rel boot_info_ptr], rcx
@@ -273,12 +241,6 @@ _start:
     ;   R8  = memory map size
     ;   R9  = memory map address
     ;
-    ; BootInfo:
-    ;
-    ;   +0x20 = memory map address
-    ;   +0x28 = memory map size
-    ;   +0x30 = descriptor size
-    ;
     ; =========================================================================
 
     mov rbx, [rel boot_info_ptr]
@@ -286,10 +248,6 @@ _start:
     mov rcx, [rbx + BOOTINFO_MEMMAP_DESC_SIZE]
     mov r8,  [rbx + BOOTINFO_MEMMAP_SIZE]
     mov r9,  [rbx + BOOTINFO_MEMMAP]
-
-    ; -------------------------------------------------------------------------
-    ; Validate PMM arguments.
-    ; -------------------------------------------------------------------------
 
     test rcx, rcx
     jz kernel_pmm_error
@@ -301,10 +259,6 @@ _start:
     jz kernel_pmm_error
 
     call pmm_init
-
-    ; -------------------------------------------------------------------------
-    ; bitmap_base == 0 means PMM initialization failed.
-    ; -------------------------------------------------------------------------
 
     cmp qword [rel bitmap_base], 0
     je kernel_pmm_error
@@ -322,10 +276,6 @@ _start:
     ;   RCX = RSDP
     ;   RAX = 1 success
     ;   RAX = 0 failure
-    ;
-    ; BootInfo:
-    ;
-    ;   +0x40 = ACPI RSDP
     ;
     ; =========================================================================
 
@@ -363,9 +313,6 @@ _start:
     ; =========================================================================
 
     call ioapic_init
-
-    ; IOAPIC may be unavailable.
-    ; MSI can still be used by xHCI.
 
     test eax, eax
     jz .ioapic_unavailable
@@ -415,8 +362,77 @@ _start:
     ; =========================================================================
     ; GUI
     ; =========================================================================
+    ;
+    ; gui_init ABI:
+    ;
+    ;   RCX  = framebuffer
+    ;   EDX  = width
+    ;   R8D  = height
+    ;   R9D  = pixels per scanline
+    ;
+    ; Pixel format:
+    ;
+    ;   gui_pixel_format = 0 -> RGB
+    ;   gui_pixel_format = 1 -> BGR
+    ;
+    ; =========================================================================
 
-    mov rdi, [rel boot_info_ptr]
+    mov rbx, [rel boot_info_ptr]
+
+
+    ; -------------------------------------------------------------------------
+    ; RCX = framebuffer
+    ; -------------------------------------------------------------------------
+
+    mov rcx, [rbx + BOOTINFO_FRAMEBUFFER]
+
+
+    ; -------------------------------------------------------------------------
+    ; EDX = width
+    ; -------------------------------------------------------------------------
+
+    mov edx, [rbx + BOOTINFO_WIDTH]
+
+
+    ; -------------------------------------------------------------------------
+    ; R8D = height
+    ; -------------------------------------------------------------------------
+
+    mov r8d, [rbx + BOOTINFO_HEIGHT]
+
+
+    ; -------------------------------------------------------------------------
+    ; R9D = pixels per scanline
+    ; -------------------------------------------------------------------------
+
+    mov r9d, [rbx + BOOTINFO_PPS]
+
+
+    ; -------------------------------------------------------------------------
+    ; GUI pixel format
+    ;
+    ; 0 = RGB
+    ; 1 = BGR
+    ; -------------------------------------------------------------------------
+
+    mov eax, [rbx + BOOTINFO_PIXEL_FORMAT]
+
+    cmp eax, 1
+    jbe .gui_pixel_format_valid
+
+    ; Unsupported GOP format.
+    ; Do not pass PixelBitMask / PixelBltOnly into the RGB/BGR engine.
+    xor eax, eax
+
+
+.gui_pixel_format_valid:
+
+    mov [rel gui_pixel_format], eax
+
+
+    ; -------------------------------------------------------------------------
+    ; Initialize GUI.
+    ; -------------------------------------------------------------------------
 
     call gui_init
 
@@ -566,12 +582,10 @@ _start:
     ; =========================================================================
 
     cmp byte [rel xhci_msi_active], 1
-
     je .xhci_interrupt_ready
 
 
     cmp byte [rel xhci_irq_routed], 1
-
     jne kernel_xhci_irq_error
 
 
@@ -626,7 +640,6 @@ _start:
 .kernel_halted:
 
     cli
-
     hlt
 
     jmp .kernel_halted
@@ -646,7 +659,7 @@ kernel_init_xhci_irq:
 
 
     ; -------------------------------------------------------------------------
-    ; Reset state
+    ; Reset state.
     ; -------------------------------------------------------------------------
 
     mov byte [rel xhci_msi_active], 0
@@ -674,7 +687,7 @@ kernel_init_xhci_irq:
 
 
     ; -------------------------------------------------------------------------
-    ; MSI vector
+    ; MSI vector.
     ; -------------------------------------------------------------------------
 
     mov esi, XHCI_IRQ_VECTOR
@@ -832,7 +845,6 @@ kernel_bootinfo_error:
     cli
 
     lea rdi, [rel msg_bootinfo_error]
-
     call serial_log
 
     jmp kernel_fatal_halt
@@ -843,7 +855,6 @@ kernel_pmm_error:
     cli
 
     lea rdi, [rel msg_pmm_error]
-
     call serial_log
 
     jmp kernel_fatal_halt
@@ -854,7 +865,6 @@ kernel_acpi_error:
     cli
 
     lea rdi, [rel msg_acpi_error]
-
     call serial_log
 
     jmp kernel_fatal_halt
@@ -865,7 +875,6 @@ kernel_lapic_error:
     cli
 
     lea rdi, [rel msg_lapic_error]
-
     call serial_log
 
     jmp kernel_fatal_halt
@@ -876,7 +885,6 @@ kernel_lapic_timer_error:
     cli
 
     lea rdi, [rel msg_lapic_timer_error]
-
     call serial_log
 
     jmp kernel_fatal_halt
@@ -887,7 +895,6 @@ kernel_xhci_error:
     cli
 
     lea rdi, [rel msg_xhci_error]
-
     call serial_log
 
     jmp kernel_fatal_halt
@@ -897,4 +904,214 @@ kernel_xhci_irq_error:
 
     cli
 
-    lea rdi, [rel msg_xhci_irq_error
+    lea rdi, [rel msg_xhci_irq_error]
+    call serial_log
+
+    jmp kernel_fatal_halt
+
+
+kernel_xhci_enable_error:
+
+    cli
+
+    lea rdi, [rel msg_xhci_enable_error]
+    call serial_log
+
+    jmp kernel_fatal_halt
+
+
+; =============================================================================
+; FATAL HALT
+; =============================================================================
+
+kernel_fatal_halt:
+
+    cli
+
+
+.fatal_loop:
+
+    hlt
+
+    jmp .fatal_loop
+
+
+; =============================================================================
+; DATA
+; =============================================================================
+
+section .data
+
+
+; -----------------------------------------------------------------------------
+; BootInfo pointer
+; -----------------------------------------------------------------------------
+
+boot_info_ptr:
+    dq 0
+
+
+; -----------------------------------------------------------------------------
+; xHCI IRQ state
+; -----------------------------------------------------------------------------
+
+xhci_msi_active:
+    db 0
+
+xhci_irq_routed:
+    db 0
+
+xhci_legacy_irq:
+    db 0xFF
+
+    align 8
+
+
+; -----------------------------------------------------------------------------
+; GUI pixel format
+;
+; 0 = RGB
+; 1 = BGR
+; -----------------------------------------------------------------------------
+
+gui_pixel_format:
+    dd 0
+
+    align 8
+
+
+; =============================================================================
+; SERIAL MESSAGES
+; =============================================================================
+
+msg_kernel_start:
+    db "BLITRUM KERNEL START", 13, 10, 0
+
+msg_bootinfo_error:
+    db "BOOTINFO ERROR", 13, 10, 0
+
+msg_pmm_ok:
+    db "PMM OK", 13, 10, 0
+
+msg_pmm_error:
+    db "PMM ERROR", 13, 10, 0
+
+msg_acpi_ok:
+    db "ACPI OK", 13, 10, 0
+
+msg_acpi_error:
+    db "ACPI ERROR", 13, 10, 0
+
+msg_lapic_ok:
+    db "LAPIC OK", 13, 10, 0
+
+msg_lapic_error:
+    db "LAPIC ERROR", 13, 10, 0
+
+msg_ioapic_ok:
+    db "IOAPIC OK", 13, 10, 0
+
+msg_ioapic_missing:
+    db "IOAPIC NOT AVAILABLE - MSI MAY BE USED", 13, 10, 0
+
+msg_idt_ok:
+    db "IDT OK", 13, 10, 0
+
+msg_hid_ok:
+    db "HID OK", 13, 10, 0
+
+msg_gui_ok:
+    db "GUI OK", 13, 10, 0
+
+msg_ahci_ok:
+    db "AHCI OK", 13, 10, 0
+
+msg_ahci_missing:
+    db "AHCI NOT AVAILABLE", 13, 10, 0
+
+msg_vfs_ok:
+    db "VFS OK", 13, 10, 0
+
+msg_tgfs_ok:
+    db "TGFS OK", 13, 10, 0
+
+msg_update_ok:
+    db "UPDATE SYSTEM OK", 13, 10, 0
+
+msg_ahs_ok:
+    db "AHS-TUS OK", 13, 10, 0
+
+msg_multicore_ok:
+    db "MULTICORE OK", 13, 10, 0
+
+msg_scheduler_ok:
+    db "SCHEDULER OK", 13, 10, 0
+
+msg_lapic_timer_ok:
+    db "LAPIC TIMER OK", 13, 10, 0
+
+msg_lapic_timer_error:
+    db "LAPIC TIMER ERROR", 13, 10, 0
+
+msg_xhci_ok:
+    db "xHCI OK", 13, 10, 0
+
+msg_xhci_msi_ok:
+    db "xHCI MSI OK", 13, 10, 0
+
+msg_xhci_msi_failed:
+    db "xHCI MSI FAILED - TRYING LEGACY IRQ", 13, 10, 0
+
+msg_xhci_legacy_ok:
+    db "xHCI LEGACY IRQ ROUTED", 13, 10, 0
+
+msg_xhci_irq_ready:
+    db "xHCI IRQ READY", 13, 10, 0
+
+msg_xhci_irq_failed:
+    db "xHCI IRQ ROUTING FAILED", 13, 10, 0
+
+msg_xhci_enable_error:
+    db "xHCI INTERRUPT ENABLE ERROR", 13, 10, 0
+
+msg_xhci_error:
+    db "xHCI INIT ERROR", 13, 10, 0
+
+msg_interrupts_enabled:
+    db "INTERRUPTS ENABLED", 13, 10, 0
+
+msg_kernel_ready:
+    db "BLITRUM KERNEL READY", 13, 10, 0
+
+
+; =============================================================================
+; BSS
+; =============================================================================
+
+section .bss
+
+align 16
+
+; BootInfo is filled by UEFI bootloader before kernel entry.
+;
+; This variable only stores the pointer.
+;
+; The actual BootInfo structure lives in bootloader-owned memory
+; that remains valid after ExitBootServices().
+;
+align 8
+
+boot_info_storage:
+    resq 1
+
+; Alias used by code.
+;
+; NASM allows us to reserve a separate storage location, but the code uses
+; boot_info_ptr above. Keep one canonical location by equating the symbol.
+;
+; No additional allocation is required.
+
+
+; =============================================================================
+; END OF KERNEL
+; =============================================================================
