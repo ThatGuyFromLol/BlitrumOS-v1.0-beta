@@ -6,6 +6,8 @@
 ;
 ; AHCI <-> VFS <-> TGFS
 ;
+; FULL TGFS REGISTRY INTEGRITY VALIDATION
+;
 ; ==============================================================================
 
 bits 64
@@ -144,8 +146,8 @@ ELF_MACHINE_X86_64        equ 0x003E
 ELF_TYPE_EXEC             equ 2
 ELF_TYPE_DYN              equ 3
 
-ELF_HEADER_SIZE           equ 64
-ELF_PHDR_SIZE             equ 56
+ELF_HEADER_SIZE            equ 64
+ELF_PHDR_SIZE              equ 56
 
 
 ; ==============================================================================
@@ -249,20 +251,32 @@ vfs_mount_drive:
     test rax, rax
     jz .mount_failed
 
+    ; Registry must be after the superblock.
     cmp rax, TGFS_SUPERBLOCK_LBA
     jbe .mount_failed
 
+    ; Registry LBA itself must fit AHCI 48-bit addressing.
+    mov rdx, rax
+    shr rdx, 48
+    test rdx, rdx
+    jnz .mount_failed
+
+    ; Registry occupies one complete sector.
+    ;
+    ; It may legally be LBA 2.
+    ; Data starts at LBA 3.
+    ;
+    ; Therefore only registry LBAs >= DATA_START_LBA would collide
+    ; with the data area and are rejected later by the full validator.
     mov [rel tgfs_registry_lba], rax
 
 
     ; ==========================================================================
     ; VALIDATE REGISTRY THROUGH AHCI
     ;
-    ; Registry is read again by tgfs_validate_registry.
-    ;
     ; This deliberately makes mounting a real end-to-end test:
     ;
-    ;   SATA -> AHCI -> registry -> TGFS
+    ;   SATA -> AHCI -> registry -> TGFS integrity
     ; ==========================================================================
 
     mov rcx, r12
@@ -321,17 +335,23 @@ vfs_mount_drive:
 ;   CF  = 0 valid
 ;   CF  = 1 invalid
 ;
-; VALIDATION:
+; FULL VALIDATION:
 ;
 ;   1. registry LBA exists
-;   2. registry LBA >= DATA_START boundary
-;   3. registry sector is readable through AHCI
-;   4. every occupied entry has:
-;        - valid file ID
+;   2. registry LBA is inside AHCI 48-bit range
+;   3. registry does not occupy the data area
+;   4. registry sector is readable
+;   5. every occupied entry has:
+;        - non-zero file ID
+;        - non-zero tags
 ;        - valid data LBA
 ;        - valid file size
 ;        - valid sector count
-;   5. data range does not overflow
+;        - valid 48-bit end LBA
+;   6. no duplicate File IDs
+;   7. no file overlaps another file
+;   8. no file overlaps registry
+;   9. all data starts at or after TGFS_DATA_START_LBA
 ;
 ; ==============================================================================
 
@@ -355,8 +375,34 @@ tgfs_validate_registry:
     test r13, r13
     jz .registry_invalid
 
+
+    ; Registry must not be sector 0 or superblock.
     cmp r13, TGFS_SUPERBLOCK_LBA
     jbe .registry_invalid
+
+
+    ; Registry LBA must fit AHCI 48-bit addressing.
+    mov rax, r13
+    shr rax, 48
+    test rax, rax
+    jnz .registry_invalid
+
+
+    ; ==========================================================================
+    ; REGISTRY MUST NOT BE INSIDE DATA AREA
+    ;
+    ; Current TGFS format:
+    ;
+    ;   LBA 0 = MBR
+    ;   LBA 1 = superblock
+    ;   LBA 2 = registry
+    ;   LBA 3+ = data
+    ;
+    ; Therefore any registry LBA >= 3 would collide with the data region.
+    ; ==========================================================================
+
+    cmp r13, TGFS_DATA_START_LBA
+    jae .registry_invalid
 
 
     ; ==========================================================================
@@ -385,16 +431,18 @@ tgfs_validate_registry:
 
 
     ; ==========================================================================
-    ; CHECK ALL 8 ENTRIES
+    ; FIRST PASS
+    ;
+    ; Validate every occupied entry independently.
     ; ==========================================================================
 
     xor ebx, ebx
 
 
-.registry_loop:
+.registry_first_pass:
 
     cmp ebx, TGFS_MAX_ENTRIES
-    jae .registry_valid
+    jae .registry_second_pass
 
 
     ; ==========================================================================
@@ -416,7 +464,7 @@ tgfs_validate_registry:
     mov eax, [r14 + TGFS_ENTRY_ID]
 
     test eax, eax
-    jz .next_registry_entry
+    jz .first_pass_next
 
 
     ; ==========================================================================
@@ -437,8 +485,16 @@ tgfs_validate_registry:
 
     mov rax, [r14 + TGFS_ENTRY_LBA]
 
+    ; Must be inside the data area.
     cmp rax, TGFS_DATA_START_LBA
     jb .registry_invalid_stack
+
+
+    ; Must fit AHCI 48-bit addressing.
+    mov rdx, rax
+    shr rdx, 48
+    test rdx, rdx
+    jnz .registry_invalid_stack
 
 
     ; ==========================================================================
@@ -473,7 +529,9 @@ tgfs_validate_registry:
 
 
     ; ==========================================================================
-    ; DATA LBA + SECTOR COUNT OVERFLOW CHECK
+    ; DATA LBA + SECTOR COUNT
+    ;
+    ; End LBA is exclusive.
     ; ==========================================================================
 
     mov rcx, [r14 + TGFS_ENTRY_LBA]
@@ -482,21 +540,226 @@ tgfs_validate_registry:
 
     jc .registry_invalid_stack
 
-    ; LBA must remain inside the 48-bit address space used by AHCI.
+
+    ; End LBA must remain inside 48-bit AHCI range.
     mov rdx, rcx
 
     shr rdx, 48
 
     test rdx, rdx
-
     jnz .registry_invalid_stack
 
 
-.next_registry_entry:
+    ; ==========================================================================
+    ; DATA RANGE MUST NOT TOUCH REGISTRY
+    ;
+    ; Registry occupies:
+    ;
+    ;   [registry_lba, registry_lba + 1)
+    ;
+    ; Since data must start at >= 3 this should already be impossible,
+    ; but we keep the explicit check so the invariant is protected here.
+    ; ==========================================================================
+
+    mov rdx, [r14 + TGFS_ENTRY_LBA]
+
+    cmp rdx, r13
+    je .registry_invalid_stack
+
+
+.first_pass_next:
 
     inc ebx
 
-    jmp .registry_loop
+    jmp .registry_first_pass
+
+
+    ; ==========================================================================
+    ; SECOND PASS
+    ;
+    ; Check:
+    ;
+    ;   - duplicate File IDs
+    ;   - overlapping data ranges
+    ;
+    ; Only entries with ID != 0 participate.
+    ; ==========================================================================
+
+.registry_second_pass:
+
+    xor ebx, ebx
+
+
+.outer_entry_loop:
+
+    cmp ebx, TGFS_MAX_ENTRIES
+    jae .registry_valid
+
+
+    ; ==========================================================================
+    ; OUTER ENTRY ADDRESS
+    ; ==========================================================================
+
+    mov rax, rbx
+    shl rax, 6
+
+    lea r14, [r15 + rax]
+
+
+    ; ==========================================================================
+    ; UNUSED OUTER ENTRY
+    ; ==========================================================================
+
+    mov eax, [r14 + TGFS_ENTRY_ID]
+
+    test eax, eax
+    jz .outer_next
+
+
+    ; ==========================================================================
+    ; SAVE OUTER FILE ID
+    ; ==========================================================================
+
+    mov r12d, eax
+
+
+    ; ==========================================================================
+    ; OUTER RANGE
+    ;
+    ; r8  = start LBA
+    ; r9  = end LBA (exclusive)
+    ; ==========================================================================
+
+    mov r8, [r14 + TGFS_ENTRY_LBA]
+
+    mov rax, [r14 + TGFS_ENTRY_SIZE_BYTES]
+
+    add rax, TGFS_SECTOR_SIZE - 1
+
+    jc .registry_invalid_stack
+
+    shr rax, 9
+
+    mov r9, r8
+
+    add r9, rax
+
+    jc .registry_invalid_stack
+
+
+    ; ==========================================================================
+    ; INNER LOOP
+    ;
+    ; Compare only entries after the outer entry.
+    ; ==========================================================================
+
+    mov edi, ebx
+    inc edi
+
+
+.inner_entry_loop:
+
+    cmp edi, TGFS_MAX_ENTRIES
+    jae .outer_next
+
+
+    ; ==========================================================================
+    ; INNER ENTRY ADDRESS
+    ; ==========================================================================
+
+    mov rax, rdi
+    shl rax, 6
+
+    lea rsi, [r15 + rax]
+
+
+    ; ==========================================================================
+    ; UNUSED INNER ENTRY
+    ; ==========================================================================
+
+    mov eax, [rsi + TGFS_ENTRY_ID]
+
+    test eax, eax
+    jz .inner_next
+
+
+    ; ==========================================================================
+    ; DUPLICATE FILE ID CHECK
+    ; ==========================================================================
+
+    cmp eax, r12d
+    je .registry_invalid_stack
+
+
+    ; ==========================================================================
+    ; INNER RANGE
+    ;
+    ; r10 = start LBA
+    ; r11 = end LBA (exclusive)
+    ; ==========================================================================
+
+    mov r10, [rsi + TGFS_ENTRY_LBA]
+
+    mov rax, [rsi + TGFS_ENTRY_SIZE_BYTES]
+
+    add rax, TGFS_SECTOR_SIZE - 1
+
+    jc .registry_invalid_stack
+
+    shr rax, 9
+
+    mov r11, r10
+
+    add r11, rax
+
+    jc .registry_invalid_stack
+
+
+    ; ==========================================================================
+    ; RANGE OVERLAP TEST
+    ;
+    ; Two half-open ranges:
+    ;
+    ;   A = [r8,  r9)
+    ;   B = [r10, r11)
+    ;
+    ; They do NOT overlap when:
+    ;
+    ;   A.end <= B.start
+    ; OR
+    ;   B.end <= A.start
+    ;
+    ; Otherwise they overlap.
+    ; ==========================================================================
+
+    cmp r9, r10
+    jbe .no_overlap
+
+    cmp r11, r8
+    jbe .no_overlap
+
+
+    ; ==========================================================================
+    ; OVERLAP DETECTED
+    ; ==========================================================================
+
+    jmp .registry_invalid_stack
+
+
+.no_overlap:
+
+.inner_next:
+
+    inc edi
+
+    jmp .inner_entry_loop
+
+
+.outer_next:
+
+    inc ebx
+
+    jmp .outer_entry_loop
 
 
 ; ==============================================================================
@@ -587,6 +850,14 @@ tgfs_find_files_by_tag:
 
     cmp rdx, TGFS_SUPERBLOCK_LBA
     jbe .search_failed_stack
+
+    mov rax, rdx
+    shr rax, 48
+    test rax, rax
+    jnz .search_failed_stack
+
+    cmp rdx, TGFS_DATA_START_LBA
+    jae .search_failed_stack
 
 
     ; ==========================================================================
@@ -872,6 +1143,14 @@ tgfs_load_and_map_file:
     cmp rdx, TGFS_SUPERBLOCK_LBA
     jbe .load_error_stack
 
+    mov rax, rdx
+    shr rax, 48
+    test rax, rax
+    jnz .load_error_stack
+
+    cmp rdx, TGFS_DATA_START_LBA
+    jae .load_error_stack
+
     mov rcx, r12
     mov r8, 1
     mov r9, r15
@@ -944,6 +1223,11 @@ tgfs_load_and_map_file:
     cmp r11, TGFS_DATA_START_LBA
     jb .load_error_stack
 
+    mov rcx, r11
+    shr rcx, 48
+    test rcx, rcx
+    jnz .load_error_stack
+
 
     ; ==========================================================================
     ; VALIDATE FILE SIZE
@@ -991,12 +1275,30 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
+    ; DATA RANGE END
+    ;
+    ; Make sure the complete file remains inside 48-bit LBA space.
+    ; ==========================================================================
+
+    mov rcx, r11
+
+    add rcx, rax
+
+    jc .load_error_stack
+
+    mov rdx, rcx
+    shr rdx, 48
+    test rdx, rdx
+    jnz .load_error_stack
+
+
+    ; ==========================================================================
     ; DESTINATION + EXACT FILE SIZE
     ; ==========================================================================
 
     mov rax, r14
 
-    add rax, rdx
+    add rax, [r15 + 528]
 
     jc .load_error_stack
 
