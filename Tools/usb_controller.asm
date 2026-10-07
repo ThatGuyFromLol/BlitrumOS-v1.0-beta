@@ -3,40 +3,38 @@
 ;==============================================================================
 ; x86-64 / NASM
 ;
-; Funkcje:
-;   - wyszukiwanie kontrolera USB 3.x / xHCI
-;   - pełny skan PCI:
-;         BUS      = 0..255
-;         DEVICE   = 0..31
-;         FUNCTION = 0..7
+; Odpowiedzialność:
+;
+;   - wyszukiwanie xHCI
+;   - pełny skan PCI
 ;   - odczyt BAR0
-;   - obsługa 32-bitowego i 64-bitowego BAR
-;   - przejęcie xHCI od BIOS/UEFI
-;   - zapamiętanie PCI BDF
-;   - zapamiętanie PCI Interrupt Line / Pin
+;   - BIOS/UEFI ownership handoff
+;   - zapis PCI BDF
+;   - wykrywanie MSI
+;   - konfiguracja MSI dla xHCI
+;   - fallback do legacy PCI IRQ
 ;
-; PCI:
+; MSI:
 ;
-;   BH = Bus
-;   BL = Device
-;   CH = Function
-;
-; pci_get_interrupt_info:
-;
-;   RAX = Interrupt Line
-;   RDX = Interrupt Pin
+;   xHCI
+;     |
+;     v
+;   PCI MSI
+;     |
+;     v
+;   LAPIC
+;     |
+;     v
+;   IDT vector 0x28
+;     |
+;     v
+;   isr_xhci_handler
 ;
 ;==============================================================================
 
 bits 64
 
-
 section .text
-
-
-;==============================================================================
-; GLOBALS
-;==============================================================================
 
 global find_usb_controllers
 
@@ -46,13 +44,16 @@ global xhci_get_pci_bus
 global xhci_get_pci_device
 global xhci_get_pci_function
 
+global xhci_enable_msi
+global xhci_disable_msi
+global xhci_msi_available
+
 
 ;==============================================================================
 ; EXTERNALS
 ;==============================================================================
 
 extern pci_read_config_dword
-extern pci_get_interrupt_info
 
 
 ;==============================================================================
@@ -62,35 +63,35 @@ extern pci_get_interrupt_info
 XHCI_BIOS_TIMEOUT       equ 10000000
 XHCI_MAX_EXT_CAPS       equ 256
 
+PCI_CONFIG_ADDRESS      equ 0x0CF8
+PCI_CONFIG_DATA         equ 0x0CFC
+
+PCI_CAP_PTR              equ 0x34
+PCI_STATUS_COMMAND       equ 0x04
+
+PCI_STATUS_CAP_LIST      equ (1 << 20)
+
+PCI_CAP_ID_MSI           equ 0x05
+
+PCI_MSI_ENABLE           equ 0x00010000
+PCI_MSI_64BIT            equ 0x00000080
+PCI_MSI_MULTI_MASK       equ 0x000E0000
+
+PCI_MSI_ADDRESS_LOW      equ 0x00000000
+PCI_MSI_ADDRESS_HIGH     equ 0x00000004
+PCI_MSI_DATA_32          equ 0x00000008
+PCI_MSI_DATA_64          equ 0x0000000C
+
 
 ;==============================================================================
 ; find_usb_controllers
 ;
-; Zwraca:
+; ZWRACA:
 ;
-;   RAX = pełny 64-bitowy adres fizyczny MMIO xHCI
+;   RAX = fizyczny adres MMIO xHCI
 ;
-;   CF = 0
-;       znaleziono kontroler i handshake zakończył się poprawnie
-;
-;   CF = 1
-;       nie znaleziono kontrolera
-;       LUB
-;       handshake xHCI nie powiódł się
-;
-; Dodatkowo zapisuje:
-;
-;   xhci_pci_bus
-;   xhci_pci_device
-;   xhci_pci_function
-;   xhci_pci_irq
-;   xhci_pci_pin
-;
-; Pełny skan PCI:
-;
-;   256 magistral
-;   32 urządzenia na magistralę
-;   8 funkcji na urządzenie
+;   CF=0 = sukces
+;   CF=1 = brak xHCI / błąd
 ;
 ;==============================================================================
 
@@ -101,48 +102,32 @@ find_usb_controllers:
     push rdx
 
 
-    ;==========================================================================
-    ; BUS = 0
-    ;
-    ; BH przechowuje numer magistrali.
-    ; BL przechowuje numer urządzenia.
-    ;
-    ; Ponieważ BH jest 8-bitowe, pełny zakres 0..255 obsługujemy przez
-    ; wykrycie przepełnienia:
-    ;
-    ;   255 + 1 = 0
-    ;
-    ; Po takim przepełnieniu kończymy skan.
-    ;==========================================================================
-
     xor ebx, ebx
 
 
-.loop_bus:
+;==============================================================================
+; BUS
+;==============================================================================
 
-    ;==========================================================================
-    ; DEVICE = 0
-    ;==========================================================================
+.loop_bus:
 
     xor bl, bl
 
 
-.loop_dev:
+;==============================================================================
+; DEVICE
+;==============================================================================
 
-    ;==========================================================================
-    ; FUNCTION = 0
-    ;==========================================================================
+.loop_dev:
 
     xor ch, ch
 
 
-.loop_func:
+;==============================================================================
+; FUNCTION
+;==============================================================================
 
-    ;==========================================================================
-    ; SPRAWDŹ VENDOR ID
-    ;
-    ; PCI offset 0x00
-    ;==========================================================================
+.loop_func:
 
     mov cl, 0x00
 
@@ -154,24 +139,11 @@ find_usb_controllers:
 
 
     ;==========================================================================
-    ; ODCZYTAJ CLASS / SUBCLASS / PROGIF
+    ; CLASS / SUBCLASS / PROGIF
     ;
-    ; PCI offset 0x08
-    ;
-    ; bits 31:24 = Revision ID
-    ; bits 23:16 = ProgIF
-    ; bits 15:8  = Subclass
-    ; bits 7:0   = Class
-    ;
-    ; Po SHR 8:
-    ;
-    ;   EAX = 0x00CCSSPP
-    ;
-    ; xHCI:
-    ;
-    ;   Class    = 0x0C
-    ;   Subclass = 0x03
-    ;   ProgIF   = 0x30
+    ; 0x0C = Serial Bus Controller
+    ; 0x03 = USB
+    ; 0x30 = xHCI
     ;==========================================================================
 
     mov cl, 0x08
@@ -187,28 +159,12 @@ find_usb_controllers:
 
 .next_func:
 
-    ;==========================================================================
-    ; FUNCTION++
-    ;
-    ; Zakres:
-    ;
-    ;   0..7
-    ;==========================================================================
-
     inc ch
 
     cmp ch, 8
 
     jne .loop_func
 
-
-    ;==========================================================================
-    ; DEVICE++
-    ;
-    ; Zakres:
-    ;
-    ;   0..31
-    ;==========================================================================
 
     inc bl
 
@@ -217,35 +173,10 @@ find_usb_controllers:
     jne .loop_dev
 
 
-    ;==========================================================================
-    ; BUS++
-    ;
-    ; Zakres:
-    ;
-    ;   0..255
-    ;
-    ; Nie możemy zrobić:
-    ;
-    ;   cmp bh, 256
-    ;
-    ; ponieważ BH ma tylko 8 bitów.
-    ;
-    ; Zamiast tego wykorzystujemy naturalne przepełnienie:
-    ;
-    ;   255 -> 0
-    ;
-    ; Jeżeli po INC BH != 0, przechodzimy do następnej magistrali.
-    ; Jeżeli BH == 0, oznacza to że zakończyliśmy pełny zakres 0..255.
-    ;==========================================================================
-
     inc bh
 
     jnz .loop_bus
 
-
-    ;==========================================================================
-    ; NIE ZNALEZIONO
-    ;==========================================================================
 
     pop rdx
     pop rcx
@@ -257,19 +188,13 @@ find_usb_controllers:
 
 
 ;==============================================================================
-; ZNALEZIONO xHCI
+; FOUND xHCI
 ;==============================================================================
 
 .found_xhci:
 
     ;==========================================================================
-    ; ZAPISZ PCI BDF
-    ;
-    ; W tym momencie:
-    ;
-    ;   BH = bus
-    ;   BL = device
-    ;   CH = function
+    ; SAVE BDF
     ;==========================================================================
 
     movzx eax, bh
@@ -283,22 +208,14 @@ find_usb_controllers:
 
 
     ;==========================================================================
-    ; ODCZYTAJ PCI INTERRUPT LINE / PIN
+    ; READ LEGACY INTERRUPT INFO
     ;==========================================================================
 
-    call pci_get_interrupt_info
-
-    ; RAX = Interrupt Line
-    ; RDX = Interrupt Pin
-
-    mov [rel xhci_pci_irq], eax
-    mov [rel xhci_pci_pin], edx
+    call xhci_read_legacy_irq
 
 
     ;==========================================================================
-    ; ODCZYTAJ BAR0
-    ;
-    ; PCI offset 0x10
+    ; BAR0
     ;==========================================================================
 
     mov cl, 0x10
@@ -307,29 +224,10 @@ find_usb_controllers:
 
     mov rdx, rax
 
-
-    ;==========================================================================
-    ; BAR MUSI BYĆ MEMORY SPACE
-    ;
-    ; bit 0:
-    ;
-    ;   0 = Memory Space
-    ;   1 = I/O Space
-    ;==========================================================================
-
     test edx, 1
 
     jnz .controller_error
 
-
-    ;==========================================================================
-    ; SPRAWDŹ TYP BAR
-    ;
-    ; bits 1..2:
-    ;
-    ;   00 = 32-bit
-    ;   10 = 64-bit
-    ;==========================================================================
 
     mov eax, edx
 
@@ -340,9 +238,9 @@ find_usb_controllers:
     je .bar_64bit
 
 
-    ;==========================================================================
-    ; BAR 32-BIT
-    ;==========================================================================
+;==============================================================================
+; 32-BIT BAR
+;==============================================================================
 
 .bar_32bit:
 
@@ -355,15 +253,11 @@ find_usb_controllers:
     jmp .handshake_start
 
 
-    ;==========================================================================
-    ; BAR 64-BIT
-    ;==========================================================================
+;==============================================================================
+; 64-BIT BAR
+;==============================================================================
 
 .bar_64bit:
-
-    ;==========================================================================
-    ; BAR1 = górne 32 bity
-    ;==========================================================================
 
     mov cl, 0x14
 
@@ -381,31 +275,17 @@ find_usb_controllers:
 
 
 ;==============================================================================
-; xHCI BIOS HANDSHAKE
+; BIOS HANDSHAKE
 ;==============================================================================
 
 .handshake_start:
-
-    ;==========================================================================
-    ; RAX = baza MMIO
-    ;==========================================================================
 
     mov rax, rdx
 
     call xhci_bios_handshake
 
-    ; CF = 1 oznacza błąd handshake.
-
     jc .controller_error
 
-
-    ;==========================================================================
-    ; SUKCES
-    ;
-    ; xhci_bios_handshake przywraca:
-    ;
-    ;   RAX = baza MMIO
-    ;==========================================================================
 
     pop rdx
     pop rcx
@@ -417,7 +297,7 @@ find_usb_controllers:
 
 
 ;==============================================================================
-; BŁĄD KONTROLERA
+; ERROR
 ;==============================================================================
 
 .controller_error:
@@ -434,22 +314,695 @@ find_usb_controllers:
 
 
 ;==============================================================================
-; xhci_bios_handshake
+; xhci_read_legacy_irq
+;
+; Odczytuje PCI config 0x3C.
+;
+;==============================================================================
+
+xhci_read_legacy_irq:
+
+    push rbx
+    push rcx
+    push rdx
+
+
+    mov bh, byte [rel xhci_pci_bus]
+    mov bl, byte [rel xhci_pci_device]
+    mov ch, byte [rel xhci_pci_function]
+    mov cl, 0x3C
+
+    call pci_read_config_dword
+
+    movzx edx, al
+
+    mov [rel xhci_pci_irq], edx
+
+    shr eax, 8
+
+    and eax, 0xFF
+
+    mov [rel xhci_pci_pin], eax
+
+
+    pop rdx
+    pop rcx
+    pop rbx
+
+    ret
+
+
+;==============================================================================
+; xhci_find_msi_capability
+;
+; ZWRACA:
+;
+;   EAX = offset MSI capability
+;   EAX = 0 jeśli brak
+;
+;==============================================================================
+;
+; Funkcja czyta capability list przez standardowy PCI config space.
+;
+;==============================================================================
+
+xhci_find_msi_capability:
+
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+
+    ;==========================================================================
+    ; BUS / DEVICE / FUNCTION
+    ;==========================================================================
+
+    mov bh, byte [rel xhci_pci_bus]
+    mov bl, byte [rel xhci_pci_device]
+    mov ch, byte [rel xhci_pci_function]
+
+
+    ;==========================================================================
+    ; STATUS REGISTER 0x04
+    ;==========================================================================
+
+    mov cl, PCI_STATUS_COMMAND
+
+    call pci_read_config_dword
+
+    test eax, PCI_STATUS_CAP_LIST
+
+    jz .not_found
+
+
+    ;==========================================================================
+    ; CAPABILITY POINTER
+    ;==========================================================================
+
+    mov cl, PCI_CAP_PTR
+
+    call pci_read_config_dword
+
+    and eax, 0xFF
+
+    test eax, eax
+
+    jz .not_found
+
+
+    mov esi, eax
+
+    xor edi, edi
+
+
+;==============================================================================
+; CAPABILITY WALK
+;==============================================================================
+
+.cap_loop:
+
+    cmp edi, 48
+    jae .not_found
+
+    inc edi
+
+
+    ;==========================================================================
+    ; capability header
+    ;
+    ; byte 0 = capability ID
+    ; byte 1 = next pointer
+    ;==========================================================================
+
+    mov ecx, esi
+
+    and ecx, 0xFC
+
+    mov cl, sil
+
+    ; Powyższe ustawienie CL jest wystarczające tylko dla offsetów < 256.
+    ; Capability pointer PCI zawsze znajduje się w pierwszych 256 bajtach.
+
+    mov cl, sil
+
+    call pci_read_config_dword
+
+
+    mov edx, eax
+
+    and eax, 0xFF
+
+    cmp eax, PCI_CAP_ID_MSI
+
+    je .found
+
+
+    shr edx, 8
+
+    and edx, 0xFF
+
+    test edx, edx
+
+    jz .not_found
+
+
+    mov esi, edx
+
+    jmp .cap_loop
+
+
+.found:
+
+    mov eax, esi
+
+    jmp .done
+
+
+.not_found:
+
+    xor eax, eax
+
+
+.done:
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+
+    ret
+
+
+;==============================================================================
+; PCI WRITE DWORD HELPER
 ;
 ; WEJŚCIE:
 ;
-;   RAX = adres MMIO kontrolera xHCI
+;   CL  = config offset
+;   EAX = value
 ;
-; WYJŚCIE:
+; BDF:
 ;
-;   CF = 0
-;       handshake OK
+;   xhci_pci_bus
+;   xhci_pci_device
+;   xhci_pci_function
 ;
-;   CF = 1
-;       timeout / błąd
+;==============================================================================
+
+xhci_pci_write_dword:
+
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+
+
+    mov r8d, eax
+
+
+    mov eax, 0x80000000
+
+
+    movzx edx, byte [rel xhci_pci_bus]
+    shl edx, 16
+    or eax, edx
+
+
+    movzx edx, byte [rel xhci_pci_device]
+    shl edx, 11
+    or eax, edx
+
+
+    movzx edx, byte [rel xhci_pci_function]
+    shl edx, 8
+    or eax, edx
+
+
+    movzx edx, cl
+    and edx, 0xFC
+    or eax, edx
+
+
+    mov dx, PCI_CONFIG_ADDRESS
+    out dx, eax
+
+
+    mov eax, r8d
+
+    mov dx, PCI_CONFIG_DATA
+    out dx, eax
+
+
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    ret
+
+
+;==============================================================================
+; xhci_enable_msi
 ;
-;   RAX = adres MMIO xHCI
+; WEJŚCIE:
 ;
+;   EDI = destination LAPIC ID
+;   ESI = interrupt vector
+;
+; ZWRACA:
+;
+;   EAX = 1 sukces
+;   EAX = 0 brak MSI / błąd
+;
+;==============================================================================
+;
+; Konfigurujemy:
+;
+;   MSI Address:
+;
+;       FEE00000
+;       + APIC ID << 12
+;
+;   MSI Data:
+;
+;       vector
+;
+;       fixed delivery
+;       edge triggered
+;
+; Multi-message pozostaje ustawione na 1 wiadomość.
+;
+;==============================================================================
+
+xhci_enable_msi:
+
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+
+
+    ;==========================================================================
+    ; VECTOR
+    ;==========================================================================
+
+    cmp esi, 0x20
+    jb .fail
+
+    cmp esi, 0xFE
+    ja .fail
+
+
+    ;==========================================================================
+    ; FIND MSI CAPABILITY
+    ;==========================================================================
+
+    call xhci_find_msi_capability
+
+    test eax, eax
+
+    jz .fail
+
+    mov ebx, eax
+
+
+    ;==========================================================================
+    ; READ MSI CONTROL
+    ;
+    ; offset +2
+    ;
+    ; DWORD:
+    ;
+    ; bits 15:0 = Message Control
+    ;==========================================================================
+
+    mov ecx, ebx
+    add ecx, 2
+
+    call xhci_pci_read_dword
+
+
+    mov r8d, eax
+
+    and r8d, 0xFFFF
+
+
+    ;==========================================================================
+    ; CHECK 64-BIT CAPABILITY
+    ;==========================================================================
+
+    test r8d, PCI_MSI_64BIT
+
+    jnz .msi_64
+
+
+;==============================================================================
+; 32-BIT MSI
+;==============================================================================
+
+.msi_32:
+
+    ;==========================================================================
+    ; ADDRESS
+    ;==========================================================================
+
+    mov eax, 0xFEE00000
+
+    mov edx, edi
+
+    shl edx, 12
+
+    or eax, edx
+
+    mov ecx, ebx
+
+    add ecx, PCI_MSI_ADDRESS_LOW
+
+    call xhci_pci_write_dword
+
+
+    ;==========================================================================
+    ; DATA
+    ;==========================================================================
+
+    mov eax, esi
+
+    mov ecx, ebx
+
+    add ecx, PCI_MSI_DATA_32
+
+    call xhci_pci_write_dword
+
+    jmp .enable
+
+
+;==============================================================================
+; 64-BIT MSI
+;==============================================================================
+
+.msi_64:
+
+    ;==========================================================================
+    ; ADDRESS LOW
+    ;==========================================================================
+
+    mov eax, 0xFEE00000
+
+    mov edx, edi
+
+    shl edx, 12
+
+    or eax, edx
+
+    mov ecx, ebx
+
+    add ecx, PCI_MSI_ADDRESS_LOW
+
+    call xhci_pci_write_dword
+
+
+    ;==========================================================================
+    ; ADDRESS HIGH
+    ;==========================================================================
+
+    xor eax, eax
+
+    mov ecx, ebx
+
+    add ecx, PCI_MSI_ADDRESS_HIGH
+
+    call xhci_pci_write_dword
+
+
+    ;==========================================================================
+    ; DATA
+    ;==========================================================================
+
+    mov eax, esi
+
+    mov ecx, ebx
+
+    add ecx, PCI_MSI_DATA_64
+
+    call xhci_pci_write_dword
+
+
+;==============================================================================
+; ENABLE MSI
+;==============================================================================
+
+.enable:
+
+    ;==========================================================================
+    ; Read current Message Control.
+    ;==========================================================================
+
+    mov ecx, ebx
+
+    add ecx, 2
+
+    call xhci_pci_read_dword
+
+    and eax, 0xFFFF
+
+
+    ;==========================================================================
+    ; Force:
+    ;
+    ;   Multiple Message Enable = 0
+    ;
+    ; One vector is enough for Blitrum.
+    ;==========================================================================
+
+    and eax, ~PCI_MSI_MULTI_MASK
+
+    or eax, PCI_MSI_ENABLE
+
+
+    ;==========================================================================
+    ; MSI control occupies bits 0..15.
+    ;
+    ; Preserve upper half of DWORD.
+    ;==========================================================================
+
+    mov r9d, eax
+
+    mov ecx, ebx
+
+    add ecx, 0
+
+    call xhci_pci_read_dword
+
+    and eax, 0xFFFF0000
+
+    or eax, r9d
+
+    mov ecx, ebx
+
+    call xhci_pci_write_dword
+
+
+    mov byte [rel xhci_msi_enabled], 1
+    mov [rel xhci_msi_cap_offset], ebx
+    mov [rel xhci_msi_vector], esi
+    mov [rel xhci_msi_apic_id], edi
+
+    mov eax, 1
+
+    jmp .done
+
+
+.fail:
+
+    mov byte [rel xhci_msi_enabled], 0
+
+    xor eax, eax
+
+
+.done:
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+
+    ret
+
+
+;==============================================================================
+; xhci_pci_read_dword
+;
+; ECX = config offset
+; EAX = value
+;==============================================================================
+
+xhci_pci_read_dword:
+
+    push rbx
+    push rcx
+    push rdx
+    push r8
+
+
+    mov r8d, ecx
+
+    mov eax, 0x80000000
+
+
+    movzx edx, byte [rel xhci_pci_bus]
+    shl edx, 16
+    or eax, edx
+
+
+    movzx edx, byte [rel xhci_pci_device]
+    shl edx, 11
+    or eax, edx
+
+
+    movzx edx, byte [rel xhci_pci_function]
+    shl edx, 8
+    or eax, edx
+
+
+    mov edx, r8d
+    and edx, 0xFC
+    or eax, edx
+
+
+    mov dx, PCI_CONFIG_ADDRESS
+    out dx, eax
+
+
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+
+
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+
+    ret
+
+
+;==============================================================================
+; xhci_disable_msi
+;==============================================================================
+
+xhci_disable_msi:
+
+    push rbx
+    push rcx
+    push rdx
+
+
+    cmp byte [rel xhci_msi_enabled], 1
+    jne .done
+
+
+    mov ebx, [rel xhci_msi_cap_offset]
+
+    test ebx, ebx
+    jz .done
+
+
+    mov ecx, ebx
+
+    call xhci_pci_read_dword
+
+    and eax, 0xFFFEFFFF
+
+    mov ecx, ebx
+
+    call xhci_pci_write_dword
+
+    mov byte [rel xhci_msi_enabled], 0
+
+
+.done:
+
+    pop rdx
+    pop rcx
+    pop rbx
+
+    ret
+
+
+;==============================================================================
+; xhci_msi_available
+;==============================================================================
+
+xhci_msi_available:
+
+    call xhci_find_msi_capability
+
+    test eax, eax
+
+    jz .no
+
+    mov eax, 1
+
+    ret
+
+.no:
+
+    xor eax, eax
+
+    ret
+
+
+;==============================================================================
+; GETTERS
+;==============================================================================
+
+xhci_get_pci_irq:
+
+    mov eax, [rel xhci_pci_irq]
+
+    ret
+
+
+xhci_get_pci_pin:
+
+    mov eax, [rel xhci_pci_pin]
+
+    ret
+
+
+xhci_get_pci_bus:
+
+    mov eax, [rel xhci_pci_bus]
+
+    ret
+
+
+xhci_get_pci_device:
+
+    mov eax, [rel xhci_pci_device]
+
+    ret
+
+
+xhci_get_pci_function:
+
+    mov eax, [rel xhci_pci_function]
+
+    ret
+
+
+;==============================================================================
+; xHCI BIOS HANDSHAKE
 ;==============================================================================
 
 xhci_bios_handshake:
@@ -461,21 +1014,11 @@ xhci_bios_handshake:
     push rsi
 
 
-    ;==========================================================================
-    ; Zachowaj bazę MMIO.
-    ;==========================================================================
-
     mov rsi, rax
 
 
     ;==========================================================================
     ; HCCPARAMS1
-    ;
-    ; Offset:
-    ;
-    ;   0x10
-    ;
-    ; xECP znajduje się w bits 31:16.
     ;==========================================================================
 
     mov ecx, [rsi + 0x10]
@@ -487,25 +1030,12 @@ xhci_bios_handshake:
     jz .no_extended_caps
 
 
-    ;==========================================================================
-    ; RDX = pierwszy Extended Capability
-    ;==========================================================================
-
     mov rdx, rsi
 
     add rdx, rcx
 
-
-    ;==========================================================================
-    ; LICZNIK EXTENDED CAPABILITIES
-    ;==========================================================================
-
     xor ecx, ecx
 
-
-;==============================================================================
-; SZUKAJ USB LEGACY SUPPORT
-;==============================================================================
 
 .search_loop:
 
@@ -516,20 +1046,8 @@ xhci_bios_handshake:
     inc ecx
 
 
-    ;==========================================================================
-    ; Odczytaj nagłówek capability
-    ;==========================================================================
-
     mov ebx, [rdx]
 
-
-    ;==========================================================================
-    ; Capability ID
-    ;
-    ; bits 7:0
-    ;
-    ; USB Legacy Support = 1
-    ;==========================================================================
 
     mov eax, ebx
 
@@ -539,12 +1057,6 @@ xhci_bios_handshake:
 
     je .found_legacy
 
-
-    ;==========================================================================
-    ; Next Capability Pointer
-    ;
-    ; bits 15:8
-    ;==========================================================================
 
     mov eax, ebx
 
@@ -557,10 +1069,6 @@ xhci_bios_handshake:
     jz .no_legacy_found
 
 
-    ;==========================================================================
-    ; DWORD -> BYTE
-    ;==========================================================================
-
     shl eax, 2
 
     add rdx, rax
@@ -568,22 +1076,7 @@ xhci_bios_handshake:
     jmp .search_loop
 
 
-;==============================================================================
-; ZNALEZIONO USB LEGACY SUPPORT
-;==============================================================================
-
 .found_legacy:
-
-    ;==========================================================================
-    ; USBLEGSUP
-    ;
-    ; bit 16 = BIOS Owned Semaphore
-    ; bit 24 = OS Owned Semaphore
-    ;
-    ; Ustawiamy:
-    ;
-    ;   OS Owned = 1
-    ;==========================================================================
 
     mov eax, [rdx]
 
@@ -591,10 +1084,6 @@ xhci_bios_handshake:
 
     mov [rdx], eax
 
-
-    ;==========================================================================
-    ; CZEKAJ NA BIOS
-    ;==========================================================================
 
     mov ecx, XHCI_BIOS_TIMEOUT
 
@@ -607,34 +1096,16 @@ xhci_bios_handshake:
 
     jz .bios_released
 
-
     pause
 
     dec ecx
 
     jnz .wait_bios
 
-
-    ;==========================================================================
-    ; TIMEOUT
-    ;==========================================================================
-
     jmp .handshake_error
 
 
-;==============================================================================
-; BIOS ODDAŁ KONTROLER
-;==============================================================================
-
 .bios_released:
-
-    ;==========================================================================
-    ; USBLEGCTLSTS
-    ;
-    ; RDX + 4
-    ;
-    ; Wyłączamy SMI control.
-    ;==========================================================================
 
     mov eax, [rdx + 4]
 
@@ -642,29 +1113,14 @@ xhci_bios_handshake:
 
     mov [rdx + 4], eax
 
+    jmp .success
 
-    ;==========================================================================
-    ; SUKCES
-    ;==========================================================================
-
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-    clc
-
-    ret
-
-
-;==============================================================================
-; BRAK LEGACY SUPPORT
-;==============================================================================
 
 .no_legacy_found:
 .no_extended_caps:
 
+.success:
+
     pop rsi
     pop rdx
     pop rcx
@@ -675,10 +1131,6 @@ xhci_bios_handshake:
 
     ret
 
-
-;==============================================================================
-; HANDSHAKE ERROR
-;==============================================================================
 
 .handshake_error:
 
@@ -694,91 +1146,12 @@ xhci_bios_handshake:
 
 
 ;==============================================================================
-; xhci_get_pci_irq
-;
-; WYJŚCIE:
-;
-;   RAX = PCI Interrupt Line
-;
-;   0..254 = przypisany IRQ
-;   255    = brak przypisania
-;
-;==============================================================================
-
-xhci_get_pci_irq:
-
-    mov eax, [rel xhci_pci_irq]
-
-    ret
-
-
-;==============================================================================
-; xhci_get_pci_pin
-;
-; WYJŚCIE:
-;
-;   RAX = PCI Interrupt Pin
-;
-;   0 = brak
-;   1 = INTA
-;   2 = INTB
-;   3 = INTC
-;   4 = INTD
-;
-;==============================================================================
-
-xhci_get_pci_pin:
-
-    mov eax, [rel xhci_pci_pin]
-
-    ret
-
-
-;==============================================================================
-; xhci_get_pci_bus
-;==============================================================================
-
-xhci_get_pci_bus:
-
-    mov eax, [rel xhci_pci_bus]
-
-    ret
-
-
-;==============================================================================
-; xhci_get_pci_device
-;==============================================================================
-
-xhci_get_pci_device:
-
-    mov eax, [rel xhci_pci_device]
-
-    ret
-
-
-;==============================================================================
-; xhci_get_pci_function
-;==============================================================================
-
-xhci_get_pci_function:
-
-    mov eax, [rel xhci_pci_function]
-
-    ret
-
-
-;==============================================================================
 ; DATA
 ;==============================================================================
 
 section .data
 
 align 8
-
-
-;==============================================================================
-; PCI LOCATION
-;==============================================================================
 
 xhci_pci_bus:
     dd 0
@@ -789,13 +1162,20 @@ xhci_pci_device:
 xhci_pci_function:
     dd 0
 
-
-;==============================================================================
-; PCI INTERRUPT INFORMATION
-;==============================================================================
-
 xhci_pci_irq:
     dd 0xFFFFFFFF
 
 xhci_pci_pin:
     dd 0
+
+xhci_msi_cap_offset:
+    dd 0
+
+xhci_msi_vector:
+    dd 0
+
+xhci_msi_apic_id:
+    dd 0
+
+xhci_msi_enabled:
+    db 0
