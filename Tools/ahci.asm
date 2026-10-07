@@ -806,9 +806,22 @@ init_ahci_controller:
 ; CHECK AHCI PORTS
 ;
 ; Wyjście:
-;   RAX = bitmap aktywnych portów
+;   RAX = bitmap aktywnych portów SATA ATA
 ;   CF  = 0 jeśli HBA istnieje
 ;   CF  = 1 jeśli HBA nie istnieje
+;
+; WAŻNE:
+;   Nie wystarczy sprawdzić PxSSTS.DET = 3.
+;
+;   DET = 3 oznacza urządzenie obecne i ustanowioną komunikację PHY.
+;   PxSIG określa typ urządzenia.
+;
+;   Zwracamy tutaj wyłącznie:
+;
+;       SATA_SIG_ATA = 0x00000101
+;
+;   Dzięki temu Kernel nie wybierze przypadkiem portu ATAPI, SEMB,
+;   Port Multiplier ani nieznanego urządzenia.
 ; ==============================================================================
 
 check_ahci_ports:
@@ -834,10 +847,20 @@ check_ahci_ports:
 
 .port_loop:
 
+    ; --------------------------------------------------------------------------
+    ; Sprawdź PI dla aktualnego portu.
+    ; --------------------------------------------------------------------------
+
     test edx, 1
 
     jz .next_port
 
+
+    ; --------------------------------------------------------------------------
+    ; Wylicz adres portu:
+    ;
+    ; HBA + 0x100 + port * 0x80
+    ; --------------------------------------------------------------------------
 
     mov rcx, r12
 
@@ -848,6 +871,11 @@ check_ahci_ports:
     add rcx, 0x100
 
 
+    ; --------------------------------------------------------------------------
+    ; DET = 3:
+    ; urządzenie obecne + PHY communication established.
+    ; --------------------------------------------------------------------------
+
     mov esi, [rcx + PXSSTS]
 
     and esi, 0x0F
@@ -856,6 +884,29 @@ check_ahci_ports:
 
     jne .next_port
 
+
+    ; --------------------------------------------------------------------------
+    ; KLUCZOWA ZMIANA:
+    ;
+    ; Sam DET=3 nie oznacza jeszcze zwykłego dysku ATA.
+    ;
+    ; Sprawdzamy PxSIG i akceptujemy wyłącznie:
+    ;
+    ;   0x00000101 = SATA ATA
+    ;
+    ; ATAPI / SEMB / Port Multiplier / nieznane urządzenia są pomijane.
+    ; --------------------------------------------------------------------------
+
+    mov esi, [rcx + PXSIG]
+
+    cmp esi, SATA_SIG_ATA
+
+    jne .next_port
+
+
+    ; --------------------------------------------------------------------------
+    ; Port jest kompatybilnym dyskiem SATA ATA.
+    ; --------------------------------------------------------------------------
 
     bts rax, r12
 
