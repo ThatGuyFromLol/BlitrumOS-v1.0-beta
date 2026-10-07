@@ -69,6 +69,10 @@ extern gui_draw_window
 extern gui_refresh_screen
 extern gui_pixel_format
 
+extern screen_width
+extern screen_height
+extern screen_pps
+
 
 ; -----------------------------------------------------------------------------
 ; Storage
@@ -168,6 +172,16 @@ XHCI_IRQ_VECTOR             equ 0x28
 ; -----------------------------------------------------------------------------
 
 KERNEL_STACK_TOP            equ 0x0000000000090000
+
+
+; -----------------------------------------------------------------------------
+; Initial GUI window
+; -----------------------------------------------------------------------------
+
+GUI_WINDOW_MAX_WIDTH        equ 640
+GUI_WINDOW_MAX_HEIGHT       equ 480
+
+GUI_WINDOW_MARGIN           equ 32
 
 
 ; =============================================================================
@@ -607,8 +621,19 @@ _start:
     ; =========================================================================
     ; INITIAL GUI FRAME
     ; =========================================================================
+    ;
+    ; gui_draw_window ABI:
+    ;
+    ;   ECX = X
+    ;   EDX = Y
+    ;   R8D = width
+    ;   R9D = height
+    ;
+    ; Wyliczamy bezpieczny rozmiar na podstawie aktualnej rozdzielczości.
+    ; Dzięki temu nie przekazujemy śmieciowych wartości do GUI.
+    ; =========================================================================
 
-    call gui_draw_window
+    call kernel_draw_initial_window
 
     call gui_refresh_screen
 
@@ -634,6 +659,146 @@ _start:
     hlt
 
     jmp .kernel_halted
+
+
+; =============================================================================
+; INITIAL GUI WINDOW
+; =============================================================================
+;
+; Wyjście:
+;   EAX = 1 jeżeli okno zostało wywołane
+;   EAX = 0 jeżeli ekran jest zbyt mały / GUI nie może zostać narysowane
+;
+; =============================================================================
+
+kernel_draw_initial_window:
+
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+
+    ; -------------------------------------------------------------------------
+    ; Pobierz rozdzielczość.
+    ; -------------------------------------------------------------------------
+
+    mov r12d, [rel screen_width]
+    mov r13d, [rel screen_height]
+
+
+    ; -------------------------------------------------------------------------
+    ; Musimy mieć co najmniej trochę miejsca na margines.
+    ; -------------------------------------------------------------------------
+
+    cmp r12d, GUI_WINDOW_MARGIN * 2
+    jbe .window_invalid
+
+    cmp r13d, GUI_WINDOW_MARGIN * 2
+    jbe .window_invalid
+
+
+    ; =========================================================================
+    ; WIDTH
+    ; =========================================================================
+
+    mov r14d, r12d
+
+    sub r14d, GUI_WINDOW_MARGIN * 2
+
+    cmp r14d, GUI_WINDOW_MAX_WIDTH
+    jbe .width_ready
+
+    mov r14d, GUI_WINDOW_MAX_WIDTH
+
+
+.width_ready:
+
+
+    ; =========================================================================
+    ; HEIGHT
+    ; =========================================================================
+
+    mov r15d, r13d
+
+    sub r15d, GUI_WINDOW_MARGIN * 2
+
+    cmp r15d, GUI_WINDOW_MAX_HEIGHT
+    jbe .height_ready
+
+    mov r15d, GUI_WINDOW_MAX_HEIGHT
+
+
+.height_ready:
+
+
+    ; -------------------------------------------------------------------------
+    ; Dodatkowe zabezpieczenie.
+    ; -------------------------------------------------------------------------
+
+    test r14d, r14d
+    jz .window_invalid
+
+    test r15d, r15d
+    jz .window_invalid
+
+
+    ; =========================================================================
+    ; X = (screen_width - window_width) / 2
+    ; =========================================================================
+
+    mov eax, r12d
+    sub eax, r14d
+    shr eax, 1
+
+    mov ecx, eax
+
+
+    ; =========================================================================
+    ; Y = (screen_height - window_height) / 2
+    ; =========================================================================
+
+    mov eax, r13d
+    sub eax, r15d
+    shr eax, 1
+
+    mov edx, eax
+
+
+    ; =========================================================================
+    ; CALL GUI
+    ;
+    ; ECX = X
+    ; EDX = Y
+    ; R8D = width
+    ; R9D = height
+    ; =========================================================================
+
+    mov r8d, r14d
+    mov r9d, r15d
+
+    call gui_draw_window
+
+    mov eax, 1
+
+    jmp .done
+
+
+.window_invalid:
+
+    xor eax, eax
+
+
+.done:
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    ret
 
 
 ; =============================================================================
