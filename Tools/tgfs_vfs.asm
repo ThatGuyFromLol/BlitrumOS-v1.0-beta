@@ -22,7 +22,7 @@ global tgfs_find_files_by_tag
 global tgfs_load_and_map_file
 global syscall_compatibility_layer
 global tgfs_last_file_size
-
+global tgfs_last_file_checksum
 
 ; ==============================================================================
 ; EXTERNALS
