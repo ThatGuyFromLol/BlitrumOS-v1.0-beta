@@ -168,11 +168,14 @@ LOADED_IMAGE_DEVICE_HANDLE equ 0x18
 ; RCX = ImageHandle
 ; RDX = EFI_SYSTEM_TABLE
 ;
+; UWAGA:
+; Nie wykonujemy CLI tutaj.
+; UEFI nadal działa w swoim środowisku i ExitBootServices()
+; musi otrzymać aktualny MapKey.
+;
 ; ==============================================================================
 
 _start:
-
-    cli
 
     mov [rel image_handle], rcx
     mov [rel sys_table], rdx
@@ -915,8 +918,15 @@ _start:
 ; ==============================================================================
 ; 26. BOOT SERVICES EXITED
 ; ==============================================================================
+;
+; Dopiero tutaj możemy przejść do środowiska kernela.
+; Wyłączamy przerwania po zakończeniu UEFI Boot Services.
+;
+; ==============================================================================
 
 .boot_services_exited:
+
+    cli
 
     mov qword [rel boot_services], 0
 
