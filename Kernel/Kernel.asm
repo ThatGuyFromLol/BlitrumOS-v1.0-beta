@@ -45,14 +45,9 @@
 ;    |
 ;   STI
 ;
-; WAŻNE:
-;
-;   Scheduler jest gotowy ZANIM xHCI może wygenerować IRQ.
-;
 ; =============================================================================
 
 bits 64
-
 
 section .text
 
@@ -80,6 +75,7 @@ extern lapic_get_id
 extern lapic_timer_init_us
 
 extern ioapic_init
+extern ioapic_available
 extern ioapic_route_irq
 extern ioapic_mask_irq
 extern ioapic_unmask_irq
@@ -190,11 +186,7 @@ BOOTINFO_ACPI_RSDP          equ 0x40
 ; -----------------------------------------------------------------------------
 
 ; 500 us = 0.5 ms
-;
-; scheduler_init itself does NOT receive this value.
-;
-; The value is used only by lapic_timer_init_us.
-;
+
 DEFAULT_SCHEDULER_TICK_US   equ 500
 
 
@@ -219,7 +211,7 @@ KERNEL_STACK_TOP            equ 0x0000000000090000
 _start:
 
     ; -------------------------------------------------------------------------
-    ; ABSOLUTELY NO EXTERNAL INTERRUPTS YET.
+    ; Absolutely no external interrupts yet.
     ; -------------------------------------------------------------------------
 
     cli
@@ -230,7 +222,7 @@ _start:
     ;
     ;   RCX = BootInfo
     ;
-    ; Save it before doing anything else.
+    ; Save it immediately.
     ; -------------------------------------------------------------------------
 
     mov [rel boot_info_ptr], rcx
@@ -268,7 +260,6 @@ _start:
     mov rax, [rel boot_info_ptr]
 
     test rax, rax
-
     jz kernel_bootinfo_error
 
 
@@ -278,9 +269,9 @@ _start:
     ;
     ; PMM ABI:
     ;
-    ;   RCX = rozmiar EFI_MEMORY_DESCRIPTOR
-    ;   R8  = rozmiar mapy pamięci
-    ;   R9  = adres mapy pamięci
+    ;   RCX = EFI_MEMORY_DESCRIPTOR size
+    ;   R8  = memory map size
+    ;   R9  = memory map address
     ;
     ; BootInfo:
     ;
@@ -297,7 +288,7 @@ _start:
     mov r9,  [rbx + BOOTINFO_MEMMAP]
 
     ; -------------------------------------------------------------------------
-    ; Walidacja argumentów przed wejściem do PMM.
+    ; Validate PMM arguments.
     ; -------------------------------------------------------------------------
 
     test rcx, rcx
@@ -312,8 +303,7 @@ _start:
     call pmm_init
 
     ; -------------------------------------------------------------------------
-    ; pmm_init obecnie nie zwraca niezawodnego statusu w RAX.
-    ; bitmap_base = 0 oznacza, że inicjalizacja PMM się nie udała.
+    ; bitmap_base == 0 means PMM initialization failed.
     ; -------------------------------------------------------------------------
 
     cmp qword [rel bitmap_base], 0
@@ -362,7 +352,6 @@ _start:
     call lapic_init
 
     test eax, eax
-
     jz kernel_lapic_error
 
     lea rdi, [rel msg_lapic_ok]
@@ -375,11 +364,10 @@ _start:
 
     call ioapic_init
 
-    ; IOAPIC może być niedostępny na niektórych konfiguracjach.
-    ; Nie zatrzymujemy tutaj kernela, ponieważ xHCI może używać MSI.
+    ; IOAPIC may be unavailable.
+    ; MSI can still be used by xHCI.
 
     test eax, eax
-
     jz .ioapic_unavailable
 
     lea rdi, [rel msg_ioapic_ok]
@@ -399,9 +387,6 @@ _start:
 
     ; =========================================================================
     ; IDT
-    ; =========================================================================
-    ;
-    ; IDT MUSI istnieć przed uruchomieniem jakiegokolwiek źródła IRQ.
     ; =========================================================================
 
     call idt_init
@@ -430,9 +415,6 @@ _start:
     ; =========================================================================
     ; GUI
     ; =========================================================================
-    ;
-    ; GUI używa PMM do alokacji backbuffera.
-    ; =========================================================================
 
     mov rdi, [rel boot_info_ptr]
 
@@ -449,16 +431,12 @@ _start:
     call find_ahci_controller
 
     test rax, rax
-
     jz .no_ahci
-
 
     call init_ahci_controller
 
     test rax, rax
-
     jz .no_ahci
-
 
     lea rdi, [rel msg_ahci_ok]
     call serial_log
@@ -528,19 +506,6 @@ _start:
     ; =========================================================================
     ; SCHEDULER
     ; =========================================================================
-    ;
-    ; scheduler_init NIE przyjmuje argumentów.
-    ;
-    ; To było jedno z błędnych założeń w poprzedniej wersji:
-    ;
-    ;   mov edi, DEFAULT_SCHEDULER_TICK_US
-    ;   call scheduler_init
-    ;
-    ; Poprawnie:
-    ;
-    ;   call scheduler_init
-    ;
-    ; =========================================================================
 
     call scheduler_init
 
@@ -551,31 +516,13 @@ _start:
     ; =========================================================================
     ; LAPIC TIMER
     ; =========================================================================
-    ;
-    ; scheduler już istnieje.
-    ;
-    ; Używamy:
-    ;
-    ;   lapic_timer_init_us
-    ;
-    ; a nie bezpośredniego lapic_timer_init.
-    ;
-    ; API:
-    ;
-    ;   RCX = liczba mikrosekund
-    ;
-    ; 500 us = 0.5 ms
-    ;
-    ; =========================================================================
 
     mov ecx, DEFAULT_SCHEDULER_TICK_US
 
     call lapic_timer_init_us
 
     test eax, eax
-
     jz kernel_lapic_timer_error
-
 
     lea rdi, [rel msg_lapic_timer_ok]
     call serial_log
@@ -584,28 +531,11 @@ _start:
     ; =========================================================================
     ; xHCI INITIALIZATION
     ; =========================================================================
-    ;
-    ; xhci_init:
-    ;
-    ;   - wykrywa kontroler
-    ;   - ustawia MMIO
-    ;   - tworzy DCBAA
-    ;   - tworzy Command Ring
-    ;   - tworzy Event Ring
-    ;   - ustawia ERST
-    ;   - przygotowuje interrupter
-    ;   - inicjalizuje USB interrupt layer
-    ;
-    ; IRQ nadal pozostają wyłączone.
-    ;
-    ; =========================================================================
 
     call xhci_init
 
     test rax, rax
-
     jz kernel_xhci_error
-
 
     lea rdi, [rel msg_xhci_ok]
     call serial_log
@@ -618,45 +548,21 @@ _start:
     call kernel_init_xhci_irq
 
     test eax, eax
-
     jz kernel_xhci_irq_error
 
 
     ; =========================================================================
     ; xHCI INTERRUPTS
     ; =========================================================================
-    ;
-    ; W tym momencie:
-    ;
-    ;   IDT       = gotowe
-    ;   LAPIC     = gotowe
-    ;   scheduler = gotowy
-    ;   IRQ route = gotowy
-    ;
-    ; Dopiero teraz włączamy przerwania xHCI.
-    ; =========================================================================
 
     call xhci_enable_interrupts
 
     test eax, eax
-
     jz kernel_xhci_enable_error
 
 
     ; =========================================================================
     ; LEGACY IOAPIC UNMASK
-    ; =========================================================================
-    ;
-    ; MSI NIE używa IOAPIC.
-    ;
-    ; Jeśli MSI działa:
-    ;
-    ;   xHCI -> MSI -> LAPIC
-    ;
-    ; Jeśli MSI nie działa:
-    ;
-    ;   xHCI -> PCI INTx -> IOAPIC -> LAPIC
-    ;
     ; =========================================================================
 
     cmp byte [rel xhci_msi_active], 1
@@ -674,7 +580,6 @@ _start:
     call ioapic_unmask_irq
 
     test eax, eax
-
     jz kernel_xhci_irq_error
 
 
@@ -718,10 +623,6 @@ _start:
     call scheduler_event_loop
 
 
-    ; =========================================================================
-    ; scheduler_event_loop NIE POWINIEN WRÓCIĆ
-    ; =========================================================================
-
 .kernel_halted:
 
     cli
@@ -734,47 +635,6 @@ _start:
 ; =============================================================================
 ; xHCI IRQ INITIALIZATION
 ; =============================================================================
-;
-; PRIORYTET:
-;
-;   1. MSI
-;   2. legacy PCI INTx -> IOAPIC
-;
-; MSI:
-;
-;   xHCI
-;      |
-;      v
-;   MSI
-;      |
-;      v
-;   LAPIC
-;      |
-;      v
-;   vector 0x28
-;
-; Legacy:
-;
-;   xHCI
-;      |
-;      v
-;   PCI IRQ
-;      |
-;      v
-;   IOAPIC
-;      |
-;      v
-;   LAPIC
-;      |
-;      v
-;   vector 0x28
-;
-; RETURN:
-;
-;   EAX = 1 success
-;   EAX = 0 failure
-;
-; =============================================================================
 
 kernel_init_xhci_irq:
 
@@ -786,12 +646,11 @@ kernel_init_xhci_irq:
 
 
     ; -------------------------------------------------------------------------
-    ; RESET STATE
+    ; Reset state
     ; -------------------------------------------------------------------------
 
     mov byte [rel xhci_msi_active], 0
     mov byte [rel xhci_irq_routed], 0
-
     mov byte [rel xhci_legacy_irq], 0xFF
 
 
@@ -802,20 +661,11 @@ kernel_init_xhci_irq:
     call xhci_msi_available
 
     test eax, eax
-
     jz .try_legacy
 
 
     ; -------------------------------------------------------------------------
-    ; Get current CPU LAPIC ID.
-    ;
-    ; NIE używamy żadnego fikcyjnego:
-    ;
-    ;   lapic_boot_cpu_id
-    ;
-    ; tylko prawdziwe:
-    ;
-    ;   lapic_get_id
+    ; Current LAPIC ID.
     ; -------------------------------------------------------------------------
 
     call lapic_get_id
@@ -840,21 +690,18 @@ kernel_init_xhci_irq:
     call xhci_enable_msi
 
     test eax, eax
-
     jz .msi_failed
 
 
     ; -------------------------------------------------------------------------
-    ; MSI SUCCESS
+    ; MSI success.
     ; -------------------------------------------------------------------------
 
     mov byte [rel xhci_msi_active], 1
     mov byte [rel xhci_irq_routed], 1
 
-
     lea rdi, [rel msg_xhci_msi_ok]
     call serial_log
-
 
     mov eax, 1
 
@@ -873,50 +720,29 @@ kernel_init_xhci_irq:
 
 .try_legacy:
 
-    ; -------------------------------------------------------------------------
-    ; IOAPIC musi istnieć dla legacy IRQ.
-    ; -------------------------------------------------------------------------
-
-    call ioapic_available_local
+    call ioapic_available
 
     test eax, eax
-
     jz .legacy_failed
 
 
     ; -------------------------------------------------------------------------
-    ; Pobierz PCI Interrupt Line bezpośrednio z xHCI drivera.
-    ;
-    ; xhci_get_pci_irq:
-    ;
-    ;   EAX = IRQ
+    ; Get PCI Interrupt Line.
     ; -------------------------------------------------------------------------
 
     call xhci_get_pci_irq
 
     cmp eax, 0xFF
-
     je .legacy_failed
 
-
     cmp eax, 15
-
     ja .legacy_failed
-
 
     mov [rel xhci_legacy_irq], al
 
 
     ; =========================================================================
     ; LEGACY IRQ -> IOAPIC
-    ; =========================================================================
-    ;
-    ; ioapic_route_irq:
-    ;
-    ;   EDI = ISA IRQ
-    ;   ESI = vector
-    ;   EDX = destination LAPIC ID
-    ;
     ; =========================================================================
 
     movzx edi, byte [rel xhci_legacy_irq]
@@ -934,13 +760,12 @@ kernel_init_xhci_irq:
 
 
     ; -------------------------------------------------------------------------
-    ; Route.
+    ; Route IRQ.
     ; -------------------------------------------------------------------------
 
     call ioapic_route_irq
 
     test eax, eax
-
     jz .legacy_failed
 
 
@@ -953,7 +778,6 @@ kernel_init_xhci_irq:
     call ioapic_mask_irq
 
     test eax, eax
-
     jz .legacy_failed
 
 
@@ -964,19 +788,17 @@ kernel_init_xhci_irq:
     mov byte [rel xhci_irq_routed], 1
     mov byte [rel xhci_msi_active], 0
 
-
     lea rdi, [rel msg_xhci_legacy_ok]
     call serial_log
-
 
     mov eax, 1
 
     jmp .done
 
 
-; ============================================================================
-; FAIL
-; ============================================================================
+; =============================================================================
+; FAILURE
+; =============================================================================
 
 .legacy_failed:
 
@@ -986,9 +808,9 @@ kernel_init_xhci_irq:
     xor eax, eax
 
 
-; ============================================================================
+; =============================================================================
 ; RETURN
-; ============================================================================
+; =============================================================================
 
 .done:
 
@@ -997,26 +819,6 @@ kernel_init_xhci_irq:
     pop rdx
     pop rcx
     pop rbx
-
-    ret
-
-
-; =============================================================================
-; LOCAL IOAPIC AVAILABILITY WRAPPER
-; =============================================================================
-;
-; Nie wymaga dodatkowego extern, jeśli obecny ioapic.asm nie eksportuje
-; ioapic_available w buildzie. Korzystamy bezpośrednio z lokalnego symbolu
-; przez extern poniżej.
-;
-; =============================================================================
-
-extern ioapic_available
-
-
-ioapic_available_local:
-
-    call ioapic_available
 
     ret
 
@@ -1095,220 +897,4 @@ kernel_xhci_irq_error:
 
     cli
 
-    lea rdi, [rel msg_xhci_irq_error]
-
-    call serial_log
-
-    jmp kernel_fatal_halt
-
-
-kernel_xhci_enable_error:
-
-    cli
-
-    lea rdi, [rel msg_xhci_enable_error]
-
-    call serial_log
-
-    jmp kernel_fatal_halt
-
-
-kernel_fatal_halt:
-
-    cli
-
-
-.fatal_loop:
-
-    hlt
-
-    jmp .fatal_loop
-
-
-; =============================================================================
-; DATA
-; =============================================================================
-
-section .data
-
-
-; =============================================================================
-; BOOTINFO
-; =============================================================================
-
-align 8
-
-boot_info_ptr:
-    dq 0
-
-
-; =============================================================================
-; xHCI INTERRUPT STATE
-; =============================================================================
-
-align 1
-
-; 1 = MSI
-; 0 = legacy / inactive
-xhci_msi_active:
-    db 0
-
-
-; 1 = IRQ route configured
-xhci_irq_routed:
-    db 0
-
-
-; Legacy PCI IRQ.
-;
-; 0xFF = invalid.
-xhci_legacy_irq:
-    db 0xFF
-
-
-; =============================================================================
-; DIAGNOSTIC MESSAGES
-; =============================================================================
-
-msg_kernel_start:
-    db "Blitrum OS: kernel start", 10, 0
-
-
-msg_pmm_ok:
-    db "PMM initialized", 10, 0
-
-
-msg_acpi_ok:
-    db "ACPI initialized", 10, 0
-
-
-msg_pmm_error:
-    db "FATAL: PMM initialization failed", 10, 0
-
-
-msg_acpi_error:
-    db "FATAL: ACPI initialization failed", 10, 0
-
-
-msg_lapic_ok:
-    db "LAPIC initialized", 10, 0
-
-
-msg_ioapic_ok:
-    db "IOAPIC initialized", 10, 0
-
-
-msg_ioapic_missing:
-    db "IOAPIC unavailable - MSI may still be used", 10, 0
-
-
-msg_idt_ok:
-    db "IDT initialized", 10, 0
-
-
-msg_hid_ok:
-    db "HID initialized", 10, 0
-
-
-msg_gui_ok:
-    db "GUI initialized", 10, 0
-
-
-msg_ahci_ok:
-    db "AHCI initialized", 10, 0
-
-
-msg_ahci_missing:
-    db "AHCI controller not found", 10, 0
-
-
-msg_vfs_ok:
-    db "VFS initialized", 10, 0
-
-
-msg_tgfs_ok:
-    db "TGFS initialized", 10, 0
-
-
-msg_update_ok:
-    db "Update system initialized", 10, 0
-
-
-msg_ahs_ok:
-    db "AHS-TUS initialized", 10, 0
-
-
-msg_multicore_ok:
-    db "Multicore initialized", 10, 0
-
-
-msg_scheduler_ok:
-    db "Scheduler initialized", 10, 0
-
-
-msg_lapic_timer_ok:
-    db "LAPIC timer initialized at 500 us", 10, 0
-
-
-msg_xhci_ok:
-    db "xHCI initialized", 10, 0
-
-
-msg_xhci_msi_ok:
-    db "xHCI MSI enabled -> LAPIC vector 0x28", 10, 0
-
-
-msg_xhci_msi_failed:
-    db "xHCI MSI unavailable/failed -> legacy IRQ fallback", 10, 0
-
-
-msg_xhci_legacy_ok:
-    db "xHCI legacy PCI IRQ -> IOAPIC vector 0x28", 10, 0
-
-
-msg_xhci_irq_ready:
-    db "xHCI interrupt path ready", 10, 0
-
-
-msg_interrupts_enabled:
-    db "CPU interrupts enabled", 10, 0
-
-
-msg_kernel_ready:
-    db "Blitrum OS kernel ready", 10, 0
-
-
-; =============================================================================
-; FATAL ERRORS
-; =============================================================================
-
-msg_bootinfo_error:
-    db "FATAL: invalid BootInfo", 10, 0
-
-
-msg_pmm_error:
-    db "FATAL: PMM initialization failed", 10, 0
-
-
-msg_acpi_error:
-    db "FATAL: ACPI initialization failed", 10, 0
-
-
-msg_lapic_error:
-    db "FATAL: LAPIC initialization failed", 10, 0
-
-
-msg_lapic_timer_error:
-    db "FATAL: LAPIC timer initialization failed", 10, 0
-
-
-msg_xhci_error:
-    db "FATAL: xHCI initialization failed", 10, 0
-
-
-msg_xhci_irq_error:
-    db "FATAL: xHCI IRQ routing failed", 10, 0
-
-
-msg_xhci_enable_error:
-    db "FATAL: xHCI interrupt enable failed", 10, 0
+    lea rdi, [rel msg_xhci_irq_error
