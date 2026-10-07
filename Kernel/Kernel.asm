@@ -80,7 +80,7 @@ extern screen_pps
 
 extern find_ahci_controller
 extern init_ahci_controller
-extern check_ahci_ports
+extern ahci_get_active_port
 
 extern vfs_mount_drive
 
@@ -424,9 +424,6 @@ _start:
     cmp eax, 1
     jbe .gui_pixel_format_valid
 
-    ; PixelBitMask / PixelBltOnly are not supported by current GUI core.
-    ; Fall back to RGB instead of passing an invalid value.
-
     xor eax, eax
 
 
@@ -478,22 +475,31 @@ _start:
     ; VFS
     ; =========================================================================
     ;
+    ; AHCI jest jedynym modułem wybierającym aktywny port.
+    ;
+    ; ahci_get_active_port ABI:
+    ;
+    ;   RAX = numer aktywnego portu
+    ;   CF  = 0 sukces
+    ;
+    ;   RAX = 0
+    ;   CF  = 1 błąd
+    ;
     ; vfs_mount_drive ABI:
     ;
     ;   RCX = SATA port
     ;   RAX = filesystem type / 0 on failure
     ;
-    ; AHCI wybiera pierwszy poprawny port ATA podczas inicjalizacji.
-    ; check_ahci_ports daje bitmapę aktywnych portów, z której wybieramy
-    ; pierwszy port do użycia przez VFS.
+    ; NIE wykonujemy tutaj ponownego check_ahci_ports().
+    ;
+    ; Dzięki temu AHCI jest jedynym źródłem prawdy dla aktywnego portu.
     ; =========================================================================
 
-    call check_ahci_ports
+    call ahci_get_active_port
 
-    test rax, rax
-    jz .storage_not_available
+    jc .storage_not_available
 
-    bsf rcx, rax
+    mov rcx, rax
 
     call vfs_mount_drive
 
@@ -506,14 +512,12 @@ _start:
     ; -------------------------------------------------------------------------
     ; TGFS jest już zamontowany przez VFS.
     ;
-    ; Nie wywołujemy tutaj tgfs_load_and_map_file bez parametrów.
-    ; Loader wymaga:
+    ; Konkretne pliki są ładowane później przez mechanizmy znające:
+    ;
     ;   RCX = SATA port
     ;   RDX = File ID
     ;   R8  = destination
     ;
-    ; Konkretne pliki są ładowane przez mechanizmy, które znają ich ID
-    ; i bezpieczny adres docelowy.
     ; -------------------------------------------------------------------------
 
     lea rdi, [rel msg_tgfs_ok]
@@ -666,17 +670,6 @@ _start:
     ; =========================================================================
     ; INITIAL GUI FRAME
     ; =========================================================================
-    ;
-    ; gui_draw_window ABI:
-    ;
-    ;   ECX = X
-    ;   EDX = Y
-    ;   R8D = width
-    ;   R9D = height
-    ;
-    ; Wyliczamy bezpieczny rozmiar na podstawie aktualnej rozdzielczości.
-    ; Dzięki temu nie przekazujemy śmieciowych wartości do GUI.
-    ; =========================================================================
 
     call kernel_draw_initial_window
 
@@ -708,12 +701,6 @@ _start:
 
 ; =============================================================================
 ; INITIAL GUI WINDOW
-; =============================================================================
-;
-; Wyjście:
-;   EAX = 1 jeżeli okno zostało wywołane
-;   EAX = 0 jeżeli ekran jest zbyt mały / GUI nie może zostać narysowane
-;
 ; =============================================================================
 
 kernel_draw_initial_window:
@@ -813,11 +800,6 @@ kernel_draw_initial_window:
 
     ; =========================================================================
     ; CALL GUI
-    ;
-    ; ECX = X
-    ; EDX = Y
-    ; R8D = width
-    ; R9D = height
     ; =========================================================================
 
     mov r8d, r14d
@@ -896,9 +878,6 @@ kernel_init_xhci_irq:
 
     ; -------------------------------------------------------------------------
     ; Configure MSI.
-    ;
-    ; EDI = LAPIC ID
-    ; ESI = vector
     ; -------------------------------------------------------------------------
 
     call xhci_enable_msi
