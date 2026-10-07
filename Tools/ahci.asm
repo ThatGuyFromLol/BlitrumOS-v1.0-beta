@@ -5,10 +5,34 @@
 ; Funkcje:
 ;   find_ahci_controller
 ;   init_ahci_controller
+;   ahci_get_active_port
 ;   check_ahci_ports
 ;   ahci_read_sectors
 ;
 ; API:
+;
+; find_ahci_controller:
+;   RAX = AHCI HBA MMIO
+;   CF  = 0 znaleziono
+;   CF  = 1 brak
+;
+; init_ahci_controller:
+;   RAX = AHCI HBA MMIO
+;   RAX = AHCI HBA MMIO przy sukcesie
+;   RAX = 0 przy błędzie
+;   CF  = 0 sukces
+;   CF  = 1 błąd
+;
+; ahci_get_active_port:
+;   RAX = wybrany numer portu SATA
+;   CF  = 0 sukces
+;   RAX = 0
+;   CF  = 1 błąd
+;
+; check_ahci_ports:
+;   RAX = bitmapa wykrytych portów ATA
+;   CF  = 0 sukces
+;   CF  = 1 brak HBA
 ;
 ; ahci_read_sectors:
 ;   RCX = numer portu SATA
@@ -16,11 +40,20 @@
 ;   R8  = liczba sektorów
 ;   R9  = adres bufora
 ;
-; Wyjście:
 ;   RAX = 1 sukces
 ;   RAX = 0 błąd
 ;   CF  = 0 sukces
 ;   CF  = 1 błąd
+;
+; WAŻNE:
+;
+;   Po init_ahci_controller numer aktywnego portu przechowywany jest
+;   w ahci_port_index.
+;
+;   Kernel/VFS powinien pobierać port przez ahci_get_active_port().
+;
+;   check_ahci_ports() pozostaje funkcją diagnostyczną oraz bazą
+;   pod przyszły hot-plug / AHS-TUS.
 ;
 ; ==============================================================================
 
@@ -127,14 +160,6 @@ ATA_READ_DMA_EXT  equ 0x25
 
 ; ==============================================================================
 ; COMMAND SLOTS
-;
-; AHCI HBA może posiadać od 1 do 32 command slots.
-;
-; CAP bits 12:8:
-;
-;   NCS = liczba slotów - 1
-;
-; Maksymalnie obsługujemy 32 sloty.
 ; ==============================================================================
 
 AHCI_MAX_SLOTS           equ 32
@@ -143,20 +168,6 @@ AHCI_COMMAND_HEADER_SIZE equ 32
 
 ; ==============================================================================
 ; PRDT
-;
-; Jeden wpis:
-;
-;   16 bajtów
-;
-; Maksymalny transfer pojedynczego wpisu:
-;
-;   4 MiB
-;
-; Maksymalny transfer:
-;
-;   65535 sektorów = około 32 MiB
-;
-; 16 wpisów daje wystarczający zapas również przy niekorzystnym wyrównaniu.
 ; ==============================================================================
 
 PRDT_ENTRY_SIZE   equ 16
@@ -166,19 +177,6 @@ PRDT_MAX_BYTES    equ 0x00400000
 
 ; ==============================================================================
 ; COMMAND TABLE
-;
-; Standard:
-;
-;   0x00 - Command FIS 64 B
-;   0x40 - ATAPI       16 B
-;   0x50 - Reserved    48 B
-;   0x80 - PRDT
-;
-; 16 * 16 = 256 B PRDT
-;
-; 0x80 + 0x100 = 0x180
-;
-; 512 B daje bezpieczny zapas.
 ; ==============================================================================
 
 COMMAND_TABLE_SIZE equ 512
@@ -199,15 +197,22 @@ section .bss
 
 align 8
 
+; Adres bazowy HBA MMIO.
 ahci_base_mmio:
     resq 1
 
+; Numer portu SATA wybranego podczas init.
+;
+; TO JEST GŁÓWNE ŹRÓDŁO PRAWDY DLA AKTYWNEGO PORTU.
 ahci_port_index:
     resq 1
 
+; Adres MMIO wybranego portu.
 ahci_port_mmio:
     resq 1
 
+; 1 = AHCI poprawnie zainicjalizowane.
+; 0 = brak poprawnej inicjalizacji.
 ahci_initialized:
     resb 1
 
@@ -221,9 +226,6 @@ ahci_command_slots:
 ;
 ; bit N = 1:
 ;   slot N jest używany przez software.
-;
-; lock bts pozwala bezpiecznie wybrać slot również wtedy,
-; gdy AHCI jest używane przez więcej niż jeden execution context.
 ahci_slot_bitmap:
     resd 1
 
@@ -253,8 +255,6 @@ ahci_received_fis:
 ; ==============================================================================
 ; COMMAND TABLES
 ;
-; Każdy command slot otrzymuje własną command table.
-;
 ; 32 * 512 = 16384 bajtów.
 ; ==============================================================================
 
@@ -272,6 +272,7 @@ section .text
 
 global find_ahci_controller
 global init_ahci_controller
+global ahci_get_active_port
 global check_ahci_ports
 global ahci_read_sectors
 
@@ -443,9 +444,6 @@ find_ahci_controller:
 
     ; ==========================================================================
     ; 64-BIT BAR
-    ;
-    ; BAR5 = low 32 bits
-    ; BAR6 = high 32 bits
     ; ==========================================================================
 
 .bar64:
@@ -520,6 +518,12 @@ find_ahci_controller:
 
     mov qword [rel ahci_base_mmio], 0
 
+    mov qword [rel ahci_port_index], 0
+
+    mov qword [rel ahci_port_mmio], 0
+
+    mov byte [rel ahci_initialized], 0
+
     pop r15
     pop r14
     pop r13
@@ -534,6 +538,29 @@ find_ahci_controller:
 
 ; ==============================================================================
 ; INIT AHCI CONTROLLER
+;
+; Wejście:
+;   RAX = HBA MMIO
+;
+; Wyjście:
+;   RAX = HBA MMIO przy sukcesie
+;   RAX = 0 przy błędzie
+;   CF  = 0 sukces
+;   CF  = 1 błąd
+;
+; Podczas inicjalizacji wybierany jest pierwszy działający port ATA.
+;
+; Wybrany port jest zapisywany:
+;
+;   ahci_port_index
+;   ahci_port_mmio
+;
+; Od tego momentu Kernel/VFS powinien korzystać z:
+;
+;   ahci_get_active_port
+;
+; zamiast ponownie skanować porty.
+;
 ; ==============================================================================
 
 init_ahci_controller:
@@ -675,6 +702,13 @@ init_ahci_controller:
 
 
 .ata_device:
+
+    ; ==========================================================================
+    ; ZAPISUJEMY WYBRANY PORT
+    ;
+    ; To jest jedyne miejsce podczas normalnej inicjalizacji,
+    ; które wybiera aktywny port.
+    ; ==========================================================================
 
     mov [rel ahci_port_mmio], r13
 
@@ -903,6 +937,8 @@ init_ahci_controller:
 
     mov byte [rel ahci_initialized], 0
 
+    mov qword [rel ahci_port_index], 0
+
     mov qword [rel ahci_port_mmio], 0
 
     mov dword [rel ahci_slot_bitmap], 0
@@ -924,7 +960,69 @@ init_ahci_controller:
 
 
 ; ==============================================================================
+; GET ACTIVE AHCI PORT
+;
+; To jest główne API dla Kernel/VFS.
+;
+; Nie wykonuje żadnego ponownego skanowania PCI ani HBA.
+;
+; Zwraca dokładnie port wybrany przez init_ahci_controller.
+;
+; Wyjście:
+;   RAX = numer aktywnego portu
+;   CF  = 0 sukces
+;
+;   RAX = 0
+;   CF  = 1 błąd
+;
+; ==============================================================================
+
+ahci_get_active_port:
+
+    cmp byte [rel ahci_initialized], 1
+
+    jne .error
+
+    mov rax, [rel ahci_port_index]
+
+    cmp rax, 31
+
+    ja .error
+
+    clc
+    ret
+
+
+.error:
+
+    xor eax, eax
+
+    stc
+    ret
+
+
+; ==============================================================================
 ; CHECK AHCI PORTS
+;
+; FUNKCJA DIAGNOSTYCZNA.
+;
+; Nie służy już do wyboru portu dla VFS.
+;
+; Zwraca bitmapę wszystkich obecnie wykrytych portów ATA.
+;
+; To API zostawiamy pod:
+;
+;   - diagnostykę
+;   - hot-plug
+;   - AHS-TUS
+;
+; Wyjście:
+;   RAX = bitmapa portów ATA
+;   CF  = 0
+;
+;   RAX = 0
+;   CF  = 1 jeżeli HBA nie istnieje
+;
 ; ==============================================================================
 
 check_ahci_ports:
@@ -1060,12 +1158,15 @@ ahci_read_sectors:
     ; ==========================================================================
 
     test r14, r14
+
     jz .read_error
 
     test r15, r15
+
     jz .read_error
 
     cmp r14, 65535
+
     ja .read_error
 
 
@@ -1166,6 +1267,7 @@ ahci_read_sectors:
 .engine_stopped:
 
     or dword [rbx + PXCMD], PXCMD_FRE
+
     or dword [rbx + PXCMD], PXCMD_ST
 
 
@@ -1174,8 +1276,8 @@ ahci_read_sectors:
     ; ==========================================================================
     ; FIND FREE COMMAND SLOT
     ;
-    ; R12D zostanie ponownie wykorzystany jako wybrany slot po obliczeniu
-    ; adresu portu. Oryginalny numer portu nie jest już potrzebny.
+    ; R12D zostanie ponownie wykorzystane jako wybrany slot.
+    ; Numer portu nie jest już potrzebny po wyliczeniu adresu portu.
     ; ==========================================================================
 
     mov ecx, [rel ahci_command_slots]
@@ -1185,6 +1287,7 @@ ahci_read_sectors:
     jz .read_error
 
     xor r8d, r8d
+
     mov edx, AHCI_TIMEOUT
 
 
@@ -1214,11 +1317,6 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; SLOT ACQUIRED
-    ;
-    ; WAŻNE:
-    ;
-    ; Slot przechowujemy w R12D.
-    ; R9 jest wolny i może być używany przez PRDT.
     ; ==========================================================================
 
     mov r12d, r8d
@@ -1579,20 +1677,7 @@ ahci_read_sectors:
 .prdt_done:
 
     ; ==========================================================================
-    ; ECX = PRDT COUNT
-    ; ==========================================================================
-
-    mov eax, ecx
-
-    shl eax, 16
-
-    or eax, 0x00000005
-
-
-    ; ==========================================================================
     ; COMMAND HEADER
-    ;
-    ; Header DW0:
     ;
     ; bits 0..4   = CFL = 5
     ; bits 16..31 = PRDTL
@@ -1605,15 +1690,6 @@ ahci_read_sectors:
     lea rdi, [rel ahci_command_list]
 
     add rdi, rax
-
-    mov [rdi + 0], eax
-
-
-    ; ==========================================================================
-    ; POPRAWNY DW0
-    ;
-    ; Ponownie budujemy wartość, ponieważ EAX powyżej zawierał adres headera.
-    ; ==========================================================================
 
     mov eax, ecx
 
@@ -1629,13 +1705,12 @@ ahci_read_sectors:
     ; ==========================================================================
 
     mov dword [rbx + PXIS], 0xFFFFFFFF
+
     mov dword [rbx + PXSERR], 0xFFFFFFFF
 
 
     ; ==========================================================================
     ; ISSUE COMMAND
-    ;
-    ; R12D = wybrany command slot.
     ; ==========================================================================
 
     mov eax, 1
@@ -1656,9 +1731,9 @@ ahci_read_sectors:
 
 .wait_command:
 
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
     ; CHECK AHCI ERRORS
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov eax, [rbx + PXIS]
 
@@ -1667,9 +1742,9 @@ ahci_read_sectors:
     jnz .read_error_clear
 
 
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
     ; CHECK COMMAND COMPLETION
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
 
     mov eax, [rbx + PXCI]
 
@@ -1688,8 +1763,7 @@ ahci_read_sectors:
 
     ; Timeout.
     ;
-    ; Nie zwalniamy software-locka, jeżeli sprzęt nadal trzyma slot.
-    ; Zapobiega to ponownemu użyciu command table podczas aktywnego DMA.
+    ; Jeżeli hardware nadal wykonuje DMA, software-lock zostaje.
     jmp .read_timeout
 
 
@@ -1737,11 +1811,6 @@ ahci_read_sectors:
 
 ; ==============================================================================
 ; COMMAND ERROR
-;
-; Występuje po zdobyciu slotu.
-;
-; Jeżeli sprzęt nadal nie używa slotu, zwalniamy software lock.
-; Jeżeli PxCI nadal ma slot aktywny, zostawiamy lock ustawiony.
 ; ==============================================================================
 
 .command_error:
@@ -1764,6 +1833,7 @@ ahci_read_sectors:
 .read_error_clear:
 
     mov dword [rbx + PXSERR], 0xFFFFFFFF
+
     mov dword [rbx + PXIS], 0xFFFFFFFF
 
     mov eax, [rbx + PXCI]
