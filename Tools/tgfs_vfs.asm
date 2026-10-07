@@ -4,13 +4,7 @@
 ;
 ; x86-64 / NASM
 ;
-; WERSJA:
-;   AHCI <-> VFS <-> TGFS
-;
-; ZGODNOŚĆ Z:
-;   Tools/ahci.asm
-;   Tools/tgfs_writer.py
-;   Kernel/Kernel.asm
+; AHCI <-> VFS <-> TGFS
 ;
 ; ==============================================================================
 
@@ -47,21 +41,21 @@ extern hid_get_last_key
 ; FILESYSTEM TYPES
 ; ==============================================================================
 
-FS_TYPE_UNKNOWN          equ 0
-FS_TYPE_TGFS             equ 1
+FS_TYPE_UNKNOWN           equ 0
+FS_TYPE_TGFS              equ 1
 
 
 ; ==============================================================================
 ; TGFS TAGS
 ; ==============================================================================
 
-TAG_SYSTEM               equ 0x00000001
-TAG_GUI                  equ 0x00000002
-TAG_APPLICATION          equ 0x00000004
-TAG_IMAGE                equ 0x00000008
+TAG_SYSTEM                equ 0x00000001
+TAG_GUI                   equ 0x00000002
+TAG_APPLICATION           equ 0x00000004
+TAG_IMAGE                 equ 0x00000008
 
-TAG_FOREIGN_ELF          equ 0x00010000
-TAG_FOREIGN_EXE          equ 0x00020000
+TAG_FOREIGN_ELF           equ 0x00010000
+TAG_FOREIGN_EXE           equ 0x00020000
 
 
 ; ==============================================================================
@@ -192,7 +186,7 @@ tgfs_last_file_checksum:
 
 
 ; ==============================================================================
-; VFS MOUNT
+; VFS MOUNT DRIVE
 ;
 ; INPUT:
 ;   RCX = SATA port
@@ -213,11 +207,6 @@ vfs_mount_drive:
 
     mov r12, rcx
 
-
-    ; ==========================================================================
-    ; Temporary stack buffer
-    ; ==========================================================================
-
     sub rsp, TGFS_SECTOR_SIZE
 
     mov r13, rsp
@@ -228,10 +217,10 @@ vfs_mount_drive:
     ;
     ; AHCI ABI:
     ;
-    ;   RCX = port
-    ;   RDX = LBA
-    ;   R8  = sector count
-    ;   R9  = destination
+    ; RCX = SATA port
+    ; RDX = LBA
+    ; R8  = sector count
+    ; R9  = destination
     ; ==========================================================================
 
     mov rcx, r12
@@ -245,7 +234,7 @@ vfs_mount_drive:
 
 
     ; ==========================================================================
-    ; Validate TGFS signature
+    ; "TGFS"
     ; ==========================================================================
 
     cmp dword [r13 + TGFS_SB_SIGNATURE], 0x53464754
@@ -265,20 +254,12 @@ vfs_mount_drive:
     jbe .mount_failed
 
 
-    ; ==========================================================================
-    ; Save registry LBA
-    ; ==========================================================================
-
     mov [rel tgfs_registry_lba], rax
 
     mov byte [rel current_fs_type], FS_TYPE_TGFS
 
     mov eax, FS_TYPE_TGFS
 
-
-    ; ==========================================================================
-    ; Cleanup
-    ; ==========================================================================
 
     add rsp, TGFS_SECTOR_SIZE
 
@@ -319,9 +300,6 @@ vfs_mount_drive:
 ; OUTPUT:
 ;   RAX = number of matching files
 ;
-; Output:
-;   DWORD file IDs
-;
 ; ==============================================================================
 
 tgfs_find_files_by_tag:
@@ -339,10 +317,6 @@ tgfs_find_files_by_tag:
     test r14, r14
     jz .search_failed
 
-
-    ; ==========================================================================
-    ; Temporary registry buffer
-    ; ==========================================================================
 
     sub rsp, TGFS_SECTOR_SIZE
 
@@ -374,10 +348,6 @@ tgfs_find_files_by_tag:
 
     jc .search_failed_stack
 
-
-    ; ==========================================================================
-    ; Search
-    ; ==========================================================================
 
     xor ebx, ebx
     xor eax, eax
@@ -420,7 +390,7 @@ tgfs_find_files_by_tag:
 
 
     ; ==========================================================================
-    ; ALL requested tag bits must exist
+    ; All requested bits must exist
     ; ==========================================================================
 
     mov ecx, edx
@@ -432,7 +402,7 @@ tgfs_find_files_by_tag:
 
 
     ; ==========================================================================
-    ; Store matching ID
+    ; Store file ID
     ; ==========================================================================
 
     mov edx, [rsi + TGFS_ENTRY_ID]
@@ -488,26 +458,21 @@ tgfs_find_files_by_tag:
 ; ==============================================================================
 ; TGFS COMPUTE XOR-64 CHECKSUM
 ;
-; Zgodne z:
+; Zgodne z Tools/tgfs_writer.py:
 ;
-;   Tools/tgfs_writer.py
-;
-; Python:
-;
-;   for i in range(0, len(data)-7, 8):
-;       checksum ^= struct.unpack_from("<Q", data, i)[0]
+; for i in range(0, len(data)-7, 8):
+;     checksum ^= struct.unpack_from("<Q", data, i)[0]
 ;
 ; Czyli:
-;
-;   - przetwarzamy tylko pełne 8-bajtowe słowa
-;   - końcówka krótsza niż 8 bajtów jest ignorowana
+;   - tylko pełne QWORD
+;   - końcówka < 8 bajtów jest ignorowana
 ;
 ; INPUT:
 ;   RCX = buffer
-;   RDX = exact file size
+;   RDX = dokładny rozmiar pliku
 ;
 ; OUTPUT:
-;   RAX = XOR-64
+;   RAX = checksum
 ;
 ; ==============================================================================
 
@@ -523,8 +488,6 @@ tgfs_compute_checksum:
     cmp rdx, 8
     jb .checksum_done
 
-    ; Number of complete QWORDs:
-    ; floor(size / 8)
 
     mov rbx, rdx
     shr rbx, 3
@@ -553,12 +516,12 @@ tgfs_compute_checksum:
 ;
 ; INPUT:
 ;   RCX = buffer
-;   RDX = exact file size
-;   R8  = expected checksum
+;   RDX = dokładny rozmiar pliku
+;   R8  = oczekiwany checksum
 ;
 ; OUTPUT:
-;   RAX = 1 valid
-;   RAX = 0 invalid
+;   RAX = 1 poprawny
+;   RAX = 0 błędny
 ;
 ; ==============================================================================
 
@@ -576,6 +539,7 @@ tgfs_verify_checksum:
     mov eax, 1
 
     pop rbx
+
     ret
 
 
@@ -584,6 +548,7 @@ tgfs_verify_checksum:
     xor eax, eax
 
     pop rbx
+
     ret
 
 
@@ -597,23 +562,23 @@ tgfs_verify_checksum:
 ;
 ; OUTPUT:
 ;
-;   IMAGE:
-;       RAX = file size
+; IMAGE:
+;   RAX = file size
 ;
-;   APPLICATION:
-;       RAX = destination
+; APPLICATION:
+;   RAX = destination
 ;
-;   ELF64:
-;       RAX = ELF entry point
+; ELF64:
+;   RAX = ELF entry point
 ;
-;   PE64:
-;       RAX = PE entry point
+; PE64:
+;   RAX = PE entry point
 ;
-;   DATA:
-;       RAX = file size
+; DATA:
+;   RAX = file size
 ;
-;   ERROR:
-;       RAX = -1
+; ERROR:
+;   RAX = -1
 ;
 ; ==============================================================================
 
@@ -627,7 +592,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Clear previous state
+    ; Clear previous result
     ; ==========================================================================
 
     mov qword [rel tgfs_last_file_size], 0
@@ -636,6 +601,11 @@ tgfs_load_and_map_file:
 
     ; ==========================================================================
     ; Save arguments
+    ;
+    ; R12 = SATA port
+    ; R13 = file ID
+    ; R14 = destination
+    ; R15 = local metadata buffer
     ; ==========================================================================
 
     mov r12, rcx
@@ -658,17 +628,16 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Stack frame
+    ; Local stack frame
     ;
-    ; +00 .. +511 = registry buffer
+    ; +000 .. +511 = registry
+    ; +512          = data LBA
+    ; +520          = tags
+    ; +528          = file size
+    ; +536          = expected checksum
+    ; +544          = sector count
     ;
-    ; +512  = data LBA
-    ; +520  = tags
-    ; +528  = file size
-    ; +536  = expected checksum
-    ; +544  = sector count
-    ;
-    ; Total = 552 bytes.
+    ; Total = 552 bytes
     ; ==========================================================================
 
     sub rsp, 552
@@ -688,6 +657,7 @@ tgfs_load_and_map_file:
     cmp rdx, TGFS_SUPERBLOCK_LBA
     jbe .load_error_stack
 
+
     mov rcx, r12
     mov r8, 1
     mov r9, r15
@@ -698,7 +668,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Search file ID
+    ; Find file
     ; ==========================================================================
 
     xor ebx, ebx
@@ -708,6 +678,7 @@ tgfs_load_and_map_file:
 
     cmp ebx, TGFS_MAX_ENTRIES
     jae .file_not_found
+
 
     mov rdx, rbx
     shl rdx, 6
@@ -745,7 +716,7 @@ tgfs_load_and_map_file:
 .file_found:
 
     ; ==========================================================================
-    ; Read registry fields
+    ; Read metadata
     ; ==========================================================================
 
     mov r10d, [rsi + TGFS_ENTRY_TAGS]
@@ -766,7 +737,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Validate size
+    ; Validate file size
     ; ==========================================================================
 
     cmp rdx, TGFS_MIN_FILE_SIZE
@@ -777,10 +748,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Save metadata to local stack frame
-    ;
-    ; This is important because ahci_read_sectors freely modifies caller-clobbered
-    ; registers.
+    ; Save metadata
     ; ==========================================================================
 
     mov [r15 + 512], r11
@@ -797,8 +765,6 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Calculate sector count
-    ;
     ; sectors = ceil(size / 512)
     ; ==========================================================================
 
@@ -836,10 +802,9 @@ tgfs_load_and_map_file:
     ; ==========================================================================
     ; IMPORTANT:
     ;
-    ; No longer reject a file merely because it crosses a 4 MiB boundary.
+    ; NIE ma tutaj już sprawdzania granicy 4 MiB.
     ;
-    ; The current AHCI driver builds multiple PRDT entries and automatically
-    ; splits the transfer at 4 MiB boundaries.
+    ; AHCI sam dzieli transfer na PRDT.
     ; ==========================================================================
 
 
@@ -855,14 +820,11 @@ tgfs_load_and_map_file:
 
     call .read_file
 
-
     jc .load_error_stack
-
 
     call .verify_loaded_file
 
     jc .load_error_stack
-
 
     mov rax, [rel tgfs_last_file_size]
 
@@ -930,7 +892,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; ELF magic
+    ; Magic
     ; ==========================================================================
 
     cmp dword [r14 + 0], ELF_MAGIC
@@ -938,7 +900,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; ELFCLASS64
+    ; ELF64
     ; ==========================================================================
 
     cmp byte [r14 + 4], ELF_CLASS_64
@@ -954,7 +916,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; ELF version
+    ; Version
     ; ==========================================================================
 
     cmp byte [r14 + 6], 1
@@ -962,7 +924,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; ELF type
+    ; Type
     ; ==========================================================================
 
     movzx eax, word [r14 + 16]
@@ -977,7 +939,7 @@ tgfs_load_and_map_file:
 .elf_type_ok:
 
     ; ==========================================================================
-    ; Machine = x86-64
+    ; x86-64
     ; ==========================================================================
 
     cmp word [r14 + 18], ELF_MACHINE_X86_64
@@ -1046,7 +1008,7 @@ tgfs_load_and_map_file:
     ; ==========================================================================
     ; ELF entry point
     ;
-    ; Full PT_LOAD relocation is intentionally not performed yet.
+    ; PT_LOAD mapping będzie dodane w późniejszym kroku.
     ; ==========================================================================
 
     mov rax, [r14 + 24]
@@ -1068,7 +1030,6 @@ tgfs_load_and_map_file:
     jc .load_error_stack
 
     call .verify_loaded_file
-
 
     jc .load_error_stack
 
@@ -1103,7 +1064,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; COFF header
+    ; NumberOfSections
     ; ==========================================================================
 
     movzx ecx, word [r14 + rax + 6]
@@ -1115,6 +1076,10 @@ tgfs_load_and_map_file:
     ja .load_error_stack
 
 
+    ; ==========================================================================
+    ; SizeOfOptionalHeader
+    ; ==========================================================================
+
     movzx edx, word [r14 + rax + 20]
 
     cmp edx, 240
@@ -1122,7 +1087,7 @@ tgfs_load_and_map_file:
 
 
     ; ==========================================================================
-    ; Optional header
+    ; Optional Header
     ; ==========================================================================
 
     add rax, 24
@@ -1180,49 +1145,53 @@ tgfs_load_and_map_file:
 ; ==============================================================================
 ; INTERNAL FILE READ
 ;
-; Uses local metadata:
+; INPUT:
+;   R12 = SATA port
+;   R14 = destination
+;   R15 = TGFS local metadata frame
 ;
-;   [r15 + 512] = LBA
-;   [r15 + 544] = sector count
+; [R15 + 512] = LBA
+; [R15 + 544] = sector count
 ;
-; destination = R14
+; OUTPUT:
+;   CF = 0 success
+;   CF = 1 failure
 ;
 ; ==============================================================================
 
 .read_file:
 
     push rbx
-    push r12
     push r13
-    push r14
     push r15
 
 
     ; ==========================================================================
-    ; IMPORTANT:
-    ;
-    ; The caller's R15 points to the metadata frame.
-    ; Preserve it while using AHCI.
+    ; Preserve metadata pointer
     ; ==========================================================================
 
     mov r13, r15
 
-    mov r12, [r13 + 512]
 
-    mov rbx, [r13 + 544]
+    ; ==========================================================================
+    ; Read metadata
+    ; ==========================================================================
 
-    mov r14, r14
+    mov rdx, [r13 + 512]
+
+    mov r8, [r13 + 544]
 
 
     ; ==========================================================================
-    ; AHCI read
+    ; AHCI ABI
+    ;
+    ; RCX = SATA port
+    ; RDX = LBA
+    ; R8  = sectors
+    ; R9  = destination
     ; ==========================================================================
 
-    mov rcx, [rel tgfs_active_port]
-
-    mov rdx, r12
-
-    mov r8, rbx
+    mov rcx, r12
 
     mov r9, r14
 
@@ -1232,9 +1201,7 @@ tgfs_load_and_map_file:
 
 
     pop r15
-    pop r14
     pop r13
-    pop r12
     pop rbx
 
     clc
@@ -1244,9 +1211,7 @@ tgfs_load_and_map_file:
 .read_failed:
 
     pop r15
-    pop r14
     pop r13
-    pop r12
     pop rbx
 
     stc
@@ -1254,17 +1219,11 @@ tgfs_load_and_map_file:
 
 
 ; ==============================================================================
-; NOTE:
-;
-; tgfs_active_port is filled immediately before .read_file is called.
-; ==============================================================================
-
-
-; ==============================================================================
 ; VERIFY LOADED FILE
 ;
 ; INPUT:
 ;   R14 = destination
+;   R15 = metadata frame
 ;
 ; OUTPUT:
 ;   CF = 0 valid
@@ -1278,9 +1237,27 @@ tgfs_load_and_map_file:
     push r12
 
 
+    ; ==========================================================================
+    ; Exact file size
+    ; ==========================================================================
+
     mov r12, [r15 + 528]
 
+
+    ; ==========================================================================
+    ; Expected checksum
+    ; ==========================================================================
+
     mov rbx, [r15 + 536]
+
+
+    ; ==========================================================================
+    ; tgfs_verify_checksum
+    ;
+    ; RCX = buffer
+    ; RDX = exact size
+    ; R8  = expected checksum
+    ; ==========================================================================
 
     mov rcx, r14
 
