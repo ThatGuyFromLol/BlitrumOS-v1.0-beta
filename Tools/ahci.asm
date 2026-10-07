@@ -534,15 +534,6 @@ find_ahci_controller:
 
 ; ==============================================================================
 ; INIT AHCI CONTROLLER
-;
-; Wejście:
-;   RAX = AHCI HBA MMIO
-;
-; Wyjście:
-;   RAX = AHCI HBA MMIO
-;   CF  = 0 sukces
-;   CF  = 1 błąd
-;
 ; ==============================================================================
 
 init_ahci_controller:
@@ -576,9 +567,6 @@ init_ahci_controller:
 
     ; ==========================================================================
     ; READ SUPPORTED COMMAND SLOT COUNT
-    ;
-    ; CAP bits 8..12 = NCS
-    ; number of slots = NCS + 1
     ; ==========================================================================
 
     mov edx, [rax + HBA_CAP]
@@ -590,10 +578,6 @@ init_ahci_controller:
     and ecx, 0x1F
 
     inc ecx
-
-    test ecx, ecx
-
-    jz .init_error
 
     cmp ecx, AHCI_MAX_SLOTS
 
@@ -689,10 +673,6 @@ init_ahci_controller:
 
     jmp .find_port
 
-
-; ==============================================================================
-; FOUND SATA DEVICE
-; ==============================================================================
 
 .ata_device:
 
@@ -825,7 +805,7 @@ init_ahci_controller:
 
 
     ; ==========================================================================
-    ; CLEAR ALL COMMAND TABLES
+    ; CLEAR COMMAND TABLES
     ; ==========================================================================
 
     lea rdi, [rel ahci_command_tables]
@@ -839,8 +819,6 @@ init_ahci_controller:
 
     ; ==========================================================================
     ; INITIALIZE COMMAND HEADERS
-    ;
-    ; Każdy slot otrzymuje własną command table.
     ; ==========================================================================
 
     xor r12d, r12d
@@ -852,10 +830,6 @@ init_ahci_controller:
 
     jae .headers_done
 
-    ; --------------------------------------------------------------------------
-    ; Header address = command_list + slot * 32
-    ; --------------------------------------------------------------------------
-
     mov rax, r12
 
     shl rax, 5
@@ -864,11 +838,6 @@ init_ahci_controller:
 
     add rdi, rax
 
-
-    ; --------------------------------------------------------------------------
-    ; Command table address = tables + slot * 512
-    ; --------------------------------------------------------------------------
-
     mov rax, r12
 
     shl rax, 9
@@ -876,13 +845,6 @@ init_ahci_controller:
     lea rdx, [rel ahci_command_tables]
 
     add rdx, rax
-
-
-    ; --------------------------------------------------------------------------
-    ; CFL = 5 DWORD
-    ; W   = 0
-    ; PRDTL = 0
-    ; --------------------------------------------------------------------------
 
     mov dword [rdi + 0], 0x00000005
 
@@ -922,7 +884,6 @@ init_ahci_controller:
     mov byte [rel ahci_initialized], 1
 
     mov rax, [rel ahci_base_mmio]
-
 
     pop r15
     pop r14
@@ -964,12 +925,6 @@ init_ahci_controller:
 
 ; ==============================================================================
 ; CHECK AHCI PORTS
-;
-; Wyjście:
-;   RAX = bitmap aktywnych portów SATA ATA
-;   CF  = 0 jeśli HBA istnieje
-;   CF  = 1 jeśli HBA nie istnieje
-;
 ; ==============================================================================
 
 check_ahci_ports:
@@ -999,11 +954,6 @@ check_ahci_ports:
 
     jz .next_port
 
-
-    ; ==========================================================================
-    ; PORT MMIO
-    ; ==========================================================================
-
     mov rcx, r12
 
     shl rcx, 7
@@ -1012,11 +962,6 @@ check_ahci_ports:
 
     add rcx, 0x100
 
-
-    ; ==========================================================================
-    ; DET = 3
-    ; ==========================================================================
-
     mov esi, [rcx + PXSSTS]
 
     and esi, 0x0F
@@ -1024,11 +969,6 @@ check_ahci_ports:
     cmp esi, 0x03
 
     jne .next_port
-
-
-    ; ==========================================================================
-    ; SATA ATA ONLY
-    ; ==========================================================================
 
     mov esi, [rcx + PXSIG]
 
@@ -1048,7 +988,6 @@ check_ahci_ports:
     cmp r12d, 32
 
     jb .port_loop
-
 
     pop rsi
     pop r12
@@ -1084,13 +1023,6 @@ check_ahci_ports:
 ;   R8  = liczba sektorów
 ;   R9  = bufor
 ;
-; Wyjście:
-;
-;   RAX = 1 sukces
-;   RAX = 0 błąd
-;   CF  = 0 sukces
-;   CF  = 1 błąd
-;
 ; ==============================================================================
 
 ahci_read_sectors:
@@ -1117,7 +1049,7 @@ ahci_read_sectors:
     ; SAVE PARAMETERS
     ; ==========================================================================
 
-    mov r12, rcx                    ; SATA port
+    mov r12, rcx                    ; port
     mov r13, rdx                    ; LBA
     mov r14, r8                     ; sectors
     mov r15, r9                     ; buffer
@@ -1128,15 +1060,12 @@ ahci_read_sectors:
     ; ==========================================================================
 
     test r14, r14
-
     jz .read_error
 
     test r15, r15
-
     jz .read_error
 
     cmp r14, 65535
-
     ja .read_error
 
 
@@ -1216,10 +1145,6 @@ ahci_read_sectors:
     jnz .engine_running
 
 
-    ; ==========================================================================
-    ; ENGINE STOPPED
-    ; ==========================================================================
-
     mov ecx, AHCI_TIMEOUT
 
 
@@ -1241,23 +1166,16 @@ ahci_read_sectors:
 .engine_stopped:
 
     or dword [rbx + PXCMD], PXCMD_FRE
-
     or dword [rbx + PXCMD], PXCMD_ST
 
 
 .engine_running:
 
-
     ; ==========================================================================
     ; FIND FREE COMMAND SLOT
     ;
-    ; Najpierw sprawdzamy software bitmapę.
-    ; Następnie PxCI.
-    ;
-    ; LOCK BTS:
-    ;
-    ;   bit = 0 -> atomowo ustawiamy 1 i przejmujemy slot
-    ;   bit = 1 -> slot zajęty przez inny execution context
+    ; R12D zostanie ponownie wykorzystany jako wybrany slot po obliczeniu
+    ; adresu portu. Oryginalny numer portu nie jest już potrzebny.
     ; ==========================================================================
 
     mov ecx, [rel ahci_command_slots]
@@ -1266,9 +1184,7 @@ ahci_read_sectors:
 
     jz .read_error
 
-
-    xor r8d, r8d                    ; slot = 0
-
+    xor r8d, r8d
     mov edx, AHCI_TIMEOUT
 
 
@@ -1279,20 +1195,15 @@ ahci_read_sectors:
     jae .no_slot_this_round
 
 
-    ; --------------------------------------------------------------------------
-    ; Sprawdź software lock.
-    ; --------------------------------------------------------------------------
-
     lock bts dword [rel ahci_slot_bitmap], r8d
 
     jc .slot_locked
 
 
-    ; --------------------------------------------------------------------------
-    ; Slot zarezerwowany software.
-    ;
-    ; Teraz sprawdzamy sprzętowe PxCI.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SOFTWARE LOCK zdobyty.
+    ; Sprawdź sprzętowy PxCI.
+    ; ==========================================================================
 
     mov eax, [rbx + PXCI]
 
@@ -1301,23 +1212,23 @@ ahci_read_sectors:
     jc .slot_hardware_busy
 
 
-    ; --------------------------------------------------------------------------
-    ; Slot jest wolny.
-    ; --------------------------------------------------------------------------
+    ; ==========================================================================
+    ; SLOT ACQUIRED
+    ;
+    ; WAŻNE:
+    ;
+    ; Slot przechowujemy w R12D.
+    ; R9 jest wolny i może być używany przez PRDT.
+    ; ==========================================================================
 
-    mov r9d, r8d
+    mov r12d, r8d
 
     jmp .slot_acquired
 
 
 .slot_hardware_busy:
 
-    ; --------------------------------------------------------------------------
-    ; Zwolnij software lock, bo hardware nadal używa slotu.
-    ; --------------------------------------------------------------------------
-
     lock btr dword [rel ahci_slot_bitmap], r8d
-
 
 .slot_locked:
 
@@ -1347,18 +1258,10 @@ ahci_read_sectors:
 .slot_acquired:
 
     ; ==========================================================================
-    ; R9D = COMMAND SLOT
-    ;
-    ; Zachowujemy slot w R9D.
-    ; ==========================================================================
-
-    ; ==========================================================================
     ; COMMAND HEADER
-    ;
-    ; header = command_list + slot * 32
     ; ==========================================================================
 
-    mov rax, r9
+    mov rax, r12
 
     shl rax, 5
 
@@ -1369,11 +1272,9 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; COMMAND TABLE
-    ;
-    ; table = command_tables + slot * 512
     ; ==========================================================================
 
-    mov rax, r9
+    mov rax, r12
 
     shl rax, 9
 
@@ -1386,8 +1287,6 @@ ahci_read_sectors:
     ; CLEAR COMMAND TABLE
     ; ==========================================================================
 
-    push r9
-
     mov rdi, rsi
 
     xor eax, eax
@@ -1396,28 +1295,9 @@ ahci_read_sectors:
 
     rep stosq
 
-    pop r9
-
 
     ; ==========================================================================
     ; HOST TO DEVICE FIS
-    ;
-    ; FIS:
-    ;
-    ; +00 = type
-    ; +01 = flags
-    ; +02 = command
-    ; +03 = feature low
-    ; +04 = LBA0
-    ; +05 = LBA1
-    ; +06 = LBA2
-    ; +07 = device
-    ; +08 = LBA3
-    ; +09 = LBA4
-    ; +0A = LBA5
-    ; +0B = feature high
-    ; +0C = count low
-    ; +0D = count high
     ; ==========================================================================
 
     mov byte [rsi + 0x00], 0x27
@@ -1490,12 +1370,10 @@ ahci_read_sectors:
     ; ==========================================================================
     ; BUILD PRDT
     ;
-    ; R15 = original buffer
+    ; R15 = buffer
     ; R14 = total sectors
-    ;
-    ; R13 = original LBA
-    ;
-    ; PRDT jest budowany w command table slotu.
+    ; R13 = LBA
+    ; R12D = selected command slot
     ; ==========================================================================
 
     lea rdi, [rsi + 0x80]
@@ -1504,7 +1382,7 @@ ahci_read_sectors:
 
     mov rdx, r14
 
-    xor ecx, ecx                   ; PRDT entry count
+    xor ecx, ecx
 
 
 .prdt_loop:
@@ -1702,11 +1580,6 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; ECX = PRDT COUNT
-    ;
-    ; Header:
-    ;
-    ; bits 0..4   = CFL = 5
-    ; bits 16..31 = PRDTL
     ; ==========================================================================
 
     mov eax, ecx
@@ -1715,17 +1588,17 @@ ahci_read_sectors:
 
     or eax, 0x00000005
 
-    mov [rdi], eax
-
 
     ; ==========================================================================
-    ; UWAGA:
+    ; COMMAND HEADER
     ;
-    ; RDI obecnie wskazuje na koniec PRDT.
-    ; Odtwarzamy adres command header.
+    ; Header DW0:
+    ;
+    ; bits 0..4   = CFL = 5
+    ; bits 16..31 = PRDTL
     ; ==========================================================================
 
-    mov rax, r9
+    mov rax, r12
 
     shl rax, 5
 
@@ -1733,11 +1606,13 @@ ahci_read_sectors:
 
     add rdi, rax
 
-    mov dword [rdi + 0], eax
+    mov [rdi + 0], eax
 
 
     ; ==========================================================================
-    ; USTAW POPRAWNY HEADER DW0
+    ; POPRAWNY DW0
+    ;
+    ; Ponownie budujemy wartość, ponieważ EAX powyżej zawierał adres headera.
     ; ==========================================================================
 
     mov eax, ecx
@@ -1754,19 +1629,18 @@ ahci_read_sectors:
     ; ==========================================================================
 
     mov dword [rbx + PXIS], 0xFFFFFFFF
-
     mov dword [rbx + PXSERR], 0xFFFFFFFF
 
 
     ; ==========================================================================
     ; ISSUE COMMAND
     ;
-    ; r9d = wybrany command slot
+    ; R12D = wybrany command slot.
     ; ==========================================================================
 
     mov eax, 1
 
-    mov ecx, r9d
+    mov ecx, r12d
 
     shl eax, cl
 
@@ -1775,8 +1649,6 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; WAIT COMMAND
-    ;
-    ; Timeout jest lokalny dla tej operacji.
     ; ==========================================================================
 
     mov ecx, AHCI_TIMEOUT
@@ -1801,7 +1673,7 @@ ahci_read_sectors:
 
     mov eax, [rbx + PXCI]
 
-    mov edx, r9d
+    mov edx, r12d
 
     bt eax, edx
 
@@ -1814,7 +1686,11 @@ ahci_read_sectors:
 
     jnz .wait_command
 
-    jmp .read_error_clear
+    ; Timeout.
+    ;
+    ; Nie zwalniamy software-locka, jeżeli sprzęt nadal trzyma slot.
+    ; Zapobiega to ponownemu użyciu command table podczas aktywnego DMA.
+    jmp .read_timeout
 
 
 .command_complete:
@@ -1838,7 +1714,7 @@ ahci_read_sectors:
     ; RELEASE SOFTWARE SLOT
     ; ==========================================================================
 
-    lock btr dword [rel ahci_slot_bitmap], r9d
+    lock btr dword [rel ahci_slot_bitmap], r12d
 
 
     ; ==========================================================================
@@ -1862,32 +1738,86 @@ ahci_read_sectors:
 ; ==============================================================================
 ; COMMAND ERROR
 ;
-; Slot został już zarezerwowany, więc musi zostać zwolniony.
+; Występuje po zdobyciu slotu.
+;
+; Jeżeli sprzęt nadal nie używa slotu, zwalniamy software lock.
+; Jeżeli PxCI nadal ma slot aktywny, zostawiamy lock ustawiony.
 ; ==============================================================================
 
 .command_error:
 
-    lock btr dword [rel ahci_slot_bitmap], r9d
+    mov eax, [rbx + PXCI]
+
+    bt eax, r12d
+
+    jc .read_error_hw_busy
+
+    lock btr dword [rel ahci_slot_bitmap], r12d
 
     jmp .read_error
 
 
 ; ==============================================================================
 ; AHCI ERROR
-;
-; Slot może nadal być aktywny sprzętowo.
-; Nie wymuszamy tutaj zatrzymania całego command engine,
-; ale zwalniamy software lock.
 ; ==============================================================================
 
 .read_error_clear:
 
     mov dword [rbx + PXSERR], 0xFFFFFFFF
-
     mov dword [rbx + PXIS], 0xFFFFFFFF
 
-    lock btr dword [rel ahci_slot_bitmap], r9d
+    mov eax, [rbx + PXCI]
 
+    bt eax, r12d
+
+    jc .read_error_hw_busy
+
+    lock btr dword [rel ahci_slot_bitmap], r12d
+
+    jmp .read_error
+
+
+; ==============================================================================
+; TIMEOUT
+;
+; Jeżeli PxCI nadal zawiera slot, software-lock pozostaje ustawiony.
+; Dzięki temu kolejna operacja nie nadpisze command table używanej przez DMA.
+;
+; Późniejszy moduł recovery może bezpiecznie przejąć ten przypadek.
+; ==============================================================================
+
+.read_timeout:
+
+    mov eax, [rbx + PXCI]
+
+    bt eax, r12d
+
+    jc .read_error_hw_busy
+
+    lock btr dword [rel ahci_slot_bitmap], r12d
+
+    jmp .read_error
+
+
+.read_error_hw_busy:
+
+    xor eax, eax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+
+    stc
+    ret
+
+
+; ==============================================================================
+; GENERIC READ ERROR
+; ==============================================================================
 
 .read_error:
 
@@ -1902,5 +1832,4 @@ ahci_read_sectors:
     pop rbx
 
     stc
-
     ret
