@@ -239,13 +239,13 @@ find_ahci_controller:
 
     mov ebx, r12d
 
-    mov bh, bl                      ; BH = bus
-    mov bl, r13b                     ; BL = device
+    mov bh, bl
+    mov bl, r13b
 
     mov ecx, r14d
 
-    mov ch, cl                      ; CH = function
-    mov cl, 0x00                    ; offset = 0
+    mov ch, cl
+    mov cl, 0x00
 
     call pci_read_config_dword
 
@@ -429,7 +429,8 @@ find_ahci_controller:
 ;
 ; Funkcja:
 ;   - włącza AHCI
-;   - znajduje pierwszy aktywny port SATA
+;   - znajduje pierwszy kompatybilny port SATA ATA
+;   - pomija ATAPI / SEMB / PM / nieznane urządzenia
 ;   - zatrzymuje command engine
 ;   - ustawia Command List
 ;   - ustawia Received FIS
@@ -455,6 +456,12 @@ init_ahci_controller:
     jz .init_error
 
     mov [rel ahci_base_mmio], rax
+
+    mov byte [rel ahci_initialized], 0
+
+    mov qword [rel ahci_port_index], 0
+
+    mov qword [rel ahci_port_mmio], 0
 
 
     ; ==========================================================================
@@ -484,22 +491,23 @@ init_ahci_controller:
 
 .find_port:
 
-    test edx, 1
-
-    jnz .candidate_port
-
-    shr edx, 1
-
-    inc r12d
+    ; --------------------------------------------------------------------------
+    ; Szukamy kolejnego portu zaimplementowanego w HBA.
+    ; Nie traktujemy samego bitu PI jako dowodu obecności urządzenia.
+    ; --------------------------------------------------------------------------
 
     cmp r12d, 32
 
-    jb .find_port
+    jae .init_error
 
-    jmp .init_error
+    mov ecx, r12d
 
+    mov edx, [rax + HBA_PI]
 
-.candidate_port:
+    bt edx, ecx
+
+    jnc .next_port
+
 
     ; --------------------------------------------------------------------------
     ; Port MMIO:
@@ -515,13 +523,9 @@ init_ahci_controller:
 
     add r13, 0x100
 
-    mov [rel ahci_port_mmio], r13
-
-    mov [rel ahci_port_index], r12
-
 
     ; --------------------------------------------------------------------------
-    ; DET = 3 -> device present and PHY established.
+    ; DET = 3 -> device present + PHY established.
     ; --------------------------------------------------------------------------
 
     mov edx, [r13 + PXSSTS]
@@ -530,37 +534,25 @@ init_ahci_controller:
 
     cmp edx, 0x03
 
-    je .device_present
+    jne .next_port
 
 
     ; --------------------------------------------------------------------------
-    ; Spróbuj następnego zaimplementowanego portu.
+    ; Sprawdź typ urządzenia po PxSIG.
+    ;
+    ; Sterownik odczytu obsługuje wyłącznie SATA ATA.
+    ;
+    ; ATAPI:
+    ;   EB140101
+    ;
+    ; SEMB:
+    ;   C33C0101
+    ;
+    ; Port Multiplier:
+    ;   96690101
+    ;
+    ; Nieznane sygnatury również pomijamy.
     ; --------------------------------------------------------------------------
-
-    inc r12d
-
-    cmp r12d, 32
-
-    jae .init_error
-
-    mov edx, [rax + HBA_PI]
-
-    mov ecx, r12d
-
-    shr edx, cl
-
-    test edx, 1
-
-    jz .find_port
-
-    jmp .candidate_port
-
-
-.device_present:
-
-    ; ==========================================================================
-    ; SPRAWDŹ SIGNATURE
-    ; ==========================================================================
 
     mov edx, [r13 + PXSIG]
 
@@ -568,25 +560,34 @@ init_ahci_controller:
 
     je .ata_device
 
-    ; ATAPI nie jest obsługiwane przez obecny sterownik odczytu.
-    cmp edx, SATA_SIG_ATAPI
 
-    je .init_error
+    ; --------------------------------------------------------------------------
+    ; Ten port jest aktywny, ale nie jest obsługiwanym dyskiem ATA.
+    ; Szukamy następnego.
+    ; --------------------------------------------------------------------------
 
-    ; Port multiplier / SEMB również nie są obsługiwane.
-    cmp edx, SATA_SIG_SEMB
+.next_port:
 
-    je .init_error
+    inc r12d
 
-    cmp edx, SATA_SIG_PM
+    jmp .find_port
 
-    je .init_error
 
-    ; Nieznana sygnatura.
-    jmp .init_error
-
+    ; ==========================================================================
+    ; ZNALEZIONO KOMPATYBILNY DYSK SATA ATA
+    ; ==========================================================================
 
 .ata_device:
+
+    ; --------------------------------------------------------------------------
+    ; Zapamiętaj dokładnie ten port, który został zaakceptowany.
+    ; Kernel/VFS może później użyć tego numeru.
+    ; --------------------------------------------------------------------------
+
+    mov [rel ahci_port_mmio], r13
+
+    mov [rel ahci_port_index], r12
+
 
     ; ==========================================================================
     ; STOP COMMAND ENGINE
@@ -782,6 +783,8 @@ init_ahci_controller:
 
     mov byte [rel ahci_initialized], 0
 
+    mov qword [rel ahci_port_mmio], 0
+
     pop r15
     pop r14
     pop r13
@@ -814,6 +817,7 @@ check_ahci_ports:
     push rcx
     push rdx
     push r12
+    push rsi
 
     mov rbx, [rel ahci_base_mmio]
 
@@ -867,6 +871,7 @@ check_ahci_ports:
     jb .port_loop
 
 
+    pop rsi
     pop r12
     pop rdx
     pop rcx
@@ -881,6 +886,7 @@ check_ahci_ports:
 
     xor eax, eax
 
+    pop rsi
     pop r12
     pop rdx
     pop rcx
@@ -936,10 +942,10 @@ ahci_read_sectors:
     ; ZACHOWAJ PARAMETRY
     ; ==========================================================================
 
-    mov r12, rcx                    ; port
-    mov r13, rdx                    ; LBA
-    mov r14, r8                     ; sectors
-    mov r15, r9                     ; buffer
+    mov r12, rcx
+    mov r13, rdx
+    mov r14, r8
+    mov r15, r9
 
 
     ; ==========================================================================
@@ -983,11 +989,6 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; PORT MMIO
-    ;
-    ; WAŻNE:
-    ; R12-R15 pozostają parametrami.
-    ; RDI może być później używany do memset Command Table.
-    ; Adres portu przechowujemy w RBX.
     ; ==========================================================================
 
     mov rax, [rel ahci_base_mmio]
@@ -1096,10 +1097,6 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; CLEAR COMMAND TABLE
-    ;
-    ; WAŻNE:
-    ; Nie używamy RDI jako port MMIO.
-    ; Port jest w RBX.
     ; ==========================================================================
 
     mov rdi, AHCI_CTBA
@@ -1143,8 +1140,6 @@ ahci_read_sectors:
 
     ; ==========================================================================
     ; DEVICE
-    ;
-    ; LBA mode.
     ; ==========================================================================
 
     mov byte [AHCI_CTBA + 7], 0x40
@@ -1191,8 +1186,6 @@ ahci_read_sectors:
     ; PRDT
     ;
     ; DBC = bytes - 1
-    ;
-    ; Jeden wpis maksymalnie 4 MiB.
     ; ==========================================================================
 
     mov rax, r14
@@ -1212,8 +1205,6 @@ ahci_read_sectors:
 
     ; --------------------------------------------------------------------------
     ; Sprawdź, czy bufor nie przekracza granicy 4 MiB.
-    ;
-    ; AHCI PRDT entry nie może przekroczyć granicy 4 MiB.
     ; --------------------------------------------------------------------------
 
     mov rdx, r15
@@ -1280,20 +1271,12 @@ ahci_read_sectors:
 
 .wait_command:
 
-    ; --------------------------------------------------------------------------
-    ; BŁĘDY AHCI
-    ; --------------------------------------------------------------------------
-
     mov eax, [rbx + PXIS]
 
     test eax, AHCI_ERROR_MASK
 
     jnz .read_error_clear
 
-
-    ; --------------------------------------------------------------------------
-    ; Command slot 0 zakończony.
-    ; --------------------------------------------------------------------------
 
     mov eax, [rbx + PXCI]
 
@@ -1308,10 +1291,6 @@ ahci_read_sectors:
 
     jnz .wait_command
 
-
-    ; --------------------------------------------------------------------------
-    ; TIMEOUT
-    ; --------------------------------------------------------------------------
 
     jmp .read_error_clear
 
