@@ -153,8 +153,6 @@ BOOTINFO_ACPI_RSDP          equ 0x40
 ; Scheduler
 ; -----------------------------------------------------------------------------
 
-; 500 us = 0.5 ms
-
 DEFAULT_SCHEDULER_TICK_US   equ 500
 
 
@@ -179,7 +177,7 @@ KERNEL_STACK_TOP            equ 0x0000000000090000
 _start:
 
     ; -------------------------------------------------------------------------
-    ; Absolutely no external interrupts yet.
+    ; No external interrupts during initialization.
     ; -------------------------------------------------------------------------
 
     cli
@@ -189,8 +187,6 @@ _start:
     ; UEFI bootloader:
     ;
     ;   RCX = BootInfo
-    ;
-    ; Save immediately.
     ; -------------------------------------------------------------------------
 
     mov [rel boot_info_ptr], rcx
@@ -235,12 +231,9 @@ _start:
     ; PMM
     ; =========================================================================
     ;
-    ; PMM ABI:
-    ;
-    ;   RCX = EFI_MEMORY_DESCRIPTOR size
-    ;   R8  = memory map size
-    ;   R9  = memory map address
-    ;
+    ; RCX = EFI descriptor size
+    ; R8  = memory map size
+    ; R9  = memory map address
     ; =========================================================================
 
     mov rbx, [rel boot_info_ptr]
@@ -271,12 +264,9 @@ _start:
     ; ACPI
     ; =========================================================================
     ;
-    ; ACPI ABI:
-    ;
-    ;   RCX = RSDP
-    ;   RAX = 1 success
-    ;   RAX = 0 failure
-    ;
+    ; RCX = RSDP
+    ; RAX = 1 success
+    ; RAX = 0 failure
     ; =========================================================================
 
     mov rbx, [rel boot_info_ptr]
@@ -370,10 +360,10 @@ _start:
     ;   R8D  = height
     ;   R9D  = pixels per scanline
     ;
-    ; Pixel format:
+    ; gui_pixel_format:
     ;
-    ;   gui_pixel_format = 0 -> RGB
-    ;   gui_pixel_format = 1 -> BGR
+    ;   0 = RGB
+    ;   1 = BGR
     ;
     ; =========================================================================
 
@@ -420,8 +410,9 @@ _start:
     cmp eax, 1
     jbe .gui_pixel_format_valid
 
-    ; Unsupported GOP format.
-    ; Do not pass PixelBitMask / PixelBltOnly into the RGB/BGR engine.
+    ; PixelBitMask / PixelBltOnly are not supported by current GUI core.
+    ; Fall back to RGB instead of passing an invalid value.
+
     xor eax, eax
 
 
@@ -932,7 +923,6 @@ kernel_fatal_halt:
 .fatal_loop:
 
     hlt
-
     jmp .fatal_loop
 
 
@@ -941,6 +931,8 @@ kernel_fatal_halt:
 ; =============================================================================
 
 section .data
+
+align 8
 
 
 ; -----------------------------------------------------------------------------
@@ -964,20 +956,7 @@ xhci_irq_routed:
 xhci_legacy_irq:
     db 0xFF
 
-    align 8
-
-
-; -----------------------------------------------------------------------------
-; GUI pixel format
-;
-; 0 = RGB
-; 1 = BGR
-; -----------------------------------------------------------------------------
-
-gui_pixel_format:
-    dd 0
-
-    align 8
+align 8
 
 
 ; =============================================================================
@@ -1082,34 +1061,6 @@ msg_interrupts_enabled:
 
 msg_kernel_ready:
     db "BLITRUM KERNEL READY", 13, 10, 0
-
-
-; =============================================================================
-; BSS
-; =============================================================================
-
-section .bss
-
-align 16
-
-; BootInfo is filled by UEFI bootloader before kernel entry.
-;
-; This variable only stores the pointer.
-;
-; The actual BootInfo structure lives in bootloader-owned memory
-; that remains valid after ExitBootServices().
-;
-align 8
-
-boot_info_storage:
-    resq 1
-
-; Alias used by code.
-;
-; NASM allows us to reserve a separate storage location, but the code uses
-; boot_info_ptr above. Keep one canonical location by equating the symbol.
-;
-; No additional allocation is required.
 
 
 ; =============================================================================
