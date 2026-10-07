@@ -15,6 +15,14 @@ set -euo pipefail
 # Kernel load address:
 #   0x00100000
 #
+# IMPORTANT:
+#
+#   Kernel .bss MUST be physically present in kernel.bin.
+#
+#   The UEFI loader allocates memory according to kernel.bin size.
+#   Therefore the raw kernel image must include the complete zero-filled
+#   .bss region.
+#
 # Legacy BIOS boot is NOT built.
 #
 # =============================================================================
@@ -358,12 +366,49 @@ echo "     $KERNEL_ELF"
 # =============================================================================
 # 4. ELF -> RAW BINARY
 # =============================================================================
+#
+# CRITICAL:
+#
+# The linker creates .bss as SHT_NOBITS.
+#
+# A normal:
+#
+#   llvm-objcopy -O binary kernel.elf kernel.bin
+#
+# can omit the physical .bss contents.
+#
+# The kernel however contains important runtime structures in .bss:
+#
+#   - xHCI DCBAA
+#   - xHCI command ring
+#   - xHCI event ring
+#   - ERST
+#   - other kernel state
+#
+# Therefore convert .bss into an allocated/loadable/contents section
+# before producing the raw binary.
+#
+# The resulting bytes are zero-filled and become part of kernel.bin.
+#
+# This means:
+#
+#   kernel_size
+#       |
+#       +--> includes .text
+#       +--> includes .rodata
+#       +--> includes .data
+#       +--> includes .bss
+#
+# UEFI therefore allocates enough physical pages for the COMPLETE kernel.
+#
+# =============================================================================
 
 echo
 echo "[4/4] Creating raw kernel.bin..."
 echo
 
 "$OBJCOPY" \
+    --set-section-flags .bss=alloc,load,contents \
     -O binary \
     "$KERNEL_ELF" \
     "$KERNEL_BIN"
@@ -400,6 +445,17 @@ echo "  Blitrum/kernel.bin"
 echo
 echo "Kernel load address:"
 echo "  0x00100000"
+echo
+echo "Kernel image:"
+echo "  .text   = INCLUDED"
+echo "  .rodata = INCLUDED"
+echo "  .data   = INCLUDED"
+echo "  .bss    = INCLUDED + ZERO FILLED"
+echo
+echo "Memory architecture:"
+echo "  PMM     = EFI memory map"
+echo "  Kernel  = fully allocated image"
+echo "  .bss    = physically present in kernel.bin"
 echo
 echo "Interrupt architecture:"
 echo "  ACPI   : ENABLED"
