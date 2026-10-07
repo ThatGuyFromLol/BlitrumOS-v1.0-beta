@@ -88,6 +88,9 @@ gop_framebuffer:
 ; Dynamiczny backbuffer
 ;
 ; 64-bit ARGB per pixel.
+;
+; Stride backbuffera:
+;   screen_pps * 8
 ; ------------------------------------------------------------------------------
 
 gui_backbuffer:
@@ -150,6 +153,7 @@ cursor_y_prev:
 ;
 ;   pixels = height * PPS
 ;   bytes  = pixels * 8
+;
 ; ==============================================================================
 
 section .text
@@ -171,11 +175,8 @@ gui_init:
     ; ==========================================================================
 
     mov [gop_framebuffer], rcx
-
     mov [screen_width], edx
-
     mov [screen_height], r8d
-
     mov [screen_pps], r9d
 
 
@@ -197,6 +198,17 @@ gui_init:
 
 
     ; ==========================================================================
+    ; PPS MUSI BYĆ >= WIDTH
+    ;
+    ; UEFI może dodać padding do końca wiersza, ale PPS nie może być
+    ; mniejsze od widocznej szerokości.
+    ; ==========================================================================
+
+    cmp r9d, edx
+    jb .allocation_failed
+
+
+    ; ==========================================================================
     ; PIXEL FORMAT
     ;
     ; Akceptujemy:
@@ -215,7 +227,6 @@ gui_init:
     cmp eax, 1
     je .pixel_format_valid
 
-    ; Nieznany format.
     jmp .allocation_failed
 
 
@@ -337,9 +348,7 @@ gui_init:
 .allocation_failed:
 
     mov qword [gui_backbuffer], 0
-
     mov qword [backbuffer_size_b], 0
-
 
     pop r11
     pop r10
@@ -379,6 +388,7 @@ gui_get_backbuffer_addr:
 ;   bits 47..32 = Red
 ;   bits 31..16 = Green
 ;   bits 15..0  = Blue
+;
 ; ==============================================================================
 
 gui_draw_to_backbuffer:
@@ -426,6 +436,9 @@ gui_draw_to_backbuffer:
 
     mul ebx
 
+    test rdx, rdx
+    jnz .pixel_out_pop
+
     add eax, ecx
 
     jc .pixel_out_pop
@@ -470,10 +483,12 @@ gui_draw_to_backbuffer:
 ;
 ;   32-bit GOP framebuffer
 ;
-; Obsługiwane:
+; WAŻNE:
 ;
-;   0 = RGB
-;   1 = BGR
+;   visible width  = screen_width
+;   row stride      = screen_pps
+;
+; Nie kopiujemy paddingu GOP jako widocznych pikseli.
 ;
 ; ==============================================================================
 
@@ -487,6 +502,8 @@ gui_refresh_screen:
     push rdi
     push r8
     push r9
+    push r10
+    push r11
 
 
     ; ==========================================================================
@@ -512,29 +529,72 @@ gui_refresh_screen:
 
 
     ; ==========================================================================
-    ; LICZBA PIKSELI
-    ;
-    ; height * PPS
+    ; WIDTH / HEIGHT / PPS
     ; ==========================================================================
 
-    mov eax, [screen_height]
+    mov r10d, [screen_width]
+    mov r11d, [screen_height]
 
-    mov edx, [screen_pps]
-
-    mul edx
-
-    test rdx, rdx
-
-    jnz .refresh_done
-
-    mov rcx, rax
-
-    test rcx, rcx
-
+    test r10d, r10d
     jz .refresh_done
 
+    test r11d, r11d
+    jz .refresh_done
 
-.refresh_loop:
+    cmp [screen_pps], r10d
+    jb .refresh_done
+
+
+    ; ==========================================================================
+    ; SPRAWDŹ FORMAT RAZ
+    ; ==========================================================================
+
+    mov eax, [gui_pixel_format]
+
+    cmp eax, 0
+    je .format_ready
+
+    cmp eax, 1
+    je .format_ready
+
+    jmp .refresh_done
+
+
+.format_ready:
+
+
+    ; ==========================================================================
+    ; RCX = ROW COUNTER
+    ; ==========================================================================
+
+    xor rcx, rcx
+
+
+; ==============================================================================
+; ROW LOOP
+; ==============================================================================
+
+.refresh_row_loop:
+
+    cmp rcx, r11
+    jae .refresh_done
+
+
+    ; ==========================================================================
+    ; R8 = licznik widocznych pikseli w wierszu
+    ; ==========================================================================
+
+    mov r8, r10
+
+
+; ==============================================================================
+; PIXEL LOOP
+; ==============================================================================
+
+.refresh_pixel_loop:
+
+    test r8, r8
+    jz .refresh_next_row
 
 
     ; ==========================================================================
@@ -545,31 +605,16 @@ gui_refresh_screen:
 
 
     ; ==========================================================================
-    ; SPRAWDŹ FORMAT GOP
-    ; ==========================================================================
-
-    mov eax, [gui_pixel_format]
-
-    cmp eax, 0
-
-    je .pixel_rgb
-
-    cmp eax, 1
-
-    je .pixel_bgr
-
-
-    ; Nieznany format.
-    jmp .refresh_done
-
-
-    ; ==========================================================================
     ; RGB
     ;
     ; GOP:
     ;
-    ; 0x00RRGGBB
+    ;   0x00RRGGBB
     ; ==========================================================================
+
+    cmp dword [gui_pixel_format], 0
+    jne .pixel_bgr
+
 
 .pixel_rgb:
 
@@ -580,14 +625,11 @@ gui_refresh_screen:
     mov rax, rbx
 
     shr rax, 32
-
     shr eax, 8
-
     and eax, 0xFF
-
     shl eax, 16
 
-    mov r8d, eax
+    mov r9d, eax
 
 
     ; --------------------------------------------------------------------------
@@ -597,14 +639,11 @@ gui_refresh_screen:
     mov rax, rbx
 
     shr rax, 16
-
     shr eax, 8
-
     and eax, 0xFF
-
     shl eax, 8
 
-    or r8d, eax
+    or r9d, eax
 
 
     ; --------------------------------------------------------------------------
@@ -614,10 +653,9 @@ gui_refresh_screen:
     mov rax, rbx
 
     shr eax, 8
-
     and eax, 0xFF
 
-    or r8d, eax
+    or r9d, eax
 
     jmp .pixel_store
 
@@ -627,7 +665,7 @@ gui_refresh_screen:
     ;
     ; GOP:
     ;
-    ; 0x00BBGGRR
+    ;   0x00BBGGRR
     ; ==========================================================================
 
 .pixel_bgr:
@@ -639,12 +677,10 @@ gui_refresh_screen:
     mov rax, rbx
 
     shr rax, 32
-
     shr eax, 8
-
     and eax, 0xFF
 
-    mov r8d, eax
+    mov r9d, eax
 
 
     ; --------------------------------------------------------------------------
@@ -654,14 +690,11 @@ gui_refresh_screen:
     mov rax, rbx
 
     shr rax, 16
-
     shr eax, 8
-
     and eax, 0xFF
-
     shl eax, 8
 
-    or r8d, eax
+    or r9d, eax
 
 
     ; --------------------------------------------------------------------------
@@ -671,17 +704,15 @@ gui_refresh_screen:
     mov rax, rbx
 
     shr eax, 8
-
     and eax, 0xFF
-
     shl eax, 16
 
-    or r8d, eax
+    or r9d, eax
 
 
 .pixel_store:
 
-    mov [rdi], r8d
+    mov [rdi], r9d
 
 
     ; ==========================================================================
@@ -689,16 +720,85 @@ gui_refresh_screen:
     ; ==========================================================================
 
     add rsi, 8
-
     add rdi, 4
 
-    dec rcx
+    dec r8
 
-    jnz .refresh_loop
+    jmp .refresh_pixel_loop
 
+
+; ==============================================================================
+; NEXT ROW
+; ==============================================================================
+
+.refresh_next_row:
+
+    ; --------------------------------------------------------------------------
+    ; Backbuffer:
+    ;
+    ;   aktualnie przesunęliśmy się o WIDTH pikseli.
+    ;
+    ; Musimy pominąć padding:
+    ;
+    ;   PPS - WIDTH
+    ;
+    ; Każdy piksel = 8 bajtów.
+    ; --------------------------------------------------------------------------
+
+    mov eax, [screen_pps]
+
+    sub eax, [screen_width]
+
+    test eax, eax
+    jz .backbuffer_row_ready
+
+    shl rax, 3
+
+    add rsi, rax
+
+
+.backbuffer_row_ready:
+
+
+    ; --------------------------------------------------------------------------
+    ; Framebuffer:
+    ;
+    ;   aktualnie przesunęliśmy się o WIDTH pikseli.
+    ;
+    ; Pomijamy GOP padding:
+    ;
+    ;   PPS - WIDTH
+    ;
+    ; Każdy piksel = 4 bajty.
+    ; --------------------------------------------------------------------------
+
+    mov eax, [screen_pps]
+
+    sub eax, [screen_width]
+
+    test eax, eax
+    jz .framebuffer_row_ready
+
+    shl rax, 2
+
+    add rdi, rax
+
+
+.framebuffer_row_ready:
+
+    inc rcx
+
+    jmp .refresh_row_loop
+
+
+; ==============================================================================
+; DONE
+; ==============================================================================
 
 .refresh_done:
 
+    pop r11
+    pop r10
     pop r9
     pop r8
     pop rdi
@@ -718,6 +818,7 @@ gui_refresh_screen:
 ; EDX = Y
 ; R8D = width
 ; R9D = height
+;
 ; ==============================================================================
 
 gui_draw_window:
@@ -741,6 +842,17 @@ gui_draw_window:
 
 
     ; ==========================================================================
+    ; OCHRONA PRZED ZEROWYM ROZMIAREM
+    ; ==========================================================================
+
+    test r14d, r14d
+    jz .win_done
+
+    test r15d, r15d
+    jz .win_done
+
+
+    ; ==========================================================================
     ; TŁO OKNA
     ; ==========================================================================
 
@@ -750,7 +862,6 @@ gui_draw_window:
 .win_y_loop:
 
     cmp rsi, r15
-
     jge .win_title_bar
 
     xor rdi, rdi
@@ -759,19 +870,14 @@ gui_draw_window:
 .win_x_loop:
 
     cmp rdi, r14
-
     jge .next_win_y
 
 
     mov ecx, r12d
-
     add ecx, edi
 
-
     mov edx, r13d
-
     add edx, esi
-
 
     mov r8, 0x0000D3D3D3D3D3D3
 
@@ -802,7 +908,13 @@ gui_draw_window:
 .title_y_loop:
 
     cmp rsi, 24
+    jge .win_done
 
+    ; --------------------------------------------------------------------------
+    ; Nie wychodzimy poza wysokość okna.
+    ; --------------------------------------------------------------------------
+
+    cmp rsi, r15
     jge .win_done
 
     xor rdi, rdi
@@ -811,19 +923,14 @@ gui_draw_window:
 .title_x_loop:
 
     cmp rdi, r14
-
     jge .next_title_y
 
 
     mov ecx, r12d
-
     add ecx, edi
 
-
     mov edx, r13d
-
     add edx, esi
-
 
     mov r8, 0x0000000000008888
 
@@ -863,6 +970,7 @@ gui_draw_window:
 ;
 ; RCX = X
 ; RDX = Y
+;
 ; ==============================================================================
 
 gui_draw_cursor:
@@ -905,7 +1013,6 @@ gui_draw_cursor:
 .erase_y:
 
     cmp rsi, 12
-
     jge .draw_cursor
 
     xor rdi, rdi
@@ -914,22 +1021,18 @@ gui_draw_cursor:
 .erase_x:
 
     cmp rdi, 12
-
     jge .erase_next_y
 
 
     lea rax, [rel cursor_bitmap]
 
     mov rbx, rsi
-
     imul rbx, 12
-
     add rbx, rdi
 
     movzx eax, byte [rax + rbx]
 
     test al, al
-
     jz .erase_skip
 
 
@@ -938,14 +1041,10 @@ gui_draw_cursor:
 
 
     mov ecx, r14d
-
     add ecx, edi
 
-
     mov edx, r15d
-
     add edx, esi
-
 
     xor r8, r8
 
@@ -982,7 +1081,6 @@ gui_draw_cursor:
 .draw_y:
 
     cmp rsi, 12
-
     jge .cursor_done
 
     xor rdi, rdi
@@ -991,22 +1089,18 @@ gui_draw_cursor:
 .draw_x:
 
     cmp rdi, 12
-
     jge .draw_next_y
 
 
     lea rax, [rel cursor_bitmap]
 
     mov rbx, rsi
-
     imul rbx, 12
-
     add rbx, rdi
 
     movzx eax, byte [rax + rbx]
 
     test al, al
-
     jz .draw_skip
 
 
@@ -1015,14 +1109,10 @@ gui_draw_cursor:
 
 
     mov ecx, r12d
-
     add ecx, edi
 
-
     mov edx, r13d
-
     add edx, esi
-
 
     mov r8, 0x0000FFFFFFFFFFFF
 
@@ -1050,7 +1140,6 @@ gui_draw_cursor:
 .cursor_done:
 
     mov [cursor_x_prev], r12
-
     mov [cursor_y_prev], r13
 
 
