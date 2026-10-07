@@ -27,17 +27,30 @@
 ;
 ;   IOAPIC is reserved for real hardware IRQ routing.
 ;
-;   xHCI interrupt sequence:
+; IMPORTANT INITIALIZATION ORDER:
 ;
-;       xHCI init
-;          |
-;       IOAPIC route
-;          |
-;       xHCI interrupt enable
-;          |
-;       IOAPIC IRQ unmask
-;          |
-;       STI
+;   IDT
+;      |
+;   LAPIC
+;      |
+;   IOAPIC
+;      |
+;   scheduler_init
+;      |
+;   LAPIC scheduler timer
+;      |
+;   xHCI init
+;      |
+;   xHCI IRQ route
+;      |
+;   xHCI interrupt enable
+;      |
+;   IOAPIC IRQ unmask
+;      |
+;   STI
+;
+; Dzięki temu xHCI ISR nigdy nie zostanie uruchomiony zanim scheduler
+; i jego struktury nie będą gotowe.
 ;
 ; =============================================================================
 
@@ -161,11 +174,6 @@ extern xhci_get_pci_function
 ; AUDIO
 ; =============================================================================
 
-; Tools/audio_hca.asm eksportuje:
-;
-;   find_hda_controller
-;   init_hda_controller
-;
 extern find_hda_controller
 extern init_hda_controller
 
@@ -381,6 +389,10 @@ _start:
 ; =============================================================================
 ; IDT
 ; =============================================================================
+;
+; IDT MUSI być gotowe zanim zaczniemy konfigurować sprzętowe IRQ.
+;
+; =============================================================================
 
     call idt_init
 
@@ -403,16 +415,14 @@ _start:
 ; GUI
 ; =============================================================================
 ;
-; POPRAWNE ABI gui_init z Tools/gui_hdr.asm:
+; POPRAWNE ABI gui_init:
 ;
 ;   RCX  = framebuffer
 ;   EDX  = width
 ;   R8D  = height
 ;   R9D  = pixels per scanline
 ;
-; Pixel format NIE jest przekazywany jako argument.
-;
-; Jest ustawiany przez eksportowaną zmienną:
+; Pixel format:
 ;
 ;   gui_pixel_format
 ;
@@ -490,12 +500,6 @@ _start:
 ; =============================================================================
 ; VFS / TGFS
 ; =============================================================================
-;
-; vfs_mount_drive:
-;
-;   RCX = SATA port
-;
-; =============================================================================
 
     cmp byte [rel ahci_active], 1
     jne .vfs_done
@@ -510,19 +514,99 @@ _start:
 
 
 ; =============================================================================
+; AHS-TUS / UPDATE
+; =============================================================================
+
+    call update_system_init
+
+
+; =============================================================================
+; MULTICORE
+; =============================================================================
+;
+; Uruchamiamy obsługę multicore przed schedulerem, aby scheduler mógł
+; korzystać z finalnego stanu CPU/AP.
+;
+; =============================================================================
+
+    call init_multicore
+
+
+; =============================================================================
+; SCHEDULER
+; =============================================================================
+;
+; KRYTYCZNA ZMIANA KOLEJNOŚCI:
+;
+; Scheduler jest inicjalizowany PRZED xHCI.
+;
+; ISR xHCI wykonuje:
+;
+;   scheduler_trigger_event
+;
+; dlatego scheduler musi już istnieć zanim:
+;
+;   xHCI IRQ -> IOAPIC -> LAPIC -> IDT -> ISR
+;
+; zostanie otwarte.
+;
+; =============================================================================
+
+    call scheduler_init
+
+
+; =============================================================================
+; LAPIC TIMER
+; =============================================================================
+;
+; Timer jest przygotowywany przed otwarciem xHCI IRQ.
+;
+; Nadal nie wykonuje IRQ dopóki CPU pozostaje na CLI.
+;
+; =============================================================================
+
+    cmp byte [rel lapic_active], 1
+    jne .timer_unavailable
+
+    mov rcx, DEFAULT_SCHEDULER_TICK_US
+
+    call lapic_timer_init_us
+
+    test rax, rax
+    jz .timer_unavailable
+
+    mov byte [rel scheduler_timer_active], 1
+
+    lea rdi, [rel timer_ok_msg]
+    call serial_log
+
+    jmp .timer_done
+
+
+.timer_unavailable:
+
+    mov byte [rel scheduler_timer_active], 0
+
+    lea rdi, [rel timer_fail_msg]
+    call serial_log
+
+
+.timer_done:
+
+
+; =============================================================================
 ; xHCI
 ; =============================================================================
 ;
-; KOLEJNOŚĆ:
+; W tym miejscu:
 ;
-;   1. xhci_init
-;   2. kernel_init_xhci_irq
-;   3. xhci_enable_interrupts
-;   4. ioapic_unmask_irq
-;   5. później STI
+;   IDT       = gotowe
+;   LAPIC     = gotowy
+;   IOAPIC    = gotowy
+;   scheduler = GOTOWY
+;   LAPIC timer = skonfigurowany
 ;
-; Dzięki temu nie otwieramy IRQ zanim kontroler i jego Event Ring
-; nie są przygotowane.
+; Dopiero teraz przygotowujemy xHCI.
 ;
 ; =============================================================================
 
@@ -554,6 +638,14 @@ _start:
 
 ; =============================================================================
 ; UNMASK IOAPIC IRQ
+; =============================================================================
+;
+; xHCI może teraz generować IRQ.
+;
+; Scheduler oraz IDT są już gotowe.
+;
+; CPU nadal ma CLI, więc ISR nie wykona się aż do STI.
+;
 ; =============================================================================
 
     mov edi, [rel xhci_pci_irq]
@@ -606,8 +698,9 @@ _start:
 .xhci_irq_unmask_failed:
 
     ; xHCI zostało już włączone.
-    ; Wyłączamy je ponownie, aby nie generować IRQ do zamaskowanej /
-    ; niepoprawnie skonfigurowanej ścieżki.
+    ;
+    ; Ponieważ IOAPIC nie został poprawnie odmaskowany, wyłączamy
+    ; hardware interrupts xHCI.
 
     call xhci_disable_interrupts
 
@@ -618,6 +711,10 @@ _start:
 
     jmp .xhci_done
 
+
+; =============================================================================
+; xHCI UNAVAILABLE
+; =============================================================================
 
 .xhci_unavailable:
 
@@ -663,60 +760,6 @@ _start:
 
 
 ; =============================================================================
-; AHS-TUS / UPDATE
-; =============================================================================
-
-    call update_system_init
-
-
-; =============================================================================
-; MULTICORE
-; =============================================================================
-
-    call init_multicore
-
-
-; =============================================================================
-; SCHEDULER
-; =============================================================================
-
-    call scheduler_init
-
-
-; =============================================================================
-; LAPIC TIMER
-; =============================================================================
-
-    cmp byte [rel lapic_active], 1
-    jne .timer_unavailable
-
-    mov rcx, DEFAULT_SCHEDULER_TICK_US
-
-    call lapic_timer_init_us
-
-    test rax, rax
-    jz .timer_unavailable
-
-    mov byte [rel scheduler_timer_active], 1
-
-    lea rdi, [rel timer_ok_msg]
-    call serial_log
-
-    jmp .timer_done
-
-
-.timer_unavailable:
-
-    mov byte [rel scheduler_timer_active], 0
-
-    lea rdi, [rel timer_fail_msg]
-    call serial_log
-
-
-.timer_done:
-
-
-; =============================================================================
 ; INITIAL GUI
 ; =============================================================================
 
@@ -724,17 +767,21 @@ _start:
 
 
 ; =============================================================================
-; ENABLE INTERRUPTS
+; ENABLE CPU INTERRUPTS
 ; =============================================================================
 ;
 ; W tym momencie:
 ;
-;   IDT       = gotowe
-;   LAPIC     = gotowe
-;   IOAPIC    = gotowe
-;   scheduler = gotowy
-;   LAPIC timer = skonfigurowany
-;   xHCI IRQ  = odblokowane tylko jeśli pełna konfiguracja się udała
+;   GDT             = gotowe
+;   IDT             = gotowe
+;   LAPIC           = gotowy
+;   IOAPIC          = gotowy
+;   scheduler       = gotowy
+;   scheduler timer = skonfigurowany
+;   xHCI            = skonfigurowany
+;   xHCI IRQ        = odblokowane tylko po pełnym sukcesie
+;
+; Dopiero teraz otwieramy CPU IF.
 ;
 ; =============================================================================
 
@@ -946,25 +993,11 @@ kernel_init_ioapic:
 ;           v
 ;    isr_xhci_handler
 ;
-; WAŻNE:
+; ioapic_route_irq():
 ;
-;   ioapic_route_irq() przyjmuje ISA IRQ 0..15.
-;
-;   Dlatego PCI Interrupt Line musi być:
-;
-;       0..15
-;
-;   Wartość 0xFF oznacza brak użytecznej linii INTx.
-;
-;   PCI Interrupt Pin:
-;
-;       0 = brak
-;       1 = INTA
-;       2 = INTB
-;       3 = INTC
-;       4 = INTD
-;
-;   Wpis IOAPIC jest tworzony jako MASKED.
+;   EDI = IRQ
+;   ESI = vector
+;   EDX = destination APIC ID
 ;
 ; =============================================================================
 
@@ -1017,10 +1050,6 @@ kernel_init_xhci_irq:
 
 ; =============================================================================
 ; ROUTE
-;
-; EDI = PCI/ISA IRQ
-; ESI = IDT vector
-; EDX = destination LAPIC APIC ID
 ; =============================================================================
 
     mov edi, [rel xhci_pci_irq]
