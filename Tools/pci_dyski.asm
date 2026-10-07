@@ -167,12 +167,12 @@ pci_read_config_dword:
 ; ==============================================================================
 ; pci_get_interrupt_info
 ;
-; Odczytuje:
+; Odczytuje rejestr PCI Interrupt Line / Interrupt Pin.
 ;
-;   PCI offset 0x3C:
+; PCI offset 0x3C:
 ;
-;       bits 7:0    = Interrupt Line
-;       bits 15:8   = Interrupt Pin
+;   bits  7:0 = Interrupt Line
+;   bits 15:8 = Interrupt Pin
 ;
 ; WEJŚCIE:
 ;
@@ -200,10 +200,11 @@ pci_get_interrupt_info:
     push rbx
     push rcx
     push r8
+    push r9
 
 
     ; ==========================================================================
-    ; PCI INTERRUPT LINE/PIN
+    ; PCI INTERRUPT LINE / PIN
     ; ==========================================================================
 
     mov cl, 0x3C
@@ -212,10 +213,25 @@ pci_get_interrupt_info:
 
 
     ; ==========================================================================
+    ; ZACHOWAJ CAŁY REJESTR PCI
+    ;
+    ; EAX zawiera:
+    ;
+    ;   AL = Interrupt Line
+    ;   AH = Interrupt Pin
+    ;
+    ; Nie możemy najpierw nadpisać EAX samą wartością Interrupt Line,
+    ; ponieważ stracilibyśmy Interrupt Pin.
+    ; ==========================================================================
+
+    mov r9d, eax
+
+
+    ; ==========================================================================
     ; INTERRUPT LINE
     ; ==========================================================================
 
-    movzx r8d, al
+    movzx r8d, r9b
 
     mov rax, r8
 
@@ -224,7 +240,7 @@ pci_get_interrupt_info:
     ; INTERRUPT PIN
     ; ==========================================================================
 
-    mov edx, eax
+    mov edx, r9d
 
     shr edx, 8
 
@@ -235,6 +251,7 @@ pci_get_interrupt_info:
     ; RETURN
     ; ==========================================================================
 
+    pop r9
     pop r8
     pop rcx
     pop rbx
@@ -265,6 +282,7 @@ pci_get_device_info:
 
     push rbx
     push rcx
+    push r8
 
 
     ; ==========================================================================
@@ -295,6 +313,7 @@ pci_get_device_info:
 
     mov eax, r8d
 
+    pop r8
     pop rcx
     pop rbx
 
