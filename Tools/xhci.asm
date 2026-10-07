@@ -77,9 +77,6 @@ XHCI_PAGE_SIZE          equ 4096
 extern find_usb_controllers
 extern usb_interrupts_init
 
-extern pmm_alloc
-extern pmm_free
-
 
 ; =============================================================================
 ; EXPORTS
@@ -625,6 +622,7 @@ xhci_submit_command:
     pop rbx
 
     ret
+
 
 .fail:
 
