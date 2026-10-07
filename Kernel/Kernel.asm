@@ -80,9 +80,9 @@ extern screen_pps
 
 extern find_ahci_controller
 extern init_ahci_controller
+extern check_ahci_ports
 
 extern vfs_mount_drive
-extern tgfs_load_and_map_file
 
 
 ; -----------------------------------------------------------------------------
@@ -477,21 +477,66 @@ _start:
     ; =========================================================================
     ; VFS
     ; =========================================================================
+    ;
+    ; vfs_mount_drive ABI:
+    ;
+    ;   RCX = SATA port
+    ;   RAX = filesystem type / 0 on failure
+    ;
+    ; AHCI wybiera pierwszy poprawny port ATA podczas inicjalizacji.
+    ; check_ahci_ports daje bitmapę aktywnych portów, z której wybieramy
+    ; pierwszy port do użycia przez VFS.
+    ; =========================================================================
+
+    call check_ahci_ports
+
+    test rax, rax
+    jz .storage_not_available
+
+    bsf rcx, rax
 
     call vfs_mount_drive
+
+    test rax, rax
+    jz .vfs_failed
 
     lea rdi, [rel msg_vfs_ok]
     call serial_log
 
-
-    ; =========================================================================
-    ; TGFS
-    ; =========================================================================
-
-    call tgfs_load_and_map_file
+    ; -------------------------------------------------------------------------
+    ; TGFS jest już zamontowany przez VFS.
+    ;
+    ; Nie wywołujemy tutaj tgfs_load_and_map_file bez parametrów.
+    ; Loader wymaga:
+    ;   RCX = SATA port
+    ;   RDX = File ID
+    ;   R8  = destination
+    ;
+    ; Konkretne pliki są ładowane przez mechanizmy, które znają ich ID
+    ; i bezpieczny adres docelowy.
+    ; -------------------------------------------------------------------------
 
     lea rdi, [rel msg_tgfs_ok]
     call serial_log
+
+    jmp .storage_done
+
+
+.vfs_failed:
+
+    lea rdi, [rel msg_vfs_missing]
+    call serial_log
+
+    jmp .storage_done
+
+
+.storage_not_available:
+
+    lea rdi, [rel msg_ahci_storage_missing]
+    call serial_log
+
+
+.storage_done:
 
 
     ; =========================================================================
@@ -1175,6 +1220,12 @@ msg_ahci_missing:
 
 msg_vfs_ok:
     db "VFS OK", 13, 10, 0
+
+msg_vfs_missing:
+    db "VFS NOT MOUNTED", 13, 10, 0
+
+msg_ahci_storage_missing:
+    db "AHCI STORAGE NOT AVAILABLE", 13, 10, 0
 
 msg_tgfs_ok:
     db "TGFS OK", 13, 10, 0
