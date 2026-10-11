@@ -5,13 +5,11 @@
 ;
 ; Kernel load address: 0x00100000
 ; BootInfo pointer:    RCX
-;
 ; =============================================================================
 
 bits 64
 
 section .text
-
 global _start
 
 ; =============================================================================
@@ -74,7 +72,6 @@ extern xhci_disable_msi
 extern xhci_get_pci_irq
 extern xhci_get_pci_pin
 
-; Defined by linker.ld
 extern __bss_start
 extern __bss_end
 
@@ -97,7 +94,7 @@ BOOTINFO_MEMMAP_DESC_VER    equ 0x38
 
 BOOTINFO_ACPI_RSDP          equ 0x40
 
-DEFAULT_SCHEDULER_TICK_US   equ 500
+DEFAULT_SCHEDULER_TICK_US    equ 500
 
 XHCI_IRQ_VECTOR             equ 0x28
 
@@ -112,22 +109,13 @@ GUI_WINDOW_MARGIN           equ 32
 ; =============================================================================
 
 _start:
-
     cli
     cld
 
-    ; ---------------------------------------------------------
-    ; Save BootInfo before initializing BSS.
-    ; RCX is supplied by the UEFI bootloader.
-    ; ---------------------------------------------------------
-
+    ; Preserve BootInfo before clearing BSS.
     mov [rel boot_info_ptr], rcx
 
-    ; ---------------------------------------------------------
-    ; Clear BSS before calling modules or using the BSS stack.
-    ; The linker defines __bss_start and __bss_end.
-    ; ---------------------------------------------------------
-
+    ; Clear BSS.
     lea rdi, [rel __bss_start]
     lea rcx, [rel __bss_end]
 
@@ -138,47 +126,31 @@ _start:
     xor eax, eax
     rep stosb
 
-    ; ---------------------------------------------------------
-    ; Use the kernel-owned stack.
-    ; Do not assume physical address 0x90000 is free.
-    ; ---------------------------------------------------------
-
+    ; Switch to the kernel-owned stack.
     lea rsp, [rel kernel_stack_top]
     and rsp, -16
-
     xor rbp, rbp
 
-    ; ---------------------------------------------------------
     ; GDT
-    ; ---------------------------------------------------------
-
     call gdt_init
 
-    ; ---------------------------------------------------------
-    ; SERIAL
-    ; ---------------------------------------------------------
-
+    ; Serial logging
     call serial_init
 
     lea rdi, [rel msg_kernel_start]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; BOOTINFO VALIDATION
-    ; ---------------------------------------------------------
-
+    ; Validate BootInfo.
     mov rax, [rel boot_info_ptr]
-
     test rax, rax
     jz kernel_bootinfo_error
 
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
     ; PMM
-    ;
-    ; RCX = EFI memory descriptor size
-    ; R8  = EFI memory map size
-    ; R9  = EFI memory map address
-    ; ---------------------------------------------------------
+    ; RCX = descriptor size
+    ; R8  = memory map size
+    ; R9  = memory map address
+    ; -------------------------------------------------------------------------
 
     mov rbx, [rel boot_info_ptr]
 
@@ -203,15 +175,13 @@ _start:
     lea rdi, [rel msg_pmm_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
     ; ACPI
-    ;
     ; RCX = RSDP pointer
-    ; EAX = 1 on success, 0 on failure
-    ; ---------------------------------------------------------
+    ; EAX = nonzero on success
+    ; -------------------------------------------------------------------------
 
     mov rbx, [rel boot_info_ptr]
-
     mov rcx, [rbx + BOOTINFO_ACPI_RSDP]
 
     test rcx, rcx
@@ -225,10 +195,7 @@ _start:
     lea rdi, [rel msg_acpi_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; LOCAL APIC
-    ; ---------------------------------------------------------
-
+    ; LAPIC
     call lapic_init
 
     test eax, eax
@@ -237,12 +204,7 @@ _start:
     lea rdi, [rel msg_lapic_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; IOAPIC
-    ; IOAPIC failure is not immediately fatal:
-    ; xHCI may be able to use MSI instead.
-    ; ---------------------------------------------------------
-
+    ; IOAPIC: MSI may still be usable if IOAPIC is unavailable.
     call ioapic_init
 
     test eax, eax
@@ -250,53 +212,36 @@ _start:
 
     lea rdi, [rel msg_ioapic_ok]
     call serial_log
-
     jmp .ioapic_done
 
 .ioapic_unavailable:
-
     lea rdi, [rel msg_ioapic_missing]
     call serial_log
 
 .ioapic_done:
 
-    ; ---------------------------------------------------------
     ; IDT
-    ; ---------------------------------------------------------
-
     call idt_init
 
     lea rdi, [rel msg_idt_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; CRASH SCREEN SUPPORT
-    ; ---------------------------------------------------------
-
+    ; Crash screen support
     call bsod_init
 
-    ; ---------------------------------------------------------
     ; HID
-    ; ---------------------------------------------------------
-
     call hid_init
 
     lea rdi, [rel msg_hid_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
     ; GUI / GOP
-    ;
-    ; gui_init:
-    ;   RCX = framebuffer address
-    ;   EDX = width
-    ;   R8D = height
-    ;   R9D = pixels per scanline
-    ;
-    ; Pixel format:
-    ;   0 = RGB
-    ;   1 = BGR
-    ; ---------------------------------------------------------
+    ; RCX  = framebuffer
+    ; EDX  = width
+    ; R8D  = height
+    ; R9D  = pixels per scanline
+    ; -------------------------------------------------------------------------
 
     mov rbx, [rel boot_info_ptr]
 
@@ -306,14 +251,11 @@ _start:
     mov r9d, [rbx + BOOTINFO_PPS]
 
     mov eax, [rbx + BOOTINFO_PIXEL_FORMAT]
-
     cmp eax, 1
     jbe .gui_pixel_format_valid
-
     xor eax, eax
 
 .gui_pixel_format_valid:
-
     mov [rel gui_pixel_format], eax
 
     call gui_init
@@ -321,9 +263,9 @@ _start:
     lea rdi, [rel msg_gui_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
     ; AHCI
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
 
     call find_ahci_controller
 
@@ -337,36 +279,25 @@ _start:
 
     lea rdi, [rel msg_ahci_ok]
     call serial_log
-
     jmp .ahci_done
 
 .no_ahci:
-
     lea rdi, [rel msg_ahci_missing]
     call serial_log
 
 .ahci_done:
 
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
     ; VFS / TGFS
-    ;
-    ; ahci_get_active_port:
-    ;   RAX = active SATA port
-    ;   CF  = 0 success, 1 failure
-    ;
-    ; vfs_mount_drive:
-    ;   RCX = SATA port
-    ;   RAX = filesystem type, or 0 on failure
-    ;
-    ; AHCI is the source of truth for the active port.
-    ; ---------------------------------------------------------
+    ; ahci_get_active_port: RAX = port, CF=0 on success
+    ; vfs_mount_drive: RCX = port, RAX nonzero on success
+    ; -------------------------------------------------------------------------
 
     call ahci_get_active_port
 
     jc .storage_not_available
 
     mov rcx, rax
-
     call vfs_mount_drive
 
     test rax, rax
@@ -377,66 +308,45 @@ _start:
 
     lea rdi, [rel msg_tgfs_ok]
     call serial_log
-
     jmp .storage_done
 
 .vfs_failed:
-
     lea rdi, [rel msg_vfs_missing]
     call serial_log
-
     jmp .storage_done
 
 .storage_not_available:
-
     lea rdi, [rel msg_ahci_storage_missing]
     call serial_log
 
 .storage_done:
 
-    ; ---------------------------------------------------------
-    ; UPDATE SYSTEM
-    ; ---------------------------------------------------------
-
+    ; Update system
     call update_system_init
 
     lea rdi, [rel msg_update_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
     ; AHS-TUS
-    ; ---------------------------------------------------------
-
     call ahs_tus_init
 
     lea rdi, [rel msg_ahs_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; MULTICORE
-    ; ---------------------------------------------------------
-
+    ; Multicore
     call multicore_init
 
     lea rdi, [rel msg_multicore_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; SCHEDULER
-    ; ---------------------------------------------------------
-
+    ; Scheduler
     call scheduler_init
 
     lea rdi, [rel msg_scheduler_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; LAPIC TIMER
-    ; Default scheduling interval: 500 microseconds.
-    ; ---------------------------------------------------------
-
+    ; LAPIC timer, default 500 microseconds.
     mov ecx, DEFAULT_SCHEDULER_TICK_US
-
     call lapic_timer_init_us
 
     test eax, eax
@@ -445,10 +355,7 @@ _start:
     lea rdi, [rel msg_lapic_timer_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; xHCI INITIALIZATION
-    ; ---------------------------------------------------------
-
+    ; xHCI initialization
     call xhci_init
 
     test rax, rax
@@ -457,28 +364,19 @@ _start:
     lea rdi, [rel msg_xhci_ok]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; xHCI IRQ ROUTING
-    ; ---------------------------------------------------------
-
+    ; Configure xHCI interrupt routing.
     call kernel_init_xhci_irq
 
     test eax, eax
     jz kernel_xhci_irq_error
 
-    ; ---------------------------------------------------------
-    ; ENABLE xHCI INTERRUPTS
-    ; ---------------------------------------------------------
-
+    ; Enable xHCI interrupts.
     call xhci_enable_interrupts
 
     test eax, eax
     jz kernel_xhci_enable_error
 
-    ; ---------------------------------------------------------
-    ; Unmask legacy IOAPIC route only if MSI is not active.
-    ; ---------------------------------------------------------
-
+    ; Unmask legacy route only when MSI is not active.
     cmp byte [rel xhci_msi_active], 1
     je .xhci_interrupt_ready
 
@@ -486,52 +384,34 @@ _start:
     jne kernel_xhci_irq_error
 
     movzx edi, byte [rel xhci_legacy_irq]
-
     call ioapic_unmask_irq
 
     test eax, eax
     jz kernel_xhci_irq_error
 
 .xhci_interrupt_ready:
-
     lea rdi, [rel msg_xhci_irq_ready]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; Enable CPU interrupts after interrupt routing is ready.
-    ; ---------------------------------------------------------
-
+    ; Enable CPU interrupts after routing is configured.
     sti
 
     lea rdi, [rel msg_interrupts_enabled]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; INITIAL GUI FRAME
-    ; ---------------------------------------------------------
-
+    ; Draw the initial GUI window.
     call kernel_draw_initial_window
-
     call gui_refresh_screen
-
-    ; ---------------------------------------------------------
-    ; KERNEL READY
-    ; ---------------------------------------------------------
 
     lea rdi, [rel msg_kernel_ready]
     call serial_log
 
-    ; ---------------------------------------------------------
-    ; MAIN SCHEDULER LOOP
-    ; ---------------------------------------------------------
-
+    ; Main scheduler loop.
     call scheduler_event_loop
 
 .kernel_halted:
-
     cli
     hlt
-
     jmp .kernel_halted
 
 
@@ -540,18 +420,15 @@ _start:
 ; =============================================================================
 
 kernel_draw_initial_window:
-
     push rbx
     push r12
     push r13
     push r14
     push r15
 
-    ; Get screen resolution.
     mov r12d, [rel screen_width]
     mov r13d, [rel screen_height]
 
-    ; Ensure the screen can accommodate the margins.
     cmp r12d, GUI_WINDOW_MARGIN * 2
     jbe .window_invalid
 
@@ -560,28 +437,23 @@ kernel_draw_initial_window:
 
     ; Width = min(screen width - margins, maximum width).
     mov r14d, r12d
-
     sub r14d, GUI_WINDOW_MARGIN * 2
 
     cmp r14d, GUI_WINDOW_MAX_WIDTH
     jbe .width_ready
-
     mov r14d, GUI_WINDOW_MAX_WIDTH
 
 .width_ready:
 
     ; Height = min(screen height - margins, maximum height).
     mov r15d, r13d
-
     sub r15d, GUI_WINDOW_MARGIN * 2
 
     cmp r15d, GUI_WINDOW_MAX_HEIGHT
     jbe .height_ready
-
     mov r15d, GUI_WINDOW_MAX_HEIGHT
 
 .height_ready:
-
     test r14d, r14d
     jz .window_invalid
 
@@ -590,44 +462,33 @@ kernel_draw_initial_window:
 
     ; X = (screen width - window width) / 2.
     mov eax, r12d
-
     sub eax, r14d
-
     shr eax, 1
-
     mov ecx, eax
 
     ; Y = (screen height - window height) / 2.
     mov eax, r13d
-
     sub eax, r15d
-
     shr eax, 1
-
     mov edx, eax
 
-    ; Width and height.
     mov r8d, r14d
     mov r9d, r15d
 
     call gui_draw_window
 
     mov eax, 1
-
     jmp .done
 
 .window_invalid:
-
     xor eax, eax
 
 .done:
-
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
-
     ret
 
 
@@ -640,42 +501,35 @@ kernel_draw_initial_window:
 ; =============================================================================
 
 kernel_init_xhci_irq:
-
     push rbx
     push rcx
     push rdx
     push rsi
     push rdi
 
-    ; Reset IRQ state.
     mov byte [rel xhci_msi_active], 0
     mov byte [rel xhci_irq_routed], 0
     mov byte [rel xhci_legacy_irq], 0xFF
 
-    ; ---------------------------------------------------------
-    ; TRY MSI
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
+    ; First try MSI.
+    ; -------------------------------------------------------------------------
 
     call xhci_msi_available
 
     test eax, eax
     jz .try_legacy
 
-    ; Destination LAPIC ID.
+    ; Obtain destination LAPIC ID.
     call lapic_get_id
-
     mov edi, eax
 
-    ; Interrupt vector.
     mov esi, XHCI_IRQ_VECTOR
-
-    ; Configure MSI.
     call xhci_enable_msi
 
     test eax, eax
     jz .msi_failed
 
-    ; MSI successfully configured.
     mov byte [rel xhci_msi_active], 1
     mov byte [rel xhci_irq_routed], 1
 
@@ -683,26 +537,23 @@ kernel_init_xhci_irq:
     call serial_log
 
     mov eax, 1
-
     jmp .done
 
 .msi_failed:
-
     lea rdi, [rel msg_xhci_msi_failed]
     call serial_log
 
 .try_legacy:
 
-    ; ---------------------------------------------------------
-    ; LEGACY IOAPIC FALLBACK
-    ; ---------------------------------------------------------
+    ; -------------------------------------------------------------------------
+    ; Legacy IOAPIC fallback.
+    ; -------------------------------------------------------------------------
 
     call ioapic_available
 
     test eax, eax
     jz .legacy_failed
 
-    ; Obtain PCI Interrupt Line.
     call xhci_get_pci_irq
 
     cmp eax, 0xFF
@@ -711,38 +562,35 @@ kernel_init_xhci_irq:
     cmp eax, 15
     ja .legacy_failed
 
-    ; IRQ 0 is not accepted for this PCI routing fallback.
+    ; IRQ 0 is not accepted for this PCI fallback.
     test eax, eax
     jz .legacy_failed
 
     mov [rel xhci_legacy_irq], al
 
-    ; EDI = IRQ
-    ; ESI = interrupt vector
-    movzx edi, byte [rel xhci_legacy_irq]
-
-    mov esi, XHCI_IRQ_VECTOR
-
-    ; EDX = destination LAPIC ID.
+    ; Get LAPIC ID FIRST. Calls may clobber caller-saved registers.
     call lapic_get_id
-
     mov edx, eax
 
-    ; Configure routing.
+    ; IMPORTANT: set every routing argument AFTER lapic_get_id.
+    ; EDI = ISA IRQ
+    ; ESI = interrupt vector
+    ; EDX = destination LAPIC ID
+    movzx edi, byte [rel xhci_legacy_irq]
+    mov esi, XHCI_IRQ_VECTOR
+
     call ioapic_route_irq
 
     test eax, eax
     jz .legacy_failed
 
-    ; Keep the IRQ masked until xHCI is ready.
+    ; Keep the route masked until xHCI is ready.
     movzx edi, byte [rel xhci_legacy_irq]
-
     call ioapic_mask_irq
 
     test eax, eax
     jz .legacy_failed
 
-    ; Legacy IRQ route is ready.
     mov byte [rel xhci_irq_routed], 1
     mov byte [rel xhci_msi_active], 0
 
@@ -750,24 +598,20 @@ kernel_init_xhci_irq:
     call serial_log
 
     mov eax, 1
-
     jmp .done
 
 .legacy_failed:
-
     lea rdi, [rel msg_xhci_irq_failed]
     call serial_log
 
     xor eax, eax
 
 .done:
-
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
-
     ret
 
 
@@ -776,82 +620,51 @@ kernel_init_xhci_irq:
 ; =============================================================================
 
 kernel_bootinfo_error:
-
     cli
-
     lea rdi, [rel msg_bootinfo_error]
     call serial_log
-
     jmp kernel_fatal_halt
-
 
 kernel_pmm_error:
-
     cli
-
     lea rdi, [rel msg_pmm_error]
     call serial_log
-
     jmp kernel_fatal_halt
-
 
 kernel_acpi_error:
-
     cli
-
     lea rdi, [rel msg_acpi_error]
     call serial_log
-
     jmp kernel_fatal_halt
-
 
 kernel_lapic_error:
-
     cli
-
     lea rdi, [rel msg_lapic_error]
     call serial_log
-
     jmp kernel_fatal_halt
-
 
 kernel_lapic_timer_error:
-
     cli
-
     lea rdi, [rel msg_lapic_timer_error]
     call serial_log
-
     jmp kernel_fatal_halt
-
 
 kernel_xhci_error:
-
     cli
-
     lea rdi, [rel msg_xhci_error]
     call serial_log
-
     jmp kernel_fatal_halt
-
 
 kernel_xhci_irq_error:
-
     cli
-
     lea rdi, [rel msg_xhci_irq_error]
     call serial_log
-
     jmp kernel_fatal_halt
 
-
 kernel_xhci_enable_error:
-
     cli
-
     lea rdi, [rel msg_xhci_enable_error]
     call serial_log
-
     jmp kernel_fatal_halt
 
 
@@ -860,13 +673,10 @@ kernel_xhci_enable_error:
 ; =============================================================================
 
 kernel_fatal_halt:
-
     cli
 
 .fatal_loop:
-
     hlt
-
     jmp .fatal_loop
 
 
@@ -878,11 +688,9 @@ section .data
 
 align 8
 
-; BootInfo pointer.
 boot_info_ptr:
     dq 0
 
-; xHCI interrupt state.
 xhci_msi_active:
     db 0
 
@@ -1006,12 +814,6 @@ msg_kernel_ready:
 
 ; =============================================================================
 ; BSS
-; =============================================================================
-;
-; The linker places this section after .data.
-; The UEFI loader loads kernel.bin at 0x00100000.
-; BSS is cleared before this stack is used.
-;
 ; =============================================================================
 
 section .bss
